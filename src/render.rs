@@ -188,6 +188,67 @@ fn graphic(cell: &Cell, options: &Options) -> Option<String> {
             cell.foreground.css(),
         )
     };
+    // Powerline separators must fill their cell edge-to-edge so adjacent
+    // segments meet with no seam. Drawing them from the font leaves gaps
+    // (the glyph is narrower than the cell), so we render exact shapes.
+    let poly = |points: &[(f32, f32)]| {
+        let coords = points
+            .iter()
+            .map(|(fx, fy)| format!("{},{}", x + width * fx, y + height * fy))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            r#"<polygon points="{coords}" fill="{}"/>"#,
+            cell.foreground.css(),
+        )
+    };
+    let poly_line = |points: &[(f32, f32)]| {
+        let coords = points
+            .iter()
+            .map(|(fx, fy)| format!("{},{}", x + width * fx, y + height * fy))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            r#"<polyline points="{coords}" fill="none" stroke="{}" stroke-width="{stroke_width}"/>"#,
+            cell.foreground.css(),
+        )
+    };
+    // Half-disc with its flat edge on the left (flat_left=true) or right,
+    // bulging across the full cell width.
+    let half_disc = |flat_left: bool, filled: bool| {
+        let flat = if flat_left { x } else { x + width };
+        let sweep = if flat_left { 1 } else { 0 };
+        let (fill, stroke) = if filled {
+            (cell.foreground.css(), String::new())
+        } else {
+            (
+                "none".to_owned(),
+                format!(
+                    r#" stroke="{}" stroke-width="{stroke_width}""#,
+                    cell.foreground.css()
+                ),
+            )
+        };
+        let close = if filled { " Z" } else { "" };
+        format!(
+            r#"<path d="M {flat},{} A {},{} 0 0 {sweep} {flat},{}{close}" fill="{fill}"{stroke}/>"#,
+            y,
+            width,
+            height / 2.0,
+            y + height,
+        )
+    };
+    match char {
+        '\u{e0b0}' => return Some(poly(&[(0.0, 0.0), (1.0, 0.5), (0.0, 1.0)])),
+        '\u{e0b2}' => return Some(poly(&[(1.0, 0.0), (0.0, 0.5), (1.0, 1.0)])),
+        '\u{e0b4}' => return Some(half_disc(true, true)),
+        '\u{e0b6}' => return Some(half_disc(false, true)),
+        '\u{e0b1}' => return Some(poly_line(&[(0.0, 0.0), (1.0, 0.5), (0.0, 1.0)])),
+        '\u{e0b3}' => return Some(poly_line(&[(1.0, 0.0), (0.0, 0.5), (1.0, 1.0)])),
+        '\u{e0b5}' => return Some(half_disc(true, false)),
+        '\u{e0b7}' => return Some(half_disc(false, false)),
+        _ => {}
+    }
     let codepoint = char as u32;
     if (0x2800..=0x28ff).contains(&codepoint) {
         return Some(braille_dots(
@@ -205,6 +266,12 @@ fn graphic(cell: &Cell, options: &Options) -> Option<String> {
         );
     }
     Some(match char {
+        // Shade blocks: draw as the foreground color at graduated opacity so
+        // they read as a smooth gradient (e.g. a powerline fade-in) instead of
+        // the font's literal dither dots.
+        '░' => rect(x, y, width, height, Some(0.25)),
+        '▒' => rect(x, y, width, height, Some(0.5)),
+        '▓' => rect(x, y, width, height, Some(0.75)),
         '█' => single(0.0, 0.0, 1.0, 1.0),
         '▀' => single(0.0, 0.0, 1.0, 0.5),
         '▄' => single(0.0, 0.5, 1.0, 0.5),
@@ -556,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_shade_characters_as_font_glyphs() {
+    fn renders_shade_characters_as_graduated_opacity() {
         let frame = Frame {
             version: 1,
             cols: 3,
@@ -589,11 +656,54 @@ mod tests {
 
         let output = svg(&frame, &Options::default());
 
-        assert!(output.contains(">░</text>"));
-        assert!(output.contains(">▒</text>"));
-        assert!(output.contains(">▓</text>"));
-        assert!(!output.contains("opacity=\"0.25\""));
-        assert!(!output.contains("opacity=\"0.5\""));
-        assert!(!output.contains("opacity=\"0.75\""));
+        // Shade blocks render as the foreground color at graduated opacity so
+        // they read as a smooth gradient (e.g. a powerline fade-in) rather than
+        // the font's literal dither dots.
+        assert!(output.contains("opacity=\"0.25\""));
+        assert!(output.contains("opacity=\"0.5\""));
+        assert!(output.contains("opacity=\"0.75\""));
+        assert!(!output.contains(">░</text>"));
+        assert!(!output.contains(">▒</text>"));
+        assert!(!output.contains(">▓</text>"));
+    }
+
+    #[test]
+    fn renders_powerline_separators_as_shapes() {
+        let cell = |x: u16, text: &str| crate::frame::Cell {
+            x,
+            y: 0,
+            text: text.to_owned(),
+            width: 1,
+            foreground: Color {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+            background: Color { r: 0, g: 0, b: 0 },
+            attributes: Attributes::default(),
+        };
+        let frame = Frame {
+            version: 1,
+            cols: 2,
+            rows: 1,
+            foreground: Color {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+            background: Color { r: 0, g: 0, b: 0 },
+            cursor: None,
+            // U+E0B0 triangle separator, U+E0B4 rounded separator.
+            cells: vec![cell(0, "\u{e0b0}"), cell(1, "\u{e0b4}")],
+        };
+
+        let output = svg(&frame, &Options::default());
+
+        // Separators are drawn as exact cell-filling shapes so segments meet
+        // with no seam, not as font glyphs that leave gaps.
+        assert!(output.contains("<polygon"));
+        assert!(output.contains("<path"));
+        assert!(!output.contains(">\u{e0b0}</text>"));
+        assert!(!output.contains(">\u{e0b4}</text>"));
     }
 }

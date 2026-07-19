@@ -1360,21 +1360,28 @@ mod implementation {
             });
             let raw = RawMode::enter()?;
             let mut terminal = WorkspaceTerminal::enter(input_receive, options)?;
-            loop {
-                if !terminal.tick(&mut workspace)? {
-                    break;
-                }
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let stopped = handle_workspace(stream, &mut workspace, &mut |workspace| {
-                            terminal.tick(workspace)
-                        })?;
-                        if stopped || terminal.finished() {
-                            break;
+            'workspace: loop {
+                let running = terminal.tick(&mut workspace)?;
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let stopped =
+                                handle_workspace(stream, &mut workspace, &mut |workspace| {
+                                    terminal.tick(workspace)
+                                })?;
+                            if stopped {
+                                break 'workspace;
+                            }
+                            if running && !terminal.finished() {
+                                break;
+                            }
                         }
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                        Err(error) => return Err(error).context("accept session request"),
                     }
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(error).context("accept session request"),
+                }
+                if !running || terminal.finished() {
+                    break;
                 }
                 thread::sleep(Duration::from_millis(5));
             }

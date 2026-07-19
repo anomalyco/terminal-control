@@ -343,6 +343,12 @@ impl Workspace {
         let deadline = started + deadline;
         loop {
             let running = tick(self)?;
+            if let Some(pane) = pane {
+                let index = self.resolve_pane(Some(pane))?;
+                if self.panes[index].session.exit_observed() {
+                    return self.panes[index].session.snapshot();
+                }
+            }
             if !running {
                 if self.is_empty() {
                     bail!("workspace ended before capture completed");
@@ -1847,5 +1853,44 @@ mod tests {
         assert!(workspace.frame().unwrap().text().contains("LATE-MARKER"));
         assert!(workspace.remove_observed_exits().unwrap());
         assert!(workspace.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn targeted_capture_returns_a_panes_final_frame_without_waiting_to_settle() {
+        let options = Options {
+            cols: 40,
+            rows: 8,
+            ..Options::default()
+        };
+        let mut workspace = Workspace::start(
+            &["sh".to_owned(), "-c".to_owned(), "cat".to_owned()],
+            None,
+            None,
+            &options,
+        )
+        .unwrap();
+        workspace.shell = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf TARGET-FINAL".to_owned(),
+        ];
+        workspace.split_right().unwrap();
+
+        let shot = workspace
+            .capture(
+                Some(1),
+                Duration::from_secs(600),
+                Duration::from_secs(2),
+                |workspace| {
+                    workspace.pump()?;
+                    workspace.observe_exits()?;
+                    Ok(true)
+                },
+            )
+            .unwrap();
+
+        assert!(shot.frame.text().contains("TARGET-FINAL"));
+        workspace.stop();
     }
 }

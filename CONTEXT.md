@@ -16,6 +16,10 @@ A named terminal application that remains available across waiting, input, resiz
 
 An embedded session owns the same live terminal lifecycle in-process; the named CLI session commands are an adapter for interacting with that lifecycle across invocations.
 
+### Workspace
+
+An attached terminal containing one or two embedded sessions, called panes. A workspace composes pane frames into one visible frame, serializes human stdin and named-session control on one foreground loop, and keeps agent pane targeting independent from human focus. The attached terminal is authoritative for workspace geometry. Workspace terminal presentation owns prefix decoding, transient notices, input-mode synchronization, and damage-based painting without exposing those mechanisms to the session control adapter.
+
 ### Driver
 
 A versioned JSON Lines stdin/stdout adapter over embedded sessions for external agent tooling and the TypeScript test client. A driver process can manage multiple isolated sessions without exposing terminal process details to its client. Its capture response includes the reason capture completed so test clients can distinguish settled screen state from deadline fallback, and can optionally include ANSI or rendered SVG failure evidence.

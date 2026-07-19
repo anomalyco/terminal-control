@@ -133,7 +133,7 @@ termctrl run -- nvim
 termctrl run editor --cwd ~/src/project -- nvim
 ```
 
-Use `ctrl-b %` to split right, `ctrl-b h/l` to focus panes, `ctrl-b x` to close the active pane, and `ctrl-b q` to quit. The initial workspace supports two side-by-side panes.
+Use `ctrl-b %` to split right, `ctrl-b h/l` to focus panes, and `ctrl-b ?` for in-workspace help. Killing the active pane with `ctrl-b x` or quitting with `ctrl-b q` requires a second press. The initial workspace supports two side-by-side panes.
 
 Agents discover stable pane IDs and can inspect or drive a pane without changing human focus:
 

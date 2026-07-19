@@ -13,8 +13,8 @@ use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 
-const OUTPUT_BATCH: usize = 1;
-const OUTPUT_QUEUE: usize = 4;
+const OUTPUT_QUEUE: usize = 64;
+const OUTPUT_BATCH: usize = OUTPUT_QUEUE;
 const OUTPUT_CHUNK: usize = 1024;
 
 struct Output {
@@ -271,7 +271,39 @@ impl Session {
 
     /// Send one input burst to the terminal application.
     pub fn send(&mut self, input: &[u8]) -> Result<()> {
-        self.send_all(&[input.to_vec()], Duration::ZERO)
+        self.consume_batch()?;
+        if self.has_exited()? || self.stopped {
+            bail!("session command has exited");
+        }
+        self.write_input(input)
+    }
+
+    pub(crate) fn send_current(&mut self, input: &[u8]) -> Result<()> {
+        if self.exit.is_some() || self.stopped {
+            bail!("session command has exited");
+        }
+        self.write_input(input)
+    }
+
+    pub(crate) fn send_current_if_open(&mut self, input: &[u8]) -> Result<bool> {
+        if self.exit.is_some() || self.stopped {
+            return Ok(false);
+        }
+        if !self.host.send_if_open(input)? {
+            return Ok(false);
+        }
+        if let Some(recording) = &mut self.recording {
+            recording.input(InputOrigin::Client, input)?;
+        }
+        Ok(true)
+    }
+
+    fn write_input(&mut self, input: &[u8]) -> Result<()> {
+        self.host.send(input)?;
+        if let Some(recording) = &mut self.recording {
+            recording.input(InputOrigin::Client, input)?;
+        }
+        Ok(())
     }
 
     /// Send ordered input bursts, optionally pacing them for recorded interactions.
@@ -282,10 +314,7 @@ impl Session {
         }
         let last = input.len().saturating_sub(1);
         for (index, bytes) in input.iter().enumerate() {
-            self.host.send(bytes)?;
-            if let Some(recording) = &mut self.recording {
-                recording.input(InputOrigin::Client, bytes)?;
-            }
+            self.write_input(bytes)?;
             if !pace.is_zero() && index < last {
                 thread::sleep(pace);
                 self.consume_batch()?;
@@ -458,9 +487,21 @@ impl Session {
         self.consume_batch()
     }
 
-    pub(crate) fn frame(&mut self) -> Result<Frame> {
-        self.consume_batch()?;
+    pub(crate) fn current_frame(&mut self) -> Result<Frame> {
         self.terminal.frame()
+    }
+
+    pub(crate) fn is_exited(&mut self) -> Result<bool> {
+        self.has_exited()
+    }
+
+    pub(crate) fn exit_observed(&self) -> bool {
+        self.exit.is_some()
+    }
+
+    pub(crate) fn idle_for(&self, started: Instant) -> Duration {
+        self.last_output
+            .map_or_else(|| started.elapsed(), |last| last.elapsed())
     }
 
     pub(crate) fn snapshot(&mut self) -> Result<Shot> {
@@ -475,13 +516,31 @@ impl Session {
         self.terminal.input_modes()
     }
 
+    pub(crate) fn title(&self) -> Result<String> {
+        self.terminal.title()
+    }
+
+    pub(crate) fn take_bells(&self) -> u64 {
+        self.terminal.take_bells()
+    }
+
+    pub(crate) fn cursor_style(&self) -> libghostty_vt::render::CursorVisualStyle {
+        self.terminal.cursor_style()
+    }
+
     fn consume_batch(&mut self) -> Result<()> {
+        let mut outputs = Vec::new();
         for _ in 0..OUTPUT_BATCH {
-            if !self.consume_one()? {
-                break;
+            match self.receive.try_recv() {
+                Ok(Some(output)) => outputs.push(output),
+                Ok(None) | Err(TryRecvError::Disconnected) => {
+                    self.output_closed = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
             }
         }
-        Ok(())
+        self.apply_outputs(outputs)
     }
 
     fn consume_one(&mut self) -> Result<bool> {
@@ -515,12 +574,38 @@ impl Session {
             return;
         }
         #[cfg(unix)]
-        if let Some(process_group) = self.process_group.take() {
+        let process_group = self.process_group;
+        #[cfg(unix)]
+        if let Some(process_group) = process_group {
+            unsafe {
+                libc::kill(-process_group, libc::SIGHUP);
+            }
+        }
+        let graceful_deadline = Instant::now() + Duration::from_millis(150);
+        while self.exit.is_none() && Instant::now() < graceful_deadline {
+            let _ = self.consume_one();
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.exit = Some(status.into());
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        if self.exit.is_some() {
+            let _ = self.finish_exited_output();
+        }
+        #[cfg(unix)]
+        if let Some(process_group) = process_group {
             unsafe {
                 libc::kill(-process_group, libc::SIGKILL);
             }
         }
-        let _ = self.child.kill();
+        #[cfg(unix)]
+        {
+            self.process_group = None;
+        }
+        if self.exit.is_none() {
+            let _ = self.child.kill();
+        }
         let deadline = Instant::now() + Duration::from_secs(1);
         while self.exit.is_none() && Instant::now() < deadline {
             // The PTY reader may be blocked by the bounded queue while the child exits.
@@ -531,6 +616,18 @@ impl Session {
                 break;
             }
             thread::sleep(Duration::from_millis(1));
+        }
+        let drain_deadline = Instant::now() + Duration::from_millis(100);
+        while !self.output_closed && Instant::now() < drain_deadline {
+            match self.receive.recv_timeout(Duration::from_millis(5)) {
+                Ok(Some(output)) => {
+                    let _ = self.apply_output(output);
+                }
+                Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.output_closed = true;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
         }
         self.output_closed = true;
         self.stopped = true;
@@ -551,7 +648,20 @@ impl Session {
                 }
             }
             match self.receive.recv_timeout(Duration::from_millis(10)) {
-                Ok(Some(output)) => self.apply_output(output)?,
+                Ok(Some(output)) => {
+                    let mut outputs = vec![output];
+                    for _ in 1..OUTPUT_BATCH {
+                        match self.receive.recv_timeout(Duration::from_millis(1)) {
+                            Ok(Some(output)) => outputs.push(output),
+                            Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                self.output_closed = true;
+                                break;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        }
+                    }
+                    self.apply_outputs(outputs)?;
+                }
                 Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     self.output_closed = true;
                 }
@@ -566,27 +676,40 @@ impl Session {
     }
 
     fn apply_output(&mut self, output: Output) -> Result<()> {
+        self.apply_outputs(vec![output])
+    }
+
+    fn apply_outputs(&mut self, outputs: Vec<Output>) -> Result<()> {
+        if outputs.is_empty() {
+            return Ok(());
+        }
+        let mut bytes = Vec::with_capacity(outputs.iter().map(|output| output.bytes.len()).sum());
+        for output in outputs {
+            if let Some(mirror) = &mut self.mirror {
+                mirror
+                    .write_all(&output.bytes)
+                    .context("mirror PTY output")?;
+            }
+            if let Some(recording) = &mut self.recording {
+                recording.output(output.at_ms, &output.bytes)?;
+            }
+            retain_recent(
+                &mut self.ansi,
+                &output.bytes,
+                self.max_bytes,
+                &mut self.ansi_truncated,
+            );
+            bytes.extend_from_slice(&output.bytes);
+        }
         if let Some(mirror) = &mut self.mirror {
-            mirror
-                .write_all(&output.bytes)
-                .context("mirror PTY output")?;
             mirror.flush().context("flush mirrored PTY output")?;
         }
-        if let Some(recording) = &mut self.recording {
-            recording.output(output.at_ms, &output.bytes)?;
-        }
-        let response = respond_to_output(&mut self.terminal, &mut self.host, &output.bytes)?;
+        let response = respond_to_output(&mut self.terminal, &mut self.host, &bytes)?;
         if !response.is_empty()
             && let Some(recording) = &mut self.recording
         {
             recording.input(InputOrigin::Host, &response)?;
         }
-        retain_recent(
-            &mut self.ansi,
-            &output.bytes,
-            self.max_bytes,
-            &mut self.ansi_truncated,
-        );
         self.last_output = Some(Instant::now());
         Ok(())
     }
@@ -907,7 +1030,7 @@ mod implementation {
 
     use super::{NamedSessionStatus, Request, Response, Session, UnavailableReason};
     use crate::shot::{self, Options};
-    use crate::workspace::{InputAction, OuterScreen, PrefixDecoder, Workspace};
+    use crate::workspace::{Workspace, WorkspaceTerminal};
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
     const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
@@ -1225,7 +1348,7 @@ mod implementation {
                 .with_context(|| format!("secure {}", socket.display()))?;
             listener.set_nonblocking(true)?;
             let mut workspace = Workspace::start(command, cwd, record, options)?;
-            let (input_send, input_receive) = std::sync::mpsc::channel::<Vec<u8>>();
+            let (input_send, input_receive) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
             thread::spawn(move || {
                 let mut stdin = std::io::stdin().lock();
                 let mut bytes = [0_u8; 1024];
@@ -1236,32 +1359,17 @@ mod implementation {
                 }
             });
             let raw = RawMode::enter()?;
-            let mut screen = OuterScreen::enter()?;
-            let mut decoder = PrefixDecoder::default();
-            let mut last_frame = None;
+            let mut terminal = WorkspaceTerminal::enter(input_receive, options)?;
             loop {
-                if !tick_workspace(
-                    &mut workspace,
-                    &input_receive,
-                    &mut decoder,
-                    &mut screen,
-                    options,
-                    &mut last_frame,
-                )? {
+                if !terminal.tick(&mut workspace)? {
                     break;
                 }
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        if handle_workspace(stream, &mut workspace, &mut |workspace| {
-                            tick_workspace(
-                                workspace,
-                                &input_receive,
-                                &mut decoder,
-                                &mut screen,
-                                options,
-                                &mut last_frame,
-                            )
-                        })? {
+                        let stopped = handle_workspace(stream, &mut workspace, &mut |workspace| {
+                            terminal.tick(workspace)
+                        })?;
+                        if stopped || terminal.finished() {
                             break;
                         }
                     }
@@ -1271,10 +1379,10 @@ mod implementation {
                 thread::sleep(Duration::from_millis(5));
             }
             let final_text = (!command.is_empty() && !workspace.was_stopped())
-                .then(|| last_frame.as_ref().map(crate::frame::Frame::text))
+                .then(|| terminal.content().map(crate::frame::Frame::text))
                 .flatten()
                 .filter(|text| !text.is_empty());
-            drop(screen);
+            drop(terminal);
             drop(raw);
             if let Some(text) = final_text {
                 let mut stdout = std::io::stdout().lock();
@@ -1290,54 +1398,6 @@ mod implementation {
         })();
         let _ = fs::remove_file(&socket);
         result
-    }
-
-    fn tick_workspace(
-        workspace: &mut Workspace,
-        input_receive: &std::sync::mpsc::Receiver<Vec<u8>>,
-        decoder: &mut PrefixDecoder,
-        screen: &mut OuterScreen,
-        options: &Options,
-        last_frame: &mut Option<crate::frame::Frame>,
-    ) -> Result<bool> {
-        workspace.pump()?;
-        while let Ok(input) = input_receive.try_recv() {
-            for action in decoder.push(&input) {
-                match action {
-                    InputAction::Send(input) => workspace.send(None, &input)?,
-                    InputAction::SplitRight => {
-                        if workspace.split_right().is_err() {
-                            screen.bell()?;
-                        }
-                    }
-                    InputAction::FocusLeft => {
-                        workspace.focus_left();
-                    }
-                    InputAction::FocusRight => {
-                        workspace.focus_right();
-                    }
-                    InputAction::CloseActive => workspace.close_active()?,
-                    InputAction::Quit => workspace.stop(),
-                }
-            }
-        }
-        if workspace.is_empty() {
-            return Ok(false);
-        }
-        if let Ok((cols, rows)) = crossterm::terminal::size()
-            && cols > 0
-            && rows > 0
-        {
-            workspace.resize(cols, rows, options.cell_width, options.cell_height)?;
-        }
-        screen.sync_input_modes(workspace.active_input_modes()?)?;
-        let frame = workspace.frame()?;
-        if last_frame.as_ref() != Some(&frame) {
-            screen.paint(&frame)?;
-            *last_frame = Some(frame);
-        }
-        workspace.remove_exited()?;
-        Ok(!workspace.is_empty())
     }
 
     fn ensure_socket_path(path: &Path) -> Result<()> {
@@ -1723,6 +1783,33 @@ mod implementation {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zsh_redraws_backspace_with_the_default_terminal_contract() {
+        let mut session = Session::start(
+            &["/bin/zsh".to_owned(), "-df".to_owned()],
+            None,
+            None,
+            &Options {
+                cols: 40,
+                rows: 4,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        session.wait_for_text("%", Duration::from_secs(2)).unwrap();
+        session.send(b"PS1='READY> '\r").unwrap();
+        session
+            .wait_for_text("READY>", Duration::from_secs(2))
+            .unwrap();
+        session.send(b"abc\x7fX").unwrap();
+        session
+            .wait_for_text("READY> abX", Duration::from_secs(2))
+            .unwrap();
+        session.stop().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn embedded_session_waits_sends_resizes_and_captures_the_screen() {
@@ -1973,6 +2060,35 @@ mod tests {
                 .any(|bytes| bytes == b"one")
         );
         session.stop().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_allows_a_hangup_handler_to_run_before_forcing_exit() {
+        let mut session = Session::start(
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "trap 'printf HUP-SEEN; exit 0' HUP; printf READY; while :; do :; done".to_owned(),
+            ],
+            None,
+            None,
+            &Options::default(),
+        )
+        .unwrap();
+        session
+            .wait_for_text("READY", Duration::from_secs(2))
+            .unwrap();
+
+        session.stop().unwrap();
+
+        assert!(
+            session
+                .logs(true)
+                .unwrap()
+                .windows(b"HUP-SEEN".len())
+                .any(|bytes| bytes == b"HUP-SEEN")
+        );
     }
 
     #[cfg(unix)]

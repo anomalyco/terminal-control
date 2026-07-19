@@ -40,8 +40,9 @@ termctrl send workspace --pane 1 text:opencode2 enter
 ```
 
 With no arguments, `run` starts `$SHELL` in the `workspace` session. Use `ctrl-b %` to split right,
-`ctrl-b h/l` to focus, `ctrl-b x` to close a pane, and `ctrl-b q` to quit. A supplied command still
-uses its executable basename when `NAME` is omitted.
+`ctrl-b h/l` to focus, and `ctrl-b ?` for help. Killing a pane with `ctrl-b x` or quitting with
+`ctrl-b q` requires a second press. A supplied command still uses its executable basename when
+`NAME` is omitted.
 
 Attached workspaces follow their visible terminal and reject `termctrl resize`. `run --record` records
 the initial pane only; wrap `run` in an outer named session when a composed workspace recording is

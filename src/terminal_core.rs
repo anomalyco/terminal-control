@@ -1,9 +1,9 @@
-use std::cell::RefCell;
+use std::cell::{Cell as CounterCell, RefCell};
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
-use libghostty_vt::render::{CellIterator, RowIterator};
+use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{PaletteIndex, RgbColor, Underline as GhosttyUnderline};
 use libghostty_vt::{RenderState, Terminal, TerminalOptions, terminal::Mode};
@@ -25,14 +25,19 @@ pub(crate) struct InputModes {
 
 pub(crate) struct TerminalCore {
     terminal: Terminal<'static, 'static>,
+    render_state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
     responses: Rc<RefCell<Vec<u8>>>,
+    bells: Rc<CounterCell<u64>>,
+    cursor_style: CursorVisualStyle,
+    cached_frame: Option<Frame>,
 }
 
 impl TerminalCore {
     pub(crate) fn new(rows: u16, cols: u16, max_scrollback: usize) -> Result<Self> {
         let responses = Rc::new(RefCell::new(Vec::new()));
+        let bells = Rc::new(CounterCell::new(0_u64));
         let mut terminal = Terminal::new(TerminalOptions {
             cols,
             rows,
@@ -45,6 +50,12 @@ impl TerminalCore {
                 move |_terminal, bytes| responses.borrow_mut().extend_from_slice(bytes)
             })
             .context("configure Ghostty PTY responses")?;
+        terminal
+            .on_bell({
+                let bells = Rc::clone(&bells);
+                move |_terminal| bells.set(bells.get().saturating_add(1))
+            })
+            .context("configure Ghostty bell events")?;
         terminal
             .set_default_fg_color(Some(to_ghostty_color(DEFAULT_FOREGROUND)))
             .context("configure Ghostty foreground")?
@@ -64,9 +75,13 @@ impl TerminalCore {
 
         Ok(Self {
             terminal,
+            render_state: RenderState::new().context("create Ghostty render state")?,
             rows: RowIterator::new().context("create Ghostty row iterator")?,
             cells: CellIterator::new().context("create Ghostty cell iterator")?,
             responses,
+            bells,
+            cursor_style: CursorVisualStyle::Block,
+            cached_frame: None,
         })
     }
 
@@ -112,18 +127,37 @@ impl TerminalCore {
         })
     }
 
+    pub(crate) fn title(&self) -> Result<String> {
+        Ok(self.terminal.title()?.to_owned())
+    }
+
+    pub(crate) fn take_bells(&self) -> u64 {
+        self.bells.replace(0)
+    }
+
+    pub(crate) fn cursor_style(&self) -> CursorVisualStyle {
+        self.cursor_style
+    }
+
     pub(crate) fn frame(&mut self) -> Result<Frame> {
-        // Frame v1 is a complete snapshot, while a reused Ghostty render state exposes dirty
-        // updates. Start a fresh render state so repeated captures include unchanged rows.
-        let mut render_state = RenderState::new().context("create Ghostty render state")?;
-        let snapshot = render_state
+        let snapshot = self
+            .render_state
             .update(&self.terminal)
             .context("update Ghostty render state")?;
+        let dirty = snapshot.dirty().context("read Ghostty dirty state")?;
+        if dirty == Dirty::Clean
+            && let Some(frame) = &self.cached_frame
+        {
+            return Ok(frame.clone());
+        }
         let cols = snapshot.cols().context("read Ghostty columns")?;
         let rows = snapshot.rows().context("read Ghostty rows")?;
         let colors = snapshot.colors().context("read Ghostty colors")?;
         let foreground = from_ghostty_color(colors.foreground);
         let background = from_ghostty_color(colors.background);
+        self.cursor_style = snapshot
+            .cursor_visual_style()
+            .context("read Ghostty cursor style")?;
         let cursor = if snapshot
             .cursor_visible()
             .context("read Ghostty cursor visibility")?
@@ -141,13 +175,29 @@ impl TerminalCore {
             None
         };
 
-        let mut frame_cells = Vec::new();
+        let full = dirty == Dirty::Full
+            || self
+                .cached_frame
+                .as_ref()
+                .is_none_or(|frame| frame.cols != cols || frame.rows != rows);
+        let mut changed_rows = vec![false; usize::from(rows)];
+        let mut changed_cells = Vec::new();
         let mut row_index = 0_u16;
         let mut row_iter = self
             .rows
             .update(&snapshot)
             .context("iterate Ghostty rows")?;
         while let Some(row) = row_iter.next() {
+            let row_dirty = full || row.dirty().context("read Ghostty row dirty state")?;
+            row.set_dirty(false)
+                .context("clear Ghostty row dirty state")?;
+            if !row_dirty {
+                row_index += 1;
+                continue;
+            }
+            if row_index < rows {
+                changed_rows[usize::from(row_index)] = true;
+            }
             let mut column = 0_u16;
             let mut cell_iter = self.cells.update(row).context("iterate Ghostty cells")?;
             while let Some(cell) = cell_iter.next() {
@@ -184,7 +234,7 @@ impl TerminalCore {
                     .context("read Ghostty cell text")?;
                 if !text.is_empty() || cell_background != background || has_attributes(&attributes)
                 {
-                    frame_cells.push(Cell {
+                    changed_cells.push(Cell {
                         x: column,
                         y: row_index,
                         text,
@@ -198,16 +248,36 @@ impl TerminalCore {
             }
             row_index += 1;
         }
+        snapshot
+            .set_dirty(Dirty::Clean)
+            .context("clear Ghostty dirty state")?;
 
-        Ok(Frame {
-            version: FORMAT_VERSION,
-            cols,
-            rows,
-            foreground,
-            background,
-            cursor,
-            cells: frame_cells,
-        })
+        let frame = if full {
+            Frame {
+                version: FORMAT_VERSION,
+                cols,
+                rows,
+                foreground,
+                background,
+                cursor,
+                cells: changed_cells,
+            }
+        } else {
+            let mut frame = self.cached_frame.take().expect("partial frame has cache");
+            frame.cols = cols;
+            frame.rows = rows;
+            frame.foreground = foreground;
+            frame.background = background;
+            frame.cursor = cursor;
+            frame
+                .cells
+                .retain(|cell| !changed_rows[usize::from(cell.y)]);
+            frame.cells.extend(changed_cells);
+            frame.cells.sort_unstable_by_key(|cell| (cell.y, cell.x));
+            frame
+        };
+        self.cached_frame = Some(frame.clone());
+        Ok(frame)
     }
 }
 
@@ -246,6 +316,16 @@ mod tests {
         let mut terminal = TerminalCore::new(1, 20, 0).unwrap();
 
         assert_eq!(terminal.apply_output(b"\x1b[5n"), b"\x1b[0n");
+    }
+
+    #[test]
+    fn exposes_title_and_bell_events() {
+        let mut terminal = TerminalCore::new(1, 20, 0).unwrap();
+        let _responses = terminal.apply_output(b"\x07\x1b]2;editor\x07");
+
+        assert_eq!(terminal.title().unwrap(), "editor");
+        assert_eq!(terminal.take_bells(), 1);
+        assert_eq!(terminal.take_bells(), 0);
     }
 
     #[test]
@@ -288,5 +368,39 @@ mod tests {
 
         assert_eq!(terminal.frame().unwrap().text(), "ready");
         assert_eq!(terminal.frame().unwrap().text(), "ready");
+    }
+
+    #[test]
+    fn retained_render_state_merges_dirty_rows_into_complete_frames() {
+        let mut terminal = TerminalCore::new(3, 10, 0).unwrap();
+        let _responses = terminal.apply_output(b"alpha\r\nbeta");
+        assert_eq!(terminal.frame().unwrap().text(), "alpha\nbeta");
+
+        let _responses = terminal.apply_output(b"\rB");
+        let updated = terminal.frame().unwrap();
+        assert_eq!(updated.text(), "alpha\nBeta");
+        assert_eq!(terminal.frame().unwrap(), updated);
+
+        let _responses = terminal.apply_output(b"\r\x1b[2K");
+        assert_eq!(terminal.frame().unwrap().text(), "alpha");
+    }
+
+    #[test]
+    #[ignore = "manual autoresearch benchmark"]
+    fn benchmark_repeated_complete_frames() {
+        let mut terminal = TerminalCore::new(44, 160, 0).unwrap();
+        let line = format!("{}\r\n", "x".repeat(159));
+        for _ in 0..43 {
+            let _responses = terminal.apply_output(line.as_bytes());
+        }
+        let _warmup = terminal.frame().unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..1_000 {
+            std::hint::black_box(terminal.frame().unwrap());
+        }
+        println!(
+            "METRIC repeated_frame_median_proxy_us={:.1}",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
     }
 }

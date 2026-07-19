@@ -329,7 +329,7 @@ pub(crate) fn configure_pty_environment(builder: &mut CommandBuilder, options: &
     if !options.inherit_env {
         builder.env_clear();
     }
-    builder.env("TERM", "xterm-truecolor");
+    builder.env("TERM", "xterm-256color");
     builder.env("COLORTERM", "truecolor");
     match options.color {
         ColorMode::Auto => {}
@@ -355,7 +355,7 @@ fn configure_process_environment(builder: &mut ProcessCommand, options: &Options
     if !options.inherit_env {
         builder.env_clear();
     }
-    builder.env("TERM", "xterm-truecolor");
+    builder.env("TERM", "xterm-256color");
     builder.env("COLORTERM", "truecolor");
     match options.color {
         ColorMode::Auto => {}
@@ -464,8 +464,8 @@ pub(crate) fn respond_to_output(
     if host.is_enabled() {
         host.respond(output)
     } else {
-        if !ghostty_response.is_empty() {
-            host.send(&ghostty_response)?;
+        if !ghostty_response.is_empty() && !host.send_if_open(&ghostty_response)? {
+            return Ok(Vec::new());
         }
         Ok(ghostty_response)
     }
@@ -542,6 +542,14 @@ impl Host {
         self.writer.flush().context("flush terminal input")
     }
 
+    pub(crate) fn send_if_open(&mut self, input: &[u8]) -> Result<bool> {
+        match self.send(input) {
+            Ok(()) => Ok(true),
+            Err(error) if terminal_input_closed(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -604,17 +612,35 @@ impl Host {
             response.extend_from_slice(b"\x1b_Gi=31337;EINVAL:graphics unavailable\x1b\\");
             self.kitty_replied = true;
         }
-        if !response.is_empty() {
-            self.writer
-                .write_all(&response)
-                .context("write OpenTUI host response")?;
-            self.writer.flush().context("flush OpenTUI host response")?;
+        if !response.is_empty() && !self.send_if_open(&response)? {
+            response.clear();
         }
         if self.probe.len() > 64 {
             self.probe.drain(..self.probe.len() - 64);
         }
         Ok(response)
     }
+}
+
+fn terminal_input_closed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let Some(error) = cause.downcast_ref::<std::io::Error>() else {
+            return false;
+        };
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::UnexpectedEof
+        ) {
+            return true;
+        }
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(libc::EIO) {
+            return true;
+        }
+        false
+    })
 }
 
 #[cfg(test)]
@@ -633,6 +659,20 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn classifies_only_closed_terminal_input_errors_as_nonfatal() {
+        assert!(terminal_input_closed(&anyhow::Error::new(
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed")
+        )));
+        assert!(!terminal_input_closed(&anyhow::Error::new(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied")
+        )));
+        #[cfg(unix)]
+        assert!(terminal_input_closed(&anyhow::Error::new(
+            std::io::Error::from_raw_os_error(libc::EIO)
+        )));
     }
 
     #[test]

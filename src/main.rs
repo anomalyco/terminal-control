@@ -16,7 +16,7 @@ Examples:
   termctrl show -- my-terminal-app
   termctrl save --format png --out captures/app.png -- my-terminal-app
   termctrl start demo --host opentui -- opencode
-  termctrl run editor -- nvim
+  termctrl run
   termctrl wait demo '/connect' && termctrl send demo text:/connect enter
   termctrl show demo
   termctrl save demo --format png --out captures/provider.png
@@ -66,14 +66,19 @@ Example:
   termctrl stop demo";
 
 const RUN_HELP: &str = "\
-Run starts a PTY session in the foreground and mirrors it through the current terminal. Omit NAME
-to use the executable basename as the session name. Inferred names must be valid session names and
-must not collide with an existing session.
-The application remains directly visible and interactive in this terminal pane while agents use
-the same named-session commands to inspect its screen, send input, and resize it. The application
-exits with this foreground command; no terminal multiplexer or terminal-specific API is required.
+Run enters a visible Terminal Control workspace. With no arguments it starts $SHELL in the current
+directory under the default name `workspace`. Supply a command after -- to replace the first shell,
+or NAME to expose a stable explicit control socket.
+
+Use ctrl-b % to split right, ctrl-b h/l to focus, ctrl-b x to close the active pane, ctrl-b q to
+quit, and ctrl-b ctrl-b to send a literal ctrl-b. Agents can inspect the composed workspace or a
+specific pane, list stable pane ids, and send input without stealing human focus.
 
 Examples:
+  termctrl run
+  termctrl panes workspace
+  termctrl send workspace --pane 1 text:opencode2 enter
+  termctrl show workspace --pane 1
   termctrl run editor --cwd ~/src/project -- nvim
   termctrl run -- /usr/bin/nvim";
 
@@ -163,7 +168,7 @@ enum Command {
     /// Start a named persistent terminal application.
     #[command(after_help = START_HELP)]
     Start(StartArgs),
-    /// Run a named, agent-controllable application visibly in this terminal.
+    /// Enter a visible, agent-controllable terminal workspace.
     #[command(after_help = RUN_HELP)]
     Run(RunArgs),
     /// Wait until a named session includes visible text.
@@ -175,6 +180,8 @@ enum Command {
     Status(StatusArgs),
     /// List named local sessions and their states.
     List(ListArgs),
+    /// List panes in a running workspace.
+    Panes(PanesArgs),
     /// Resize a named live session.
     Resize(ResizeArgs),
     /// Add a named moment to an active recording for later editing.
@@ -231,6 +238,9 @@ struct SourceArgs {
     /// Existing named terminal session to read.
     #[arg(value_name = "NAME")]
     name: Option<String>,
+    /// Read one workspace pane instead of the composed workspace.
+    #[arg(long, requires = "name")]
+    pane: Option<u32>,
     /// Terminal width in cells for command or ANSI input (default: 80).
     #[arg(long)]
     cols: Option<u16>,
@@ -347,7 +357,7 @@ struct StartArgs {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Stable local name used by later session commands; defaults to the executable basename.
+    /// Stable local name used by later commands; defaults to `workspace` or the executable name.
     #[arg(value_name = "NAME")]
     name: Option<String>,
     /// Terminal width in cells when terminal dimensions cannot be detected.
@@ -368,7 +378,7 @@ struct RunArgs {
     /// Working directory for the terminal command.
     #[arg(long)]
     cwd: Option<PathBuf>,
-    /// Write timestamped terminal output and client/host input to this private recording file.
+    /// Record the initial pane; split panes are not yet included.
     #[arg(long)]
     record: Option<PathBuf>,
     /// Color environment policy for the terminal command.
@@ -388,6 +398,9 @@ struct WaitArgs {
     name: String,
     /// Visible text that must appear in the session screen.
     text: String,
+    /// Target one workspace pane instead of the active pane.
+    #[arg(long)]
+    pane: Option<u32>,
     /// Maximum time to wait before returning an error.
     #[arg(long, default_value_t = 5000, value_name = "MS")]
     timeout: u64,
@@ -397,6 +410,9 @@ struct WaitArgs {
 struct SendArgs {
     /// Name of a running session.
     name: String,
+    /// Target one workspace pane instead of the active pane.
+    #[arg(long)]
+    pane: Option<u32>,
     /// Delay between input atoms; text is split into characters when set.
     #[arg(long, default_value_t = 0)]
     pace_ms: u64,
@@ -420,6 +436,15 @@ struct StatusArgs {
 #[derive(Args)]
 struct ListArgs {
     /// Write structured JSON entries, including stale sockets.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct PanesArgs {
+    /// Name of a running workspace.
+    name: String,
+    /// Write structured JSON pane entries.
     #[arg(long)]
     json: bool,
 }
@@ -622,11 +647,17 @@ fn main() -> Result<()> {
         }
         Command::Run(args) => run_session(&args)?,
         Command::Wait(args) => {
-            session::wait(&args.name, args.text, Duration::from_millis(args.timeout))?;
+            session::wait_for(
+                &args.name,
+                args.pane,
+                args.text,
+                Duration::from_millis(args.timeout),
+            )?;
         }
         Command::Send(args) => send(args)?,
         Command::Status(args) => status(args)?,
         Command::List(args) => list(args)?,
+        Command::Panes(args) => panes(args)?,
         Command::Resize(args) => {
             validate_terminal_size(args.cols, args.rows)?;
             session::resize(
@@ -766,7 +797,7 @@ fn read_source(args: &SourceArgs, render: &RenderArgs) -> Result<shot_engine::Sh
         {
             bail!("named-session reads support rendering, --settle-ms, and --deadline-ms only");
         }
-        return session::show(name, settle, deadline);
+        return session::show_pane(name, args.pane, settle, deadline);
     }
     let cols = args.cols.unwrap_or(defaults.cols);
     let rows = args.rows.unwrap_or(defaults.rows);
@@ -859,7 +890,12 @@ fn send(args: SendArgs) -> Result<()> {
         }
         session_input(&args.input, args.pace_ms > 0)?
     };
-    session::send(&args.name, input, Duration::from_millis(args.pace_ms))?;
+    session::send_to(
+        &args.name,
+        args.pane,
+        input,
+        Duration::from_millis(args.pace_ms),
+    )?;
     Ok(())
 }
 
@@ -966,6 +1002,7 @@ fn start_session(args: &StartArgs) -> Result<()> {
 fn run_session(args: &RunArgs) -> Result<()> {
     let name = match args.name.as_deref() {
         Some(name) => name.to_owned(),
+        None if args.command.is_empty() => "workspace".to_owned(),
         None => session::infer_name(&args.command)?,
     };
     let (cols, rows) = crossterm::terminal::size().unwrap_or((args.cols, args.rows));
@@ -986,6 +1023,25 @@ fn run_session(args: &RunArgs) -> Result<()> {
             ..shot_engine::Options::default()
         },
     )
+}
+
+fn panes(args: PanesArgs) -> Result<()> {
+    let panes = session::panes(&args.name)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&panes)?);
+        return Ok(());
+    }
+    for pane in panes {
+        println!(
+            "{}\t{}\t{}x{}\t{}",
+            pane.id,
+            if pane.active { "active" } else { "" },
+            pane.cols,
+            pane.rows,
+            pane.command.join(" ")
+        );
+    }
+    Ok(())
 }
 
 fn restart_session(args: &RestartArgs) -> Result<()> {
@@ -1240,7 +1296,13 @@ mod tests {
 
     #[test]
     fn parses_flat_session_control_commands() {
+        assert!(Cli::try_parse_from(["termctrl", "run"]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "run", "editor", "--", "nvim", "."]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "panes", "workspace", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["termctrl", "send", "workspace", "--pane", "1", "enter"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["termctrl", "show", "workspace", "--pane", "1"]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "status", "demo", "--json"]).is_ok());
         assert!(
             Cli::try_parse_from([
@@ -1256,6 +1318,17 @@ mod tests {
         assert!(
             Cli::try_parse_from(["termctrl", "wait", "demo", "ready", "--timeout", "5"]).is_ok()
         );
+    }
+
+    #[test]
+    fn parses_default_shell_workspace() {
+        let cli = Cli::try_parse_from(["termctrl", "run"]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.name, None);
+        assert!(args.command.is_empty());
     }
 
     #[test]

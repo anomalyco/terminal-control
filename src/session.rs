@@ -5,9 +5,10 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::frame::Frame;
 use crate::recording::{self, InputOrigin};
 use crate::shot::{self, Host, Options, Shot, respond_to_output};
-use crate::terminal_core::{SCROLLBACK_ROWS, TerminalCore};
+use crate::terminal_core::{InputModes, SCROLLBACK_ROWS, TerminalCore};
 use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -457,6 +458,23 @@ impl Session {
         self.consume_batch()
     }
 
+    pub(crate) fn frame(&mut self) -> Result<Frame> {
+        self.consume_batch()?;
+        self.terminal.frame()
+    }
+
+    pub(crate) fn snapshot(&mut self) -> Result<Shot> {
+        self.consume_batch()?;
+        Ok(Shot {
+            frame: self.terminal.frame()?,
+            ansi: self.ansi.clone(),
+        })
+    }
+
+    pub(crate) fn input_modes(&self) -> Result<InputModes> {
+        self.terminal.input_modes()
+    }
+
     fn consume_batch(&mut self) -> Result<()> {
         for _ in 0..OUTPUT_BATCH {
             if !self.consume_one()? {
@@ -610,14 +628,20 @@ enum Request {
     Wait {
         text: String,
         timeout_ms: u64,
+        #[serde(default)]
+        pane: Option<crate::workspace::PaneId>,
     },
     Send {
         input: Vec<Vec<u8>>,
         pace_ms: u64,
+        #[serde(default)]
+        pane: Option<crate::workspace::PaneId>,
     },
     Show {
         settle_ms: u64,
         deadline_ms: u64,
+        #[serde(default)]
+        pane: Option<crate::workspace::PaneId>,
     },
     Logs {
         ansi: bool,
@@ -631,6 +655,7 @@ enum Request {
     Mark {
         name: String,
     },
+    Panes,
     Stop,
 }
 
@@ -640,6 +665,8 @@ struct Response {
     captured: Option<Shot>,
     status: Option<SessionStatus>,
     logs: Option<Vec<u8>>,
+    #[serde(default)]
+    panes: Option<Vec<crate::workspace::PaneStatus>>,
 }
 
 #[doc(hidden)]
@@ -668,11 +695,22 @@ pub fn restart(
 
 #[doc(hidden)]
 pub fn wait(name: &str, text: String, timeout: Duration) -> Result<()> {
+    wait_for(name, None, text, timeout)
+}
+
+#[doc(hidden)]
+pub fn wait_for(
+    name: &str,
+    pane: Option<crate::workspace::PaneId>,
+    text: String,
+    timeout: Duration,
+) -> Result<()> {
     request(
         name,
         Request::Wait {
             text,
             timeout_ms: timeout.as_millis() as u64,
+            pane,
         },
     )?;
     Ok(())
@@ -687,11 +725,22 @@ pub fn status(name: &str) -> Result<SessionStatus> {
 
 #[doc(hidden)]
 pub fn send(name: &str, input: Vec<Vec<u8>>, pace: Duration) -> Result<()> {
+    send_to(name, None, input, pace)
+}
+
+#[doc(hidden)]
+pub fn send_to(
+    name: &str,
+    pane: Option<crate::workspace::PaneId>,
+    input: Vec<Vec<u8>>,
+    pace: Duration,
+) -> Result<()> {
     request(
         name,
         Request::Send {
             input,
             pace_ms: pace.as_millis() as u64,
+            pane,
         },
     )?;
     Ok(())
@@ -699,15 +748,33 @@ pub fn send(name: &str, input: Vec<Vec<u8>>, pace: Duration) -> Result<()> {
 
 #[doc(hidden)]
 pub fn show(name: &str, settle: Duration, deadline: Duration) -> Result<Shot> {
+    show_pane(name, None, settle, deadline)
+}
+
+#[doc(hidden)]
+pub fn show_pane(
+    name: &str,
+    pane: Option<crate::workspace::PaneId>,
+    settle: Duration,
+    deadline: Duration,
+) -> Result<Shot> {
     request(
         name,
         Request::Show {
             settle_ms: settle.as_millis() as u64,
             deadline_ms: deadline.as_millis() as u64,
+            pane,
         },
     )?
     .captured
     .ok_or_else(|| anyhow::anyhow!("session did not return a visible screen"))
+}
+
+#[doc(hidden)]
+pub fn panes(name: &str) -> Result<Vec<crate::workspace::PaneStatus>> {
+    request(name, Request::Panes)?
+        .panes
+        .ok_or_else(|| anyhow::anyhow!("session did not return panes"))
 }
 
 #[doc(hidden)]
@@ -840,10 +907,12 @@ mod implementation {
 
     use super::{NamedSessionStatus, Request, Response, Session, UnavailableReason};
     use crate::shot::{self, Options};
+    use crate::workspace::{InputAction, OuterScreen, PrefixDecoder, Workspace};
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
     const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
     const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+    const MAX_CONTROL_DURATION_MS: u64 = 10 * 60 * 1000;
 
     struct StartLock(fs::File);
 
@@ -1138,9 +1207,6 @@ mod implementation {
         record: Option<&Path>,
         options: &Options,
     ) -> Result<()> {
-        if command.is_empty() {
-            bail!("provide a command after --");
-        }
         let runtime = runtime_dir()?;
         let socket = runtime.join(format!("{name}.sock"));
         ensure_socket_path(&socket)?;
@@ -1158,8 +1224,7 @@ mod implementation {
             fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("secure {}", socket.display()))?;
             listener.set_nonblocking(true)?;
-            let mut session = Session::start(command, cwd, record, options)?;
-            session.mirror_to(std::io::stdout());
+            let mut workspace = Workspace::start(command, cwd, record, options)?;
             let (input_send, input_receive) = std::sync::mpsc::channel::<Vec<u8>>();
             thread::spawn(move || {
                 let mut stdin = std::io::stdin().lock();
@@ -1170,36 +1235,109 @@ mod implementation {
                     }
                 }
             });
-            let _raw = RawMode::enter()?;
+            let raw = RawMode::enter()?;
+            let mut screen = OuterScreen::enter()?;
+            let mut decoder = PrefixDecoder::default();
+            let mut last_frame = None;
             loop {
-                session.consume_batch()?;
-                while let Ok(input) = input_receive.try_recv() {
-                    session.send(&input)?;
+                if !tick_workspace(
+                    &mut workspace,
+                    &input_receive,
+                    &mut decoder,
+                    &mut screen,
+                    options,
+                    &mut last_frame,
+                )? {
+                    break;
                 }
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        if handle(stream, &mut session)? {
+                        if handle_workspace(stream, &mut workspace, &mut |workspace| {
+                            tick_workspace(
+                                workspace,
+                                &input_receive,
+                                &mut decoder,
+                                &mut screen,
+                                options,
+                                &mut last_frame,
+                            )
+                        })? {
                             break;
                         }
                     }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                     Err(error) => return Err(error).context("accept session request"),
                 }
-                if session.status()?.state == super::SessionState::Exited {
-                    break;
-                }
-                if let Ok((cols, rows)) = crossterm::terminal::size() {
-                    let status = session.status()?;
-                    if cols > 0 && rows > 0 && (cols != status.cols || rows != status.rows) {
-                        session.resize(cols, rows, status.cell_width, status.cell_height)?;
-                    }
-                }
                 thread::sleep(Duration::from_millis(5));
+            }
+            let final_text = (!command.is_empty() && !workspace.was_stopped())
+                .then(|| last_frame.as_ref().map(crate::frame::Frame::text))
+                .flatten()
+                .filter(|text| !text.is_empty());
+            drop(screen);
+            drop(raw);
+            if let Some(text) = final_text {
+                let mut stdout = std::io::stdout().lock();
+                stdout
+                    .write_all(text.as_bytes())
+                    .context("write final workspace screen")?;
+                stdout
+                    .write_all(b"\n")
+                    .context("write final workspace newline")?;
+                stdout.flush().context("flush final workspace screen")?;
             }
             Ok(())
         })();
         let _ = fs::remove_file(&socket);
         result
+    }
+
+    fn tick_workspace(
+        workspace: &mut Workspace,
+        input_receive: &std::sync::mpsc::Receiver<Vec<u8>>,
+        decoder: &mut PrefixDecoder,
+        screen: &mut OuterScreen,
+        options: &Options,
+        last_frame: &mut Option<crate::frame::Frame>,
+    ) -> Result<bool> {
+        workspace.pump()?;
+        while let Ok(input) = input_receive.try_recv() {
+            for action in decoder.push(&input) {
+                match action {
+                    InputAction::Send(input) => workspace.send(None, &input)?,
+                    InputAction::SplitRight => {
+                        if workspace.split_right().is_err() {
+                            screen.bell()?;
+                        }
+                    }
+                    InputAction::FocusLeft => {
+                        workspace.focus_left();
+                    }
+                    InputAction::FocusRight => {
+                        workspace.focus_right();
+                    }
+                    InputAction::CloseActive => workspace.close_active()?,
+                    InputAction::Quit => workspace.stop(),
+                }
+            }
+        }
+        if workspace.is_empty() {
+            return Ok(false);
+        }
+        if let Ok((cols, rows)) = crossterm::terminal::size()
+            && cols > 0
+            && rows > 0
+        {
+            workspace.resize(cols, rows, options.cell_width, options.cell_height)?;
+        }
+        screen.sync_input_modes(workspace.active_input_modes()?)?;
+        let frame = workspace.frame()?;
+        if last_frame.as_ref() != Some(&frame) {
+            screen.paint(&frame)?;
+            *last_frame = Some(frame);
+        }
+        workspace.remove_exited()?;
+        Ok(!workspace.is_empty())
     }
 
     fn ensure_socket_path(path: &Path) -> Result<()> {
@@ -1250,6 +1388,7 @@ mod implementation {
                 captured: None,
                 status: None,
                 logs: None,
+                panes: None,
             },
             Ok(_) => match serde_json::from_slice::<Request>(&bytes) {
                 Ok(request) => {
@@ -1261,6 +1400,7 @@ mod implementation {
                             captured: None,
                             status: None,
                             logs: None,
+                            panes: None,
                         },
                     };
                     if write_response(&mut stream, &response).is_ok() && stop {
@@ -1273,6 +1413,7 @@ mod implementation {
                     captured: None,
                     status: None,
                     logs: None,
+                    panes: None,
                 },
             },
             Err(error) => Response {
@@ -1280,6 +1421,71 @@ mod implementation {
                 captured: None,
                 status: None,
                 logs: None,
+                panes: None,
+            },
+        };
+        let _ = write_response(&mut stream, &response);
+        Ok(false)
+    }
+
+    fn handle_workspace(
+        mut stream: UnixStream,
+        workspace: &mut Workspace,
+        tick: &mut impl FnMut(&mut Workspace) -> Result<bool>,
+    ) -> Result<bool> {
+        stream
+            .set_nonblocking(false)
+            .context("set workspace connection blocking")?;
+        stream
+            .set_read_timeout(Some(CONTROL_TIMEOUT))
+            .context("set workspace request timeout")?;
+        stream
+            .set_write_timeout(Some(CONTROL_TIMEOUT))
+            .context("set workspace response timeout")?;
+        let mut bytes = Vec::new();
+        let response = match Read::by_ref(&mut stream)
+            .take(MAX_REQUEST_BYTES + 1)
+            .read_to_end(&mut bytes)
+        {
+            Ok(_) if bytes.len() as u64 > MAX_REQUEST_BYTES => Response {
+                error: Some("workspace request exceeds 1 MiB".to_owned()),
+                captured: None,
+                status: None,
+                logs: None,
+                panes: None,
+            },
+            Ok(_) => match serde_json::from_slice::<Request>(&bytes) {
+                Ok(request) => {
+                    let stop = matches!(request, Request::Stop);
+                    let response =
+                        respond_workspace(workspace, request, tick).unwrap_or_else(|error| {
+                            Response {
+                                error: Some(format!("{error:#}")),
+                                captured: None,
+                                status: None,
+                                logs: None,
+                                panes: None,
+                            }
+                        });
+                    if write_response(&mut stream, &response).is_ok() && stop {
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                Err(error) => Response {
+                    error: Some(format!("invalid workspace request: {error}")),
+                    captured: None,
+                    status: None,
+                    logs: None,
+                    panes: None,
+                },
+            },
+            Err(error) => Response {
+                error: Some(format!("failed to read workspace request: {error}")),
+                captured: None,
+                status: None,
+                logs: None,
+                panes: None,
             },
         };
         let _ = write_response(&mut stream, &response);
@@ -1297,20 +1503,39 @@ mod implementation {
             captured: None,
             status: None,
             logs: None,
+            panes: None,
         };
         match request {
             Request::Ping => {}
             Request::Status => response.status = Some(session.status()?),
-            Request::Send { input, pace_ms } => {
+            Request::Send {
+                input,
+                pace_ms,
+                pane,
+            } => {
+                if pane.is_some_and(|pane| pane != 0) {
+                    bail!("single sessions only contain pane 0");
+                }
                 session.send_all(&input, Duration::from_millis(pace_ms))?;
             }
-            Request::Wait { text, timeout_ms } => {
+            Request::Wait {
+                text,
+                timeout_ms,
+                pane,
+            } => {
+                if pane.is_some_and(|pane| pane != 0) {
+                    bail!("single sessions only contain pane 0");
+                }
                 session.wait_for_text(&text, Duration::from_millis(timeout_ms))?;
             }
             Request::Show {
                 settle_ms,
                 deadline_ms,
+                pane,
             } => {
+                if pane.is_some_and(|pane| pane != 0) {
+                    bail!("single sessions only contain pane 0");
+                }
                 response.captured = Some(
                     session
                         .capture(
@@ -1336,9 +1561,89 @@ mod implementation {
                 )?;
             }
             Request::Mark { name } => session.mark(&name)?,
+            Request::Panes => {
+                let status = session.status()?;
+                response.panes = Some(vec![crate::workspace::PaneStatus {
+                    id: 0,
+                    active: true,
+                    state: status.state,
+                    cols: status.cols,
+                    rows: status.rows,
+                    command: status.launch.command,
+                    cwd: status.launch.cwd,
+                }]);
+            }
             Request::Stop => session.stop()?,
         }
         Ok(response)
+    }
+
+    fn respond_workspace(
+        workspace: &mut Workspace,
+        request: Request,
+        tick: &mut impl FnMut(&mut Workspace) -> Result<bool>,
+    ) -> Result<Response> {
+        let mut response = Response {
+            error: None,
+            captured: None,
+            status: None,
+            logs: None,
+            panes: None,
+        };
+        match request {
+            Request::Ping => {}
+            Request::Status => response.status = Some(workspace.status()?),
+            Request::Send {
+                input,
+                pace_ms,
+                pane,
+            } => {
+                let duration = pace_ms.saturating_mul(input.len().saturating_sub(1) as u64);
+                require_control_duration("paced input", duration)?;
+                workspace.send_all(pane, &input, Duration::from_millis(pace_ms), &mut *tick)?;
+            }
+            Request::Wait {
+                text,
+                timeout_ms,
+                pane,
+            } => {
+                require_control_duration("wait timeout", timeout_ms)?;
+                workspace.wait_for_text(
+                    pane,
+                    &text,
+                    Duration::from_millis(timeout_ms),
+                    &mut *tick,
+                )?;
+            }
+            Request::Show {
+                settle_ms,
+                deadline_ms,
+                pane,
+            } => {
+                require_control_duration("capture deadline", deadline_ms)?;
+                response.captured = Some(workspace.capture(
+                    pane,
+                    Duration::from_millis(settle_ms),
+                    Duration::from_millis(deadline_ms),
+                    &mut *tick,
+                )?);
+            }
+            Request::Logs { ansi } => response.logs = Some(workspace.active_logs(ansi)?),
+            Request::Resize { .. } => {
+                bail!("visible workspace dimensions are owned by the attached terminal")
+            }
+            Request::Mark { name } => workspace.mark_recording(&name)?,
+            Request::Panes => response.panes = Some(workspace.panes()?),
+            Request::Stop => workspace.stop(),
+        }
+        Ok(response)
+    }
+
+    fn require_control_duration(label: &str, milliseconds: u64) -> Result<()> {
+        if milliseconds > MAX_CONTROL_DURATION_MS {
+            bail!("{label} exceeds the 10 minute workspace control limit");
+        }
+        Ok(())
     }
 
     #[cfg(test)]

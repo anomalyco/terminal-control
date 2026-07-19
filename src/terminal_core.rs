@@ -6,7 +6,7 @@ use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
 use libghostty_vt::render::{CellIterator, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{PaletteIndex, RgbColor, Underline as GhosttyUnderline};
-use libghostty_vt::{RenderState, Terminal, TerminalOptions};
+use libghostty_vt::{RenderState, Terminal, TerminalOptions, terminal::Mode};
 
 use crate::frame::{
     Attributes, Cell, Color, Cursor, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, FORMAT_VERSION, Frame,
@@ -14,6 +14,14 @@ use crate::frame::{
 };
 
 pub(crate) const SCROLLBACK_ROWS: usize = 10_000;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InputModes {
+    pub cursor_keys: bool,
+    pub keypad_keys: bool,
+    pub focus_events: bool,
+    pub bracketed_paste: bool,
+}
 
 pub(crate) struct TerminalCore {
     terminal: Terminal<'static, 'static>,
@@ -93,6 +101,15 @@ impl TerminalCore {
             .format_alloc(None)
             .context("format Ghostty scrollback")?;
         Ok(bytes.as_ref().to_vec())
+    }
+
+    pub(crate) fn input_modes(&self) -> Result<InputModes> {
+        Ok(InputModes {
+            cursor_keys: self.terminal.mode(Mode::DECCKM)?,
+            keypad_keys: self.terminal.mode(Mode::KEYPAD_KEYS)?,
+            focus_events: self.terminal.mode(Mode::FOCUS_EVENT)?,
+            bracketed_paste: self.terminal.mode(Mode::BRACKETED_PASTE)?,
+        })
     }
 
     pub(crate) fn frame(&mut self) -> Result<Frame> {
@@ -229,6 +246,18 @@ mod tests {
         let mut terminal = TerminalCore::new(1, 20, 0).unwrap();
 
         assert_eq!(terminal.apply_output(b"\x1b[5n"), b"\x1b[0n");
+    }
+
+    #[test]
+    fn exposes_input_modes_requested_by_the_application() {
+        let mut terminal = TerminalCore::new(1, 20, 0).unwrap();
+        let _responses = terminal.apply_output(b"\x1b[?1h\x1b=\x1b[?1004h\x1b[?2004h");
+
+        let modes = terminal.input_modes().unwrap();
+        assert!(modes.cursor_keys);
+        assert!(modes.keypad_keys);
+        assert!(modes.focus_events);
+        assert!(modes.bracketed_paste);
     }
 
     #[test]

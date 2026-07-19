@@ -26,6 +26,9 @@ struct SessionName {
 struct ScreenRequest {
     name: String,
     #[serde(default)]
+    #[schemars(description = "Optional workspace pane id; omit for the composed workspace")]
+    pane: Option<u32>,
+    #[serde(default)]
     #[schemars(
         description = "Optional quiet period before returning; omit for an immediate snapshot"
     )]
@@ -39,6 +42,9 @@ struct ScreenRequest {
 #[serde(rename_all = "camelCase")]
 struct SendRequest {
     name: String,
+    #[serde(default)]
+    #[schemars(description = "Optional workspace pane id; omit for the active pane")]
+    pane: Option<u32>,
     #[schemars(description = "Ordered typed terminal input")]
     input: Vec<Input>,
     #[serde(default)]
@@ -49,6 +55,11 @@ struct SendRequest {
 #[serde(rename_all = "camelCase")]
 struct InteractRequest {
     name: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional workspace pane id; omit to target the active pane and return the composed workspace"
+    )]
+    pane: Option<u32>,
     #[schemars(description = "Ordered typed terminal input")]
     input: Vec<Input>,
     #[serde(default)]
@@ -129,6 +140,23 @@ struct SessionList {
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct PaneSummary {
+    id: u32,
+    active: bool,
+    state: String,
+    cols: u16,
+    rows: u16,
+    command: Vec<String>,
+    cwd: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct PaneList {
+    panes: Vec<PaneSummary>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct ProcessExit {
     code: u32,
     signal: Option<String>,
@@ -205,6 +233,31 @@ impl TerminalControl {
         .await
     }
 
+    #[tool(description = "List stable panes in a named Terminal Control workspace")]
+    async fn list_panes(
+        &self,
+        Parameters(SessionName { name }): Parameters<SessionName>,
+    ) -> Result<Json<PaneList>, String> {
+        blocking(move || {
+            let panes = session::panes(&name).map_err(format_error)?;
+            Ok(Json(PaneList {
+                panes: panes
+                    .into_iter()
+                    .map(|pane| PaneSummary {
+                        id: pane.id,
+                        active: pane.active,
+                        state: state(pane.state).to_owned(),
+                        cols: pane.cols,
+                        rows: pane.rows,
+                        command: pane.command,
+                        cwd: path_string(&pane.cwd),
+                    })
+                    .collect(),
+            }))
+        })
+        .await
+    }
+
     #[tool(description = "Read the current visible screen of a named terminal session")]
     async fn get_screen(
         &self,
@@ -221,8 +274,9 @@ impl TerminalControl {
         Parameters(request): Parameters<SendRequest>,
     ) -> Result<String, String> {
         blocking(move || {
-            session::send(
+            session::send_to(
                 &request.name,
+                request.pane,
                 encode_input(request.input)?,
                 Duration::from_millis(request.pace_ms),
             )
@@ -240,15 +294,17 @@ impl TerminalControl {
         Parameters(request): Parameters<InteractRequest>,
     ) -> Result<Json<Screen>, String> {
         blocking(move || {
-            session::send(
+            session::send_to(
                 &request.name,
+                request.pane,
                 encode_input(request.input)?,
                 Duration::from_millis(request.pace_ms),
             )
             .map_err(format_error)?;
             if let Some(text) = request.wait_for {
-                session::wait(
+                session::wait_for(
                     &request.name,
+                    request.pane,
                     text,
                     Duration::from_millis(request.timeout_ms),
                 )
@@ -256,6 +312,7 @@ impl TerminalControl {
             }
             capture(ScreenRequest {
                 name: request.name,
+                pane: request.pane,
                 settle_ms: request.settle_ms,
                 deadline_ms: request.deadline_ms,
             })
@@ -264,7 +321,9 @@ impl TerminalControl {
         .map(Json)
     }
 
-    #[tool(description = "Resize a named terminal session")]
+    #[tool(
+        description = "Resize a named detached session; attached workspaces follow their terminal"
+    )]
     async fn resize_session(
         &self,
         Parameters(request): Parameters<ResizeRequest>,
@@ -305,8 +364,9 @@ pub async fn serve() -> anyhow::Result<()> {
 }
 
 fn capture(request: ScreenRequest) -> Result<Screen, String> {
-    let shot = session::show(
+    let shot = session::show_pane(
         &request.name,
+        request.pane,
         Duration::from_millis(request.settle_ms),
         Duration::from_millis(request.deadline_ms),
     )
@@ -316,8 +376,8 @@ fn capture(request: ScreenRequest) -> Result<Screen, String> {
         name: request.name,
         text: shot.frame.text(),
         state: state(status.state).to_owned(),
-        cols: status.cols,
-        rows: status.rows,
+        cols: shot.frame.cols,
+        rows: shot.frame.rows,
     })
 }
 
@@ -459,6 +519,7 @@ mod tests {
                 "get_screen",
                 "get_session_status",
                 "interact",
+                "list_panes",
                 "list_sessions",
                 "resize_session",
                 "send_input",

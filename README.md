@@ -123,16 +123,30 @@ termctrl logs demo --ansi > captures/demo-output.ansi
 
 Full-screen alternate-screen TUIs do not produce useful logs; read their visible screen with `show`.
 
-## Share A Session With A Human
+## Enter A Shared Workspace
 
-`run` keeps the application visible and interactive in your current terminal pane while agents control the same PTY through the named session commands:
+`run` opens a visible workspace with one shell in the current directory. Human and agent input share the same live Ghostty-backed panes:
 
 ```bash
+termctrl run
 termctrl run -- nvim
 termctrl run editor --cwd ~/src/project -- nvim
 ```
 
-Without `NAME`, the session name is the executable basename (`nvim` above); a name collision is an error, never a suffixed name. No tmux or multiplexer involved.
+Use `ctrl-b %` to split right, `ctrl-b h/l` to focus panes, `ctrl-b x` to close the active pane, and `ctrl-b q` to quit. The initial workspace supports two side-by-side panes.
+
+Agents discover stable pane IDs and can inspect or drive a pane without changing human focus:
+
+```bash
+termctrl panes workspace --json
+termctrl show workspace
+termctrl show workspace --pane 1
+termctrl send workspace --pane 1 text:opencode2 enter
+```
+
+Without a command or name, the workspace is named `workspace`. When a command is supplied without `NAME`, its executable basename remains the inferred name.
+
+An attached workspace follows the size of its terminal, so resize the terminal itself rather than using `termctrl resize`. `--record` currently records the initial pane; use an outer Terminal Control session when a composed workspace recording is required. Composed ANSI saves are rendered snapshots, while `--pane ID --format ansi` retains that pane's original VT stream.
 
 ## Record And Export Video
 

@@ -29,16 +29,23 @@ termctrl stop app
 
 Always stop named sessions after use unless the user explicitly wants the live process retained.
 
-Keep an application visible and human-controlled in the current terminal pane while exposing the
-same session controls to agents:
+Enter a visible workspace that humans and agents control together:
 
 ```bash
+termctrl run
 termctrl run -- /usr/bin/nvim
 termctrl run editor -- nvim
+termctrl panes workspace --json
+termctrl send workspace --pane 1 text:opencode2 enter
 ```
 
-The form without `NAME` uses the executable basename (`nvim`) and fails on a name collision; it
-never chooses a suffixed name. Pass an explicit name when running multiple copies.
+With no arguments, `run` starts `$SHELL` in the `workspace` session. Use `ctrl-b %` to split right,
+`ctrl-b h/l` to focus, `ctrl-b x` to close a pane, and `ctrl-b q` to quit. A supplied command still
+uses its executable basename when `NAME` is omitted.
+
+Attached workspaces follow their visible terminal and reject `termctrl resize`. `run --record` records
+the initial pane only; wrap `run` in an outer named session when a composed workspace recording is
+needed. Composed ANSI output is a rendered snapshot; pane-targeted ANSI is the original pane stream.
 
 ## Choose The Correct Observation
 

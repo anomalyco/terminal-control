@@ -36,13 +36,22 @@ termctrl run
 termctrl run -- /usr/bin/nvim
 termctrl run editor -- nvim
 termctrl panes workspace --json
+termctrl layout workspace --grid 2x2
 termctrl send workspace --pane 1 text:opencode2 enter
+termctrl focus workspace --pane 1
+termctrl close-pane workspace --pane 1
 ```
 
 With no arguments, `run` starts `$SHELL` in the `workspace` session. Use `ctrl-b %` for left/right
 panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l` to focus directionally, and `ctrl-b ?` for
 help. Killing a pane with `ctrl-b x` or quitting with `ctrl-b q` requires a second press. A supplied
-command still uses its executable basename when `NAME` is omitted.
+command still uses its executable basename when `NAME` is omitted. Splits can build up to four
+panes.
+
+Pane IDs are stable identities; do not infer identity from list order, position, or application-owned
+titles. `layout --grid 2x2` opens missing shell panes without changing human focus. It never kills
+surplus panes, so close exact IDs first when shrinking. Pane-targeted `send`, `show`, and `wait` do
+not change focus; use `focus --pane ID` only when intentionally moving human focus.
 
 Attached workspaces follow their visible terminal and reject `termctrl resize`. `run --record` records
 the initial pane only; wrap `run` in an outer named session when a composed workspace recording is

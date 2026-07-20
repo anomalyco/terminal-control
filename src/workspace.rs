@@ -12,6 +12,7 @@ use crate::frame::{
 use crate::session::{Session, SessionLaunch, SessionState, SessionStatus};
 use crate::shot::{Options, Shot};
 use crate::terminal_core::InputModes;
+use crate::terminal_theme::TerminalTheme;
 
 pub type PaneId = u32;
 
@@ -24,18 +25,19 @@ const PASTE_CHUNK_BYTES: usize = 64 * 1024;
 
 pub(crate) struct Workspace {
     panes: Vec<Pane>,
-    active: usize,
+    active: Option<PaneId>,
+    layout: Option<LayoutNode>,
+    applied: AppliedLayout,
     next_id: PaneId,
     cols: u16,
     rows: u16,
     cwd: PathBuf,
     shell: Vec<String>,
     options: Options,
+    theme: TerminalTheme,
     launch: SessionLaunch,
     stopped: bool,
     paste: Option<(PaneId, bool)>,
-    split: SplitLayout,
-    constrained: bool,
 }
 
 struct Pane {
@@ -43,11 +45,98 @@ struct Pane {
     session: Session,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SplitLayout {
-    #[default]
-    SideBySide,
-    Stacked,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitAxis {
+    Columns,
+    Rows,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LayoutNode {
+    Leaf(PaneId),
+    Split {
+        axis: SplitAxis,
+        first: Box<LayoutNode>,
+        second: Box<LayoutNode>,
+    },
+}
+
+impl LayoutNode {
+    fn contains(&self, pane: PaneId) -> bool {
+        match self {
+            Self::Leaf(id) => *id == pane,
+            Self::Split { first, second, .. } => first.contains(pane) || second.contains(pane),
+        }
+    }
+
+    fn first_leaf(&self) -> PaneId {
+        match self {
+            Self::Leaf(id) => *id,
+            Self::Split { first, .. } => first.first_leaf(),
+        }
+    }
+
+    fn split_leaf(&mut self, target: PaneId, axis: SplitAxis, pane: PaneId) -> bool {
+        match self {
+            Self::Leaf(id) if *id == target => {
+                *self = Self::Split {
+                    axis,
+                    first: Box::new(Self::Leaf(target)),
+                    second: Box::new(Self::Leaf(pane)),
+                };
+                true
+            }
+            Self::Leaf(_) => false,
+            Self::Split { first, second, .. } => {
+                first.split_leaf(target, axis, pane) || second.split_leaf(target, axis, pane)
+            }
+        }
+    }
+
+    fn remove_leaf(self, target: PaneId) -> (Option<Self>, bool) {
+        match self {
+            Self::Leaf(id) if id == target => (None, true),
+            Self::Leaf(_) => (Some(self), false),
+            Self::Split {
+                axis,
+                first,
+                second,
+            } => {
+                if first.contains(target) {
+                    let (first, removed) = first.remove_leaf(target);
+                    let tree = match first {
+                        Some(first) => Some(Self::Split {
+                            axis,
+                            first: Box::new(first),
+                            second,
+                        }),
+                        None => Some(*second),
+                    };
+                    (tree, removed)
+                } else if second.contains(target) {
+                    let (second, removed) = second.remove_leaf(target);
+                    let tree = match second {
+                        Some(second) => Some(Self::Split {
+                            axis,
+                            first,
+                            second: Box::new(second),
+                        }),
+                        None => Some(*first),
+                    };
+                    (tree, removed)
+                } else {
+                    (
+                        Some(Self::Split {
+                            axis,
+                            first,
+                            second,
+                        }),
+                        false,
+                    )
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,15 +148,6 @@ enum Direction {
 }
 
 impl Direction {
-    fn target(self) -> (SplitLayout, usize) {
-        match self {
-            Self::Left => (SplitLayout::SideBySide, 0),
-            Self::Right => (SplitLayout::SideBySide, 1),
-            Self::Up => (SplitLayout::Stacked, 0),
-            Self::Down => (SplitLayout::Stacked, 1),
-        }
-    }
-
     fn unavailable(self) -> &'static str {
         match self {
             Self::Left => "no pane to the left",
@@ -78,13 +158,64 @@ impl Direction {
     }
 }
 
+fn directional_score(
+    current: PaneRect,
+    candidate: PaneRect,
+    pane: PaneId,
+    direction: Direction,
+) -> Option<(bool, u16, u16, PaneId)> {
+    let current_right = current.x.saturating_add(current.cols);
+    let candidate_right = candidate.x.saturating_add(candidate.cols);
+    let current_bottom = current.y.saturating_add(current.rows);
+    let candidate_bottom = candidate.y.saturating_add(candidate.rows);
+    let current_x = current.x.saturating_mul(2).saturating_add(current.cols);
+    let candidate_x = candidate.x.saturating_mul(2).saturating_add(candidate.cols);
+    let current_y = current.y.saturating_mul(2).saturating_add(current.rows);
+    let candidate_y = candidate.y.saturating_mul(2).saturating_add(candidate.rows);
+    let horizontal_overlap = current.x < candidate_right && candidate.x < current_right;
+    let vertical_overlap = current.y < candidate_bottom && candidate.y < current_bottom;
+    match direction {
+        Direction::Left if candidate_right <= current.x => Some((
+            !vertical_overlap,
+            current.x - candidate_right,
+            current_y.abs_diff(candidate_y),
+            pane,
+        )),
+        Direction::Right if candidate.x >= current_right => Some((
+            !vertical_overlap,
+            candidate.x - current_right,
+            current_y.abs_diff(candidate_y),
+            pane,
+        )),
+        Direction::Up if candidate_bottom <= current.y => Some((
+            !horizontal_overlap,
+            current.y - candidate_bottom,
+            current_x.abs_diff(candidate_x),
+            pane,
+        )),
+        Direction::Down if candidate.y >= current_bottom => Some((
+            !horizontal_overlap,
+            candidate.y - current_bottom,
+            current_x.abs_diff(candidate_x),
+            pane,
+        )),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PaneStatus {
     pub id: PaneId,
     pub active: bool,
     pub state: SessionState,
+    #[serde(default)]
+    pub x: u16,
+    #[serde(default)]
+    pub y: u16,
     pub cols: u16,
     pub rows: u16,
+    #[serde(default)]
+    pub title: String,
     pub command: Vec<String>,
     pub cwd: PathBuf,
 }
@@ -97,34 +228,103 @@ struct PaneRect {
     rows: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlacedPane {
+    id: PaneId,
+    rect: PaneRect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Divider {
+    axis: SplitAxis,
+    x: u16,
+    y: u16,
+    len: u16,
+    first_active: bool,
+    second_active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceGeometry {
+    panes: Vec<PlacedPane>,
+    dividers: Vec<Divider>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AppliedLayout {
+    Ready(WorkspaceGeometry),
+    Constrained(WorkspaceGeometry),
+}
+
+impl AppliedLayout {
+    fn geometry(&self) -> &WorkspaceGeometry {
+        match self {
+            Self::Ready(geometry) | Self::Constrained(geometry) => geometry,
+        }
+    }
+
+    fn geometry_mut(&mut self) -> &mut WorkspaceGeometry {
+        match self {
+            Self::Ready(geometry) | Self::Constrained(geometry) => geometry,
+        }
+    }
+
+    fn is_constrained(&self) -> bool {
+        matches!(self, Self::Constrained(_))
+    }
+}
+
 impl Workspace {
+    #[cfg(test)]
     pub(crate) fn start(
         command: &[String],
         cwd: Option<&Path>,
         record: Option<&Path>,
         options: &Options,
     ) -> Result<Self> {
+        Self::start_with_theme(command, cwd, record, options, TerminalTheme::default())
+    }
+
+    pub(crate) fn start_with_theme(
+        command: &[String],
+        cwd: Option<&Path>,
+        record: Option<&Path>,
+        options: &Options,
+        theme: TerminalTheme,
+    ) -> Result<Self> {
         let cwd = cwd
             .map(Path::to_owned)
             .unwrap_or(std::env::current_dir().context("resolve workspace directory")?);
         let shell = shell_command();
         let command = if command.is_empty() { &shell } else { command };
-        let mut session = Session::start(command, Some(&cwd), record, options)?;
+        let mut session = Session::start_with_theme(command, Some(&cwd), record, options, theme)?;
         let launch = session.status()?.launch;
         Ok(Self {
             panes: vec![Pane { id: 0, session }],
-            active: 0,
+            active: Some(0),
+            layout: Some(LayoutNode::Leaf(0)),
+            applied: AppliedLayout::Ready(WorkspaceGeometry {
+                panes: vec![PlacedPane {
+                    id: 0,
+                    rect: PaneRect {
+                        x: 0,
+                        y: 0,
+                        cols: options.cols,
+                        rows: options.rows,
+                    },
+                }],
+                dividers: Vec::new(),
+            }),
             next_id: 1,
             cols: options.cols,
             rows: options.rows,
             cwd,
             shell,
             options: options.clone(),
+            theme,
             launch,
             stopped: false,
             paste: None,
-            split: SplitLayout::default(),
-            constrained: false,
         })
     }
 
@@ -137,7 +337,7 @@ impl Workspace {
     }
 
     pub(crate) fn active_id(&self) -> Option<PaneId> {
-        self.panes.get(self.active).map(|pane| pane.id)
+        self.active
     }
 
     pub(crate) fn pump(&mut self) -> Result<()> {
@@ -156,104 +356,207 @@ impl Workspace {
     }
 
     pub(crate) fn remove_observed_exits(&mut self) -> Result<bool> {
-        let mut removed = false;
-        let mut active_removed = false;
-        let mut index = 0;
-        while index < self.panes.len() {
-            if self.panes[index].session.exit_observed() {
-                let id = self.panes[index].id;
-                if self.paste.is_some_and(|(target, _)| target == id) {
-                    self.paste = None;
-                }
-                if index == self.active {
-                    active_removed = true;
-                } else if index < self.active {
-                    self.active -= 1;
-                }
-                self.panes.remove(index);
-                removed = true;
-                if self.active >= self.panes.len() {
-                    self.active = self.panes.len().saturating_sub(1);
-                }
-            } else {
-                index += 1;
+        let exited = self
+            .panes
+            .iter()
+            .filter(|pane| pane.session.exit_observed())
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>();
+        if exited.is_empty() {
+            return Ok(false);
+        }
+        let active_removed = self.active.is_some_and(|active| exited.contains(&active));
+        for id in &exited {
+            self.remove_layout_pane(*id);
+            self.panes.retain(|pane| pane.id != *id);
+            if self.paste.is_some_and(|(target, _)| target == *id) {
+                self.paste = None;
             }
         }
-        if removed && !self.panes.is_empty() {
-            if active_removed && self.panes[self.active].session.input_modes()?.focus_events {
-                self.panes[self.active]
-                    .session
-                    .send_current_if_open(b"\x1b[I")?;
-            }
-            self.apply_layout()?;
+        if self.panes.is_empty() {
+            self.active = None;
+            self.layout = None;
+            self.applied = AppliedLayout::Ready(WorkspaceGeometry {
+                panes: Vec::new(),
+                dividers: Vec::new(),
+            });
+            return Ok(true);
         }
-        Ok(removed)
+        if active_removed {
+            self.active = self.first_layout_pane();
+            self.send_focus(self.active, true)?;
+        }
+        self.refresh_layout()?;
+        Ok(true)
     }
 
-    fn split(&mut self, split: SplitLayout) -> Result<()> {
-        if self.panes.is_empty() {
-            bail!("workspace has no pane to split");
+    fn split(&mut self, axis: SplitAxis) -> Result<()> {
+        let active = self
+            .active
+            .ok_or_else(|| anyhow::anyhow!("workspace has no pane to split"))?;
+        if self.panes.len() >= 4 {
+            bail!("workspace supports at most four panes");
         }
-        if self.panes.len() >= 2 {
-            bail!("the initial workspace supports at most two panes");
+        let new_id = self.next_id;
+        let mut layout = self
+            .layout
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("workspace has no layout"))?;
+        if !layout.split_leaf(active, axis, new_id) {
+            bail!("workspace layout has no pane {active}");
         }
-        let rects = layout(self.cols, self.rows, 2, split)?;
-        let mut options = self.options.clone();
-        options.cols = rects[1].cols;
-        options.rows = rects[1].rows;
-        let session = Session::start(&self.shell, Some(&self.cwd), None, &options)?;
-        self.panes[0].session.resize(
-            rects[0].cols,
-            rects[0].rows,
-            self.options.cell_width,
-            self.options.cell_height,
-        )?;
-        self.panes.push(Pane {
-            id: self.next_id,
-            session,
-        });
-        self.split = split;
+        let geometry = geometry(&layout, self.cols, self.rows, Some(new_id))?;
+        let rect = geometry
+            .panes
+            .iter()
+            .find(|pane| pane.id == new_id)
+            .map(|pane| pane.rect)
+            .context("new pane has no layout rectangle")?;
+        let pane = self.spawn_pane(new_id, rect)?;
+        self.panes.push(pane);
+        if let Err(error) = self.apply_geometry(geometry) {
+            if let Some(mut pane) = self.panes.pop() {
+                let _ = pane.session.stop();
+            }
+            return Err(error);
+        }
         self.next_id += 1;
-        self.focus(1)?;
+        self.layout = Some(layout);
+        self.focus_pane(new_id)
+    }
+
+    pub(crate) fn set_grid(&mut self, columns: u16, rows: u16) -> Result<()> {
+        if !(1..=2).contains(&columns) || !(1..=2).contains(&rows) {
+            bail!("workspace grids support one or two columns and rows");
+        }
+        let desired = usize::from(columns) * usize::from(rows);
+        if desired < self.panes.len() {
+            bail!(
+                "grid {columns}x{rows} has {desired} cells but workspace has {} panes; close panes explicitly first",
+                self.panes.len()
+            );
+        }
+        let mut ids = self.panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        while ids.len() < desired {
+            ids.push(self.next_id + u32::try_from(ids.len() - self.panes.len()).unwrap_or(0));
+        }
+        let layout = grid_layout(&ids, columns, rows)?;
+        if self.layout.as_ref() == Some(&layout) {
+            return Ok(());
+        }
+        let geometry = geometry(&layout, self.cols, self.rows, self.active)?;
+        let mut added = Vec::new();
+        for id in ids
+            .iter()
+            .copied()
+            .filter(|id| self.pane_index(*id).is_none())
+        {
+            let rect = geometry
+                .panes
+                .iter()
+                .find(|pane| pane.id == id)
+                .map(|pane| pane.rect)
+                .context("new pane has no layout rectangle")?;
+            added.push(self.spawn_pane(id, rect)?);
+        }
+        let added_len = added.len();
+        self.panes.extend(added);
+        if let Err(error) = self.apply_geometry(geometry) {
+            for _ in 0..added_len {
+                if let Some(mut pane) = self.panes.pop() {
+                    let _ = pane.session.stop();
+                }
+            }
+            return Err(error);
+        }
+        self.next_id += u32::try_from(added_len).unwrap_or(0);
+        self.layout = Some(layout);
         Ok(())
     }
 
     fn focus_direction(&mut self, direction: Direction) -> Result<bool> {
-        let (split, target) = direction.target();
-        if self.split != split || target >= self.panes.len() {
+        let active = match self.active {
+            Some(active) => active,
+            None => return Ok(false),
+        };
+        let panes = &self.applied.geometry().panes;
+        let Some(current) = panes.iter().find(|pane| pane.id == active) else {
             return Ok(false);
+        };
+        let target = panes
+            .iter()
+            .filter(|pane| pane.id != active)
+            .filter_map(|pane| directional_score(current.rect, pane.rect, pane.id, direction))
+            .min_by_key(|score| *score)
+            .map(|(_, _, _, pane)| pane);
+        match target {
+            Some(target) => {
+                self.focus_pane(target)?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        self.focus(target)
+    }
+
+    pub(crate) fn focus_pane(&mut self, pane: PaneId) -> Result<()> {
+        self.resolve_pane(Some(pane))?;
+        if self.active == Some(pane) {
+            return Ok(());
+        }
+        let applied = if self.applied.is_constrained() {
+            None
+        } else {
+            Some(geometry(
+                self.layout.as_ref().context("workspace has no layout")?,
+                self.cols,
+                self.rows,
+                Some(pane),
+            )?)
+        };
+        self.send_focus(self.active, false)?;
+        self.active = Some(pane);
+        if let Some(applied) = applied {
+            self.applied = AppliedLayout::Ready(applied);
+        }
+        self.send_focus(self.active, true)
     }
 
     pub(crate) fn close_active(&mut self) -> Result<()> {
-        if self.panes.is_empty() {
+        let Some(active) = self.active else {
             return Ok(());
+        };
+        self.close_pane(active)
+    }
+
+    pub(crate) fn close_pane(&mut self, pane: PaneId) -> Result<()> {
+        let index = self.resolve_pane(Some(pane))?;
+        let closing_active = self.active == Some(pane);
+        if closing_active {
+            self.send_focus(Some(pane), false)?;
         }
-        if self.panes[self.active].session.input_modes()?.focus_events {
-            self.panes[self.active]
-                .session
-                .send_current_if_open(b"\x1b[O")?;
-        }
-        let id = self.panes[self.active].id;
-        if self.paste.is_some_and(|(target, _)| target == id) {
+        self.remove_layout_pane(pane);
+        if self.paste.is_some_and(|(target, _)| target == pane) {
             self.paste = None;
         }
-        let mut pane = self.panes.remove(self.active);
+        let mut pane = self.panes.remove(index);
         pane.session.stop()?;
         if self.panes.is_empty() {
+            self.active = None;
+            self.layout = None;
+            self.applied = AppliedLayout::Ready(WorkspaceGeometry {
+                panes: Vec::new(),
+                dividers: Vec::new(),
+            });
             self.stopped = true;
+            return Ok(());
         }
-        if self.active >= self.panes.len() {
-            self.active = self.panes.len().saturating_sub(1);
+        if closing_active {
+            self.active = self.first_layout_pane();
         }
-        if !self.panes.is_empty() {
-            if self.panes[self.active].session.input_modes()?.focus_events {
-                self.panes[self.active]
-                    .session
-                    .send_current_if_open(b"\x1b[I")?;
-            }
-            self.apply_layout()?;
+        self.refresh_layout()?;
+        if closing_active {
+            self.send_focus(self.active, true)?;
         }
         Ok(())
     }
@@ -284,16 +587,16 @@ impl Workspace {
     }
 
     pub(crate) fn send_paste(&mut self, input: &[u8]) -> Result<bool> {
-        let (target, _) = self
-            .paste
-            .ok_or_else(|| anyhow::anyhow!("workspace paste has not started"))?;
+        let Some((target, _)) = self.paste else {
+            return Ok(true);
+        };
         let index = self.resolve_pane(Some(target))?;
         self.panes[index].session.send_current_if_open(input)
     }
 
     pub(crate) fn end_paste(&mut self) -> Result<bool> {
         let Some((target, bracketed)) = self.paste.take() else {
-            bail!("workspace paste has not started");
+            return Ok(true);
         };
         if bracketed {
             let index = self.resolve_pane(Some(target))?;
@@ -339,41 +642,32 @@ impl Workspace {
         {
             return Ok(());
         }
-        let constrained = self.panes.len() == 2
-            && match self.split {
-                SplitLayout::SideBySide => cols < 3,
-                SplitLayout::Stacked => rows < 3,
-            };
         self.cols = cols;
         self.rows = rows;
         self.options.cols = cols;
         self.options.rows = rows;
         self.options.cell_width = cell_width;
         self.options.cell_height = cell_height;
-        self.constrained = constrained;
-        if constrained {
-            return Ok(());
-        }
-        let rects = layout(cols, rows, self.panes.len(), self.split)?;
-        self.apply_rects(&rects)
+        self.refresh_layout()
     }
 
     pub(crate) fn frame(&mut self) -> Result<Frame> {
-        if self.constrained {
+        if self.applied.is_constrained() {
             return self.constrained_frame();
         }
-        let rects = layout(self.cols, self.rows, self.panes.len(), self.split)?;
-        let mut frames = Vec::with_capacity(self.panes.len());
-        for pane in &mut self.panes {
-            frames.push(pane.session.current_frame()?);
+        let mut frames = Vec::with_capacity(self.applied.geometry().panes.len());
+        for placed in &self.applied.geometry().panes {
+            let index = self
+                .pane_index(placed.id)
+                .ok_or_else(|| anyhow::anyhow!("layout references missing pane {}", placed.id))?;
+            frames.push((placed.id, self.panes[index].session.current_frame()?));
         }
-        Ok(compose(
+        Ok(compose_workspace(
             self.cols,
             self.rows,
-            &rects,
+            self.applied.geometry(),
             &frames,
             self.active,
-            self.split,
         ))
     }
 
@@ -390,13 +684,7 @@ impl Workspace {
         frame.cursor = frame
             .cursor
             .filter(|cursor| cursor.x < frame.cols && cursor.y < frame.rows);
-        add_overlay(
-            &mut frame,
-            match self.split {
-                SplitLayout::SideBySide => "split needs 3 cols",
-                SplitLayout::Stacked => "split needs 3 rows",
-            },
-        );
+        add_overlay(&mut frame, "layout too small");
         Ok(frame)
     }
 
@@ -456,14 +744,25 @@ impl Workspace {
 
     pub(crate) fn panes(&mut self) -> Result<Vec<PaneStatus>> {
         let mut statuses = Vec::with_capacity(self.panes.len());
-        for (index, pane) in self.panes.iter_mut().enumerate() {
+        for pane in &mut self.panes {
             let status = pane.session.status()?;
+            let rect = self
+                .applied
+                .geometry()
+                .panes
+                .iter()
+                .find(|placed| placed.id == pane.id)
+                .map(|placed| placed.rect)
+                .context("pane has no applied layout rectangle")?;
             statuses.push(PaneStatus {
                 id: pane.id,
-                active: index == self.active,
+                active: self.active == Some(pane.id),
                 state: status.state,
+                x: rect.x,
+                y: rect.y,
                 cols: status.cols,
                 rows: status.rows,
+                title: pane.session.title()?,
                 command: status.launch.command,
                 cwd: status.launch.cwd,
             });
@@ -493,7 +792,8 @@ impl Workspace {
 
     pub(crate) fn active_input_modes(&self) -> Result<InputModes> {
         let index = self.resolve_pane(None)?;
-        self.panes[index].session.input_modes()
+        let modes = self.panes[index].session.input_modes()?;
+        Ok(outer_input_modes(modes, self.panes.len()))
     }
 
     pub(crate) fn active_title(&self) -> Result<String> {
@@ -509,7 +809,11 @@ impl Workspace {
     }
 
     pub(crate) fn active_cursor_style(&self) -> libghostty_vt::render::CursorVisualStyle {
-        self.panes[self.active].session.cursor_style()
+        self.active
+            .and_then(|active| self.pane_index(active))
+            .map_or(libghostty_vt::render::CursorVisualStyle::Block, |index| {
+                self.panes[index].session.cursor_style()
+            })
     }
 
     pub(crate) fn wait_for_text(
@@ -584,26 +888,110 @@ impl Workspace {
             let _ = pane.session.stop();
         }
         self.panes.clear();
+        self.active = None;
+        self.layout = None;
+        self.applied = AppliedLayout::Ready(WorkspaceGeometry {
+            panes: Vec::new(),
+            dividers: Vec::new(),
+        });
     }
 
     pub(crate) fn was_stopped(&self) -> bool {
         self.stopped
     }
 
-    fn apply_layout(&mut self) -> Result<()> {
-        let rects = layout(self.cols, self.rows, self.panes.len(), self.split)?;
-        self.constrained = false;
-        self.apply_rects(&rects)
+    fn refresh_layout(&mut self) -> Result<()> {
+        let Some(layout) = &self.layout else {
+            self.applied = AppliedLayout::Ready(WorkspaceGeometry {
+                panes: Vec::new(),
+                dividers: Vec::new(),
+            });
+            return Ok(());
+        };
+        match geometry(layout, self.cols, self.rows, self.active) {
+            Ok(geometry) => self.apply_geometry(geometry),
+            Err(_) => {
+                self.applied = AppliedLayout::Constrained(self.applied.geometry().clone());
+                Ok(())
+            }
+        }
     }
 
-    fn apply_rects(&mut self, rects: &[PaneRect]) -> Result<()> {
-        for (pane, rect) in self.panes.iter_mut().zip(rects) {
-            pane.session.resize(
-                rect.cols,
-                rect.rows,
+    fn apply_geometry(&mut self, geometry: WorkspaceGeometry) -> Result<()> {
+        let previous = self.applied.geometry().clone();
+        for placed in &geometry.panes {
+            let index = self
+                .pane_index(placed.id)
+                .ok_or_else(|| anyhow::anyhow!("layout references missing pane {}", placed.id))?;
+            if let Err(error) = self.panes[index].session.resize(
+                placed.rect.cols,
+                placed.rect.rows,
                 self.options.cell_width,
                 self.options.cell_height,
-            )?;
+            ) {
+                for previous in &previous.panes {
+                    if let Some(index) = self.pane_index(previous.id) {
+                        let _ = self.panes[index].session.resize(
+                            previous.rect.cols,
+                            previous.rect.rows,
+                            self.options.cell_width,
+                            self.options.cell_height,
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        }
+        self.applied = AppliedLayout::Ready(geometry);
+        Ok(())
+    }
+
+    fn spawn_pane(&self, id: PaneId, rect: PaneRect) -> Result<Pane> {
+        let mut options = self.options.clone();
+        options.cols = rect.cols;
+        options.rows = rect.rows;
+        Ok(Pane {
+            id,
+            session: Session::start_with_theme(
+                &self.shell,
+                Some(&self.cwd),
+                None,
+                &options,
+                self.theme,
+            )?,
+        })
+    }
+
+    fn remove_layout_pane(&mut self, pane: PaneId) {
+        if let Some(layout) = self.layout.take() {
+            let (layout, removed) = layout.remove_leaf(pane);
+            debug_assert!(removed, "pane collection and layout tree diverged");
+            self.layout = layout;
+        }
+        self.applied
+            .geometry_mut()
+            .panes
+            .retain(|placed| placed.id != pane);
+    }
+
+    fn first_layout_pane(&self) -> Option<PaneId> {
+        self.layout.as_ref().map(LayoutNode::first_leaf)
+    }
+
+    fn pane_index(&self, pane: PaneId) -> Option<usize> {
+        self.panes.iter().position(|candidate| candidate.id == pane)
+    }
+
+    fn send_focus(&mut self, pane: Option<PaneId>, focused: bool) -> Result<()> {
+        let Some(index) = pane.and_then(|pane| self.pane_index(pane)) else {
+            return Ok(());
+        };
+        if self.panes[index].session.input_modes()?.focus_events {
+            self.panes[index].session.send_current_if_open(if focused {
+                b"\x1b[I"
+            } else {
+                b"\x1b[O"
+            })?;
         }
         Ok(())
     }
@@ -611,34 +999,13 @@ impl Workspace {
     fn resolve_pane(&self, pane: Option<PaneId>) -> Result<usize> {
         match pane {
             Some(id) => self
-                .panes
-                .iter()
-                .position(|pane| pane.id == id)
+                .pane_index(id)
                 .ok_or_else(|| anyhow::anyhow!("workspace has no pane {id}")),
             None => self
-                .panes
-                .get(self.active)
-                .map(|_| self.active)
+                .active
+                .and_then(|active| self.pane_index(active))
                 .ok_or_else(|| anyhow::anyhow!("workspace has no active pane")),
         }
-    }
-
-    fn focus(&mut self, next: usize) -> Result<bool> {
-        if self.active == next {
-            return Ok(false);
-        }
-        if self.panes[self.active].session.input_modes()?.focus_events {
-            self.panes[self.active]
-                .session
-                .send_current_if_open(b"\x1b[O")?;
-        }
-        self.active = next;
-        if self.panes[self.active].session.input_modes()?.focus_events {
-            self.panes[self.active]
-                .session
-                .send_current_if_open(b"\x1b[I")?;
-        }
-        Ok(true)
     }
 }
 
@@ -652,78 +1019,167 @@ fn shell_command() -> Vec<String> {
     vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned())]
 }
 
-fn layout(cols: u16, rows: u16, panes: usize, split: SplitLayout) -> Result<Vec<PaneRect>> {
-    match panes {
-        0 => Ok(Vec::new()),
-        1 => Ok(vec![PaneRect {
+fn geometry(
+    layout: &LayoutNode,
+    cols: u16,
+    rows: u16,
+    active: Option<PaneId>,
+) -> Result<WorkspaceGeometry> {
+    let mut geometry = WorkspaceGeometry {
+        panes: Vec::new(),
+        dividers: Vec::new(),
+    };
+    place_layout(
+        layout,
+        PaneRect {
             x: 0,
             y: 0,
             cols,
             rows,
-        }]),
-        2 if split == SplitLayout::SideBySide && cols >= 3 => {
-            let left = (cols - 1) / 2;
-            Ok(vec![
-                PaneRect {
-                    x: 0,
-                    y: 0,
-                    cols: left,
-                    rows,
-                },
-                PaneRect {
-                    x: left + 1,
-                    y: 0,
-                    cols: cols - left - 1,
-                    rows,
-                },
-            ])
-        }
-        2 if split == SplitLayout::Stacked && rows >= 3 => {
-            let top = (rows - 1) / 2;
-            Ok(vec![
-                PaneRect {
-                    x: 0,
-                    y: 0,
-                    cols,
-                    rows: top,
-                },
-                PaneRect {
-                    x: 0,
-                    y: top + 1,
-                    cols,
-                    rows: rows - top - 1,
-                },
-            ])
-        }
-        2 if split == SplitLayout::SideBySide => bail!("workspace is too narrow to split"),
-        2 => bail!("workspace is too short to split"),
-        _ => bail!("the initial workspace supports at most two panes"),
+        },
+        active,
+        &mut geometry,
+    )?;
+    Ok(geometry)
+}
+
+fn grid_layout(panes: &[PaneId], columns: u16, rows: u16) -> Result<LayoutNode> {
+    match (columns, rows, panes) {
+        (1, 1, [pane]) => Ok(LayoutNode::Leaf(*pane)),
+        (2, 1, [left, right]) => Ok(LayoutNode::Split {
+            axis: SplitAxis::Columns,
+            first: Box::new(LayoutNode::Leaf(*left)),
+            second: Box::new(LayoutNode::Leaf(*right)),
+        }),
+        (1, 2, [top, bottom]) => Ok(LayoutNode::Split {
+            axis: SplitAxis::Rows,
+            first: Box::new(LayoutNode::Leaf(*top)),
+            second: Box::new(LayoutNode::Leaf(*bottom)),
+        }),
+        (2, 2, [top_left, top_right, bottom_left, bottom_right]) => Ok(LayoutNode::Split {
+            axis: SplitAxis::Rows,
+            first: Box::new(LayoutNode::Split {
+                axis: SplitAxis::Columns,
+                first: Box::new(LayoutNode::Leaf(*top_left)),
+                second: Box::new(LayoutNode::Leaf(*top_right)),
+            }),
+            second: Box::new(LayoutNode::Split {
+                axis: SplitAxis::Columns,
+                first: Box::new(LayoutNode::Leaf(*bottom_left)),
+                second: Box::new(LayoutNode::Leaf(*bottom_right)),
+            }),
+        }),
+        _ => bail!("workspace grids support 1x1, 2x1, 1x2, or 2x2"),
     }
 }
 
-fn compose(
+fn place_layout(
+    layout: &LayoutNode,
+    rect: PaneRect,
+    active: Option<PaneId>,
+    geometry: &mut WorkspaceGeometry,
+) -> Result<()> {
+    match layout {
+        LayoutNode::Leaf(id) => geometry.panes.push(PlacedPane { id: *id, rect }),
+        LayoutNode::Split {
+            axis,
+            first,
+            second,
+        } => {
+            let (first_rect, second_rect, divider) = match axis {
+                SplitAxis::Columns if rect.cols >= 3 => {
+                    let first_cols = (rect.cols - 1) / 2;
+                    (
+                        PaneRect {
+                            cols: first_cols,
+                            ..rect
+                        },
+                        PaneRect {
+                            x: rect.x + first_cols + 1,
+                            cols: rect.cols - first_cols - 1,
+                            ..rect
+                        },
+                        Divider {
+                            axis: *axis,
+                            x: rect.x + first_cols,
+                            y: rect.y,
+                            len: rect.rows,
+                            first_active: active.is_some_and(|active| first.contains(active)),
+                            second_active: active.is_some_and(|active| second.contains(active)),
+                        },
+                    )
+                }
+                SplitAxis::Rows if rect.rows >= 3 => {
+                    let first_rows = (rect.rows - 1) / 2;
+                    (
+                        PaneRect {
+                            rows: first_rows,
+                            ..rect
+                        },
+                        PaneRect {
+                            y: rect.y + first_rows + 1,
+                            rows: rect.rows - first_rows - 1,
+                            ..rect
+                        },
+                        Divider {
+                            axis: *axis,
+                            x: rect.x,
+                            y: rect.y + first_rows,
+                            len: rect.cols,
+                            first_active: active.is_some_and(|active| first.contains(active)),
+                            second_active: active.is_some_and(|active| second.contains(active)),
+                        },
+                    )
+                }
+                SplitAxis::Columns => bail!("layout needs more columns"),
+                SplitAxis::Rows => bail!("layout needs more rows"),
+            };
+            geometry.dividers.push(divider);
+            place_layout(first, first_rect, active, geometry)?;
+            place_layout(second, second_rect, active, geometry)?;
+        }
+    }
+    Ok(())
+}
+
+fn compose_workspace(
     cols: u16,
     rows: u16,
-    rects: &[PaneRect],
-    frames: &[Frame],
-    active: usize,
-    split: SplitLayout,
+    geometry: &WorkspaceGeometry,
+    frames: &[(PaneId, Frame)],
+    active: Option<PaneId>,
 ) -> Frame {
-    let foreground = frames
-        .get(active)
-        .map_or(DEFAULT_FOREGROUND, |frame| frame.foreground);
-    let background = frames
-        .get(active)
-        .map_or(DEFAULT_BACKGROUND, |frame| frame.background);
-    let mut cells = Vec::new();
-    for (rect, frame) in rects.iter().zip(frames) {
+    let active_frame = active.and_then(|active| {
+        frames
+            .iter()
+            .find(|(pane, _)| *pane == active)
+            .map(|(_, frame)| frame)
+    });
+    let foreground = active_frame.map_or(DEFAULT_FOREGROUND, |frame| frame.foreground);
+    let background = active_frame.map_or(DEFAULT_BACKGROUND, |frame| frame.background);
+    let divider_cells = geometry
+        .dividers
+        .iter()
+        .map(|divider| usize::from(divider.len))
+        .sum::<usize>();
+    let mut cells = Vec::with_capacity(
+        frames
+            .iter()
+            .map(|(_, frame)| frame.cells.len())
+            .sum::<usize>()
+            + divider_cells,
+    );
+    for placed in &geometry.panes {
+        let Some((_, frame)) = frames.iter().find(|(pane, _)| *pane == placed.id) else {
+            continue;
+        };
         if frame.background != background {
-            for y in 0..rect.rows {
+            for y in 0..placed.rect.rows {
                 cells.push(Cell {
-                    x: rect.x,
-                    y: rect.y + y,
+                    x: placed.rect.x,
+                    y: placed.rect.y + y,
                     text: String::new(),
-                    width: rect.cols,
+                    width: placed.rect.cols,
                     foreground: frame.foreground,
                     background: frame.background,
                     attributes: Attributes::default(),
@@ -731,66 +1187,67 @@ fn compose(
             }
         }
         for cell in &frame.cells {
-            if cell.x >= rect.cols
-                || cell.y >= rect.rows
-                || cell.x.saturating_add(cell.width) > rect.cols
+            if cell.x >= placed.rect.cols
+                || cell.y >= placed.rect.rows
+                || cell.x.saturating_add(cell.width) > placed.rect.cols
             {
                 continue;
             }
             let mut cell = cell.clone();
-            cell.x += rect.x;
-            cell.y += rect.y;
+            cell.x += placed.rect.x;
+            cell.y += placed.rect.y;
             cells.push(cell);
         }
     }
-    if rects.len() == 2 {
-        match split {
-            SplitLayout::SideBySide => {
-                for y in 0..rows {
-                    cells.push(Cell {
-                        x: rects[0].cols,
-                        y,
-                        text: if y == 0 {
-                            if active == 0 { "◀" } else { "▶" }.to_owned()
-                        } else {
-                            VERTICAL_DIVIDER.to_owned()
-                        },
-                        width: 1,
-                        foreground,
-                        background,
-                        attributes: divider_attributes(y == 0),
-                    });
-                }
-            }
-            SplitLayout::Stacked => {
-                for x in 0..cols {
-                    cells.push(Cell {
-                        x,
-                        y: rects[0].rows,
-                        text: if x == 0 {
-                            if active == 0 { "▲" } else { "▼" }.to_owned()
-                        } else {
-                            HORIZONTAL_DIVIDER.to_owned()
-                        },
-                        width: 1,
-                        foreground,
-                        background,
-                        attributes: divider_attributes(x == 0),
-                    });
-                }
-            }
+    for divider in &geometry.dividers {
+        for offset in 0..divider.len {
+            let marker = offset == 0 && (divider.first_active || divider.second_active);
+            let text = match (divider.axis, marker, divider.first_active) {
+                (SplitAxis::Columns, true, true) => "◀",
+                (SplitAxis::Columns, true, false) => "▶",
+                (SplitAxis::Columns, false, _) => VERTICAL_DIVIDER,
+                (SplitAxis::Rows, true, true) => "▲",
+                (SplitAxis::Rows, true, false) => "▼",
+                (SplitAxis::Rows, false, _) => HORIZONTAL_DIVIDER,
+            };
+            cells.push(Cell {
+                x: divider.x
+                    + if divider.axis == SplitAxis::Rows {
+                        offset
+                    } else {
+                        0
+                    },
+                y: divider.y
+                    + if divider.axis == SplitAxis::Columns {
+                        offset
+                    } else {
+                        0
+                    },
+                text: text.to_owned(),
+                width: 1,
+                foreground,
+                background,
+                attributes: divider_attributes(marker),
+            });
         }
     }
-    let cursor = rects
-        .get(active)
-        .zip(frames.get(active))
-        .and_then(|(rect, frame)| frame.cursor.as_ref().map(|cursor| (rect, cursor)))
-        .and_then(|(rect, cursor)| {
-            (cursor.x < rect.cols && cursor.y < rect.rows).then(|| Cursor {
-                x: rect.x + cursor.x,
-                y: rect.y + cursor.y,
-                color: cursor.color,
-                blinking: cursor.blinking,
+    let cursor = active
+        .and_then(|active| {
+            geometry.panes.iter().find(|pane| pane.id == active).zip(
+                frames
+                    .iter()
+                    .find(|(pane, _)| *pane == active)
+                    .map(|(_, frame)| frame),
+            )
+        })
+        .and_then(|(placed, frame)| {
+            frame.cursor.as_ref().and_then(|cursor| {
+                (cursor.x < placed.rect.cols && cursor.y < placed.rect.rows).then(|| Cursor {
+                    x: placed.rect.x + cursor.x,
+                    y: placed.rect.y + cursor.y,
+                    color: cursor.color,
+                    blinking: cursor.blinking,
+                })
             })
         });
     Frame {
@@ -824,7 +1281,7 @@ enum InputAction {
     PasteStart,
     PasteData(Vec<u8>),
     PasteEnd,
-    Split(SplitLayout),
+    Split(SplitAxis),
     Focus(Direction),
     CloseActive,
     Quit,
@@ -910,8 +1367,8 @@ impl PrefixDecoder {
             if self.waiting {
                 flush_plain(&mut actions, &mut plain);
                 let action = match byte {
-                    b'%' => InputAction::Split(SplitLayout::SideBySide),
-                    b'"' => InputAction::Split(SplitLayout::Stacked),
+                    b'%' => InputAction::Split(SplitAxis::Columns),
+                    b'"' => InputAction::Split(SplitAxis::Rows),
                     b'h' => InputAction::Focus(Direction::Left),
                     b'l' => InputAction::Focus(Direction::Right),
                     b'k' => InputAction::Focus(Direction::Up),
@@ -1330,15 +1787,7 @@ impl OuterScreen {
         if modes == self.modes {
             return Ok(());
         }
-        set_dec_mode(&mut self.output, 1, modes.cursor_keys)?;
-        self.output
-            .write_all(if modes.keypad_keys {
-                b"\x1b="
-            } else {
-                b"\x1b>"
-            })
-            .context("set workspace keypad mode")?;
-        set_dec_mode(&mut self.output, 1004, modes.focus_events)?;
+        write_input_modes(&mut self.output, modes)?;
         self.modes = modes;
         Ok(())
     }
@@ -1563,7 +2012,9 @@ impl Drop for OuterScreen {
         let _ = self.stdout.write_all(&self.output);
         let _ = self
             .stdout
-            .write_all(b"\x1b[?2026l\x1b[?1l\x1b>\x1b[?1004l\x1b[?2004l");
+            .write_all(
+                b"\x1b[?2026l\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l",
+            );
         let _ = self
             .stdout
             .write_all(b"\x1b[0 q\x1b[0m\x1b[?25h\x1b[?1049l\x1b[23;0t");
@@ -1574,6 +2025,31 @@ impl Drop for OuterScreen {
 fn set_dec_mode(writer: &mut impl Write, mode: u16, enabled: bool) -> Result<()> {
     write!(writer, "\x1b[?{mode}{}", if enabled { 'h' } else { 'l' })
         .context("set workspace terminal mode")
+}
+
+fn write_input_modes(writer: &mut impl Write, modes: InputModes) -> Result<()> {
+    set_dec_mode(writer, 1, modes.cursor_keys)?;
+    writer
+        .write_all(if modes.keypad_keys {
+            b"\x1b="
+        } else {
+            b"\x1b>"
+        })
+        .context("set workspace keypad mode")?;
+    set_dec_mode(writer, 1000, modes.normal_mouse)?;
+    set_dec_mode(writer, 1002, modes.button_mouse)?;
+    set_dec_mode(writer, 1003, modes.any_mouse)?;
+    set_dec_mode(writer, 1006, modes.sgr_mouse)?;
+    set_dec_mode(writer, 1004, modes.focus_events)?;
+    Ok(())
+}
+
+fn outer_input_modes(modes: InputModes, pane_count: usize) -> InputModes {
+    if pane_count == 1 {
+        modes
+    } else {
+        modes.without_mouse()
+    }
 }
 
 fn attributes(attributes: &Attributes) -> String {
@@ -1633,21 +2109,66 @@ mod tests {
     }
 
     #[test]
+    fn single_pane_workspace_mirrors_child_mouse_modes() {
+        let modes = InputModes {
+            normal_mouse: true,
+            button_mouse: true,
+            any_mouse: true,
+            sgr_mouse: true,
+            ..InputModes::default()
+        };
+        let mut output = Vec::new();
+
+        write_input_modes(&mut output, outer_input_modes(modes, 1)).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[?1000h"));
+        assert!(output.contains("\x1b[?1002h"));
+        assert!(output.contains("\x1b[?1003h"));
+        assert!(output.contains("\x1b[?1006h"));
+    }
+
+    #[test]
+    fn split_workspace_does_not_forward_untranslated_mouse_coordinates() {
+        let modes = InputModes {
+            normal_mouse: true,
+            button_mouse: true,
+            any_mouse: true,
+            sgr_mouse: true,
+            ..InputModes::default()
+        };
+
+        let outer = outer_input_modes(modes, 2);
+
+        assert!(!outer.normal_mouse);
+        assert!(!outer.button_mouse);
+        assert!(!outer.any_mouse);
+        assert!(!outer.sgr_mouse);
+    }
+
+    #[test]
     fn two_pane_layout_reserves_one_divider_column() {
+        let layout = grid_layout(&[0, 1], 2, 1).unwrap();
         assert_eq!(
-            layout(80, 24, 2, SplitLayout::SideBySide).unwrap(),
+            geometry(&layout, 80, 24, Some(0)).unwrap().panes,
             [
-                PaneRect {
-                    x: 0,
-                    y: 0,
-                    cols: 39,
-                    rows: 24
+                PlacedPane {
+                    id: 0,
+                    rect: PaneRect {
+                        x: 0,
+                        y: 0,
+                        cols: 39,
+                        rows: 24
+                    },
                 },
-                PaneRect {
-                    x: 40,
-                    y: 0,
-                    cols: 40,
-                    rows: 24
+                PlacedPane {
+                    id: 1,
+                    rect: PaneRect {
+                        x: 40,
+                        y: 0,
+                        cols: 40,
+                        rows: 24
+                    },
                 }
             ]
         );
@@ -1655,17 +2176,17 @@ mod tests {
 
     #[test]
     fn composition_offsets_right_cells_and_active_cursor() {
-        let rects = layout(11, 3, 2, SplitLayout::SideBySide).unwrap();
-        let composed = compose(
+        let layout = grid_layout(&[0, 1], 2, 1).unwrap();
+        let geometry = geometry(&layout, 11, 3, Some(1)).unwrap();
+        let composed = compose_workspace(
             11,
             3,
-            &rects,
+            &geometry,
             &[
-                frame(5, 3, "L", Some((1, 1))),
-                frame(5, 3, "R", Some((2, 2))),
+                (0, frame(5, 3, "L", Some((1, 1)))),
+                (1, frame(5, 3, "R", Some((2, 2)))),
             ],
-            1,
-            SplitLayout::SideBySide,
+            Some(1),
         );
 
         assert!(
@@ -1680,34 +2201,40 @@ mod tests {
 
     #[test]
     fn stacked_layout_reserves_one_divider_row_and_offsets_the_bottom_pane() {
-        let rects = layout(8, 5, 2, SplitLayout::Stacked).unwrap();
+        let layout = grid_layout(&[0, 1], 1, 2).unwrap();
+        let geometry = geometry(&layout, 8, 5, Some(1)).unwrap();
         assert_eq!(
-            rects,
+            geometry.panes,
             [
-                PaneRect {
-                    x: 0,
-                    y: 0,
-                    cols: 8,
-                    rows: 2,
+                PlacedPane {
+                    id: 0,
+                    rect: PaneRect {
+                        x: 0,
+                        y: 0,
+                        cols: 8,
+                        rows: 2,
+                    },
                 },
-                PaneRect {
-                    x: 0,
-                    y: 3,
-                    cols: 8,
-                    rows: 2,
+                PlacedPane {
+                    id: 1,
+                    rect: PaneRect {
+                        x: 0,
+                        y: 3,
+                        cols: 8,
+                        rows: 2,
+                    },
                 },
             ]
         );
-        let composed = compose(
+        let composed = compose_workspace(
             8,
             5,
-            &rects,
+            &geometry,
             &[
-                frame(8, 2, "T", Some((1, 1))),
-                frame(8, 2, "B", Some((2, 1))),
+                (0, frame(8, 2, "T", Some((1, 1)))),
+                (1, frame(8, 2, "B", Some((2, 1)))),
             ],
-            1,
-            SplitLayout::Stacked,
+            Some(1),
         );
 
         assert_eq!(composed.cursor.as_ref().unwrap().y, 4);
@@ -1717,23 +2244,24 @@ mod tests {
     #[test]
     fn stacked_layout_offsets_bottom_background_spans_and_rejects_short_screens() {
         assert_eq!(
-            layout(8, 2, 2, SplitLayout::Stacked)
+            geometry(&grid_layout(&[0, 1], 1, 2).unwrap(), 8, 2, Some(0))
                 .unwrap_err()
                 .to_string(),
-            "workspace is too short to split"
+            "layout needs more rows"
         );
         assert_eq!(
-            layout(2, 8, 2, SplitLayout::SideBySide)
+            geometry(&grid_layout(&[0, 1], 2, 1).unwrap(), 2, 8, Some(0))
                 .unwrap_err()
                 .to_string(),
-            "workspace is too narrow to split"
+            "layout needs more columns"
         );
 
-        let rects = layout(8, 5, 2, SplitLayout::Stacked).unwrap();
+        let layout = grid_layout(&[0, 1], 1, 2).unwrap();
+        let geometry = geometry(&layout, 8, 5, Some(0)).unwrap();
         let top = frame(8, 2, "T", None);
         let mut bottom = frame(8, 2, "B", None);
         bottom.background = crate::frame::Color { r: 1, g: 2, b: 3 };
-        let composed = compose(8, 5, &rects, &[top, bottom], 0, SplitLayout::Stacked);
+        let composed = compose_workspace(8, 5, &geometry, &[(0, top), (1, bottom)], Some(0));
 
         assert!(composed.cells.iter().any(|cell| {
             cell.y == 3
@@ -1814,13 +2342,10 @@ mod tests {
         let mut decoder = PrefixDecoder::default();
 
         assert!(decoder.push(&[PREFIX]).is_empty());
-        assert_eq!(
-            decoder.push(b"%"),
-            [InputAction::Split(SplitLayout::SideBySide)]
-        );
+        assert_eq!(decoder.push(b"%"), [InputAction::Split(SplitAxis::Columns)]);
         assert_eq!(
             decoder.push(&[PREFIX, b'"']),
-            [InputAction::Split(SplitLayout::Stacked)]
+            [InputAction::Split(SplitAxis::Rows)]
         );
         assert_eq!(
             decoder.push(&[PREFIX, b'j']),
@@ -1853,7 +2378,7 @@ mod tests {
         );
         assert_eq!(
             decoder.push(b"\x02%"),
-            [InputAction::Split(SplitLayout::SideBySide)]
+            [InputAction::Split(SplitAxis::Columns)]
         );
     }
 
@@ -1967,7 +2492,7 @@ mod tests {
             "-c".to_owned(),
             "printf RIGHT; cat".to_owned(),
         ];
-        workspace.split(SplitLayout::SideBySide).unwrap();
+        workspace.split(SplitAxis::Columns).unwrap();
         workspace.send(Some(1), b"AGENT\n").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2027,7 +2552,7 @@ mod tests {
             "-c".to_owned(),
             "printf BOTTOM; cat".to_owned(),
         ];
-        workspace.split(SplitLayout::Stacked).unwrap();
+        workspace.split(SplitAxis::Rows).unwrap();
         workspace.send(Some(1), b"AGENT\n").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2069,9 +2594,15 @@ mod tests {
         );
         workspace.resize(21, 2, 9, 18).unwrap();
         assert_eq!(workspace.status().unwrap().rows, 2);
+        workspace.set_grid(1, 2).unwrap();
+        assert_eq!(workspace.panes().unwrap()[1].y, 5);
         let constrained = workspace.frame().unwrap();
         assert_eq!(constrained.rows, 2);
-        assert!(constrained.text().contains("split needs 3 rows"));
+        assert!(
+            constrained.text().contains("layout too small"),
+            "constrained frame: {:?}",
+            constrained.text()
+        );
         workspace.resize(21, 9, 9, 18).unwrap();
         let restored = workspace.frame().unwrap().text();
         assert!(restored.contains("TOP"));
@@ -2173,7 +2704,7 @@ mod tests {
             "-c".to_owned(),
             "printf TARGET-FINAL".to_owned(),
         ];
-        workspace.split(SplitLayout::SideBySide).unwrap();
+        workspace.split(SplitAxis::Columns).unwrap();
 
         let shot = workspace
             .capture(
@@ -2189,6 +2720,119 @@ mod tests {
             .unwrap();
 
         assert!(shot.frame.text().contains("TARGET-FINAL"));
+        workspace.stop();
+    }
+
+    #[test]
+    fn grid_geometry_places_four_stable_pane_ids_and_recursive_dividers() {
+        let layout = grid_layout(&[0, 1, 2, 3], 2, 2).unwrap();
+        let geometry = geometry(&layout, 11, 7, Some(3)).unwrap();
+
+        assert_eq!(
+            geometry.panes,
+            [
+                PlacedPane {
+                    id: 0,
+                    rect: PaneRect {
+                        x: 0,
+                        y: 0,
+                        cols: 5,
+                        rows: 3,
+                    },
+                },
+                PlacedPane {
+                    id: 1,
+                    rect: PaneRect {
+                        x: 6,
+                        y: 0,
+                        cols: 5,
+                        rows: 3,
+                    },
+                },
+                PlacedPane {
+                    id: 2,
+                    rect: PaneRect {
+                        x: 0,
+                        y: 4,
+                        cols: 5,
+                        rows: 3,
+                    },
+                },
+                PlacedPane {
+                    id: 3,
+                    rect: PaneRect {
+                        x: 6,
+                        y: 4,
+                        cols: 5,
+                        rows: 3,
+                    },
+                },
+            ]
+        );
+        assert_eq!(geometry.dividers.len(), 3);
+        let composed = compose_workspace(
+            11,
+            7,
+            &geometry,
+            &[
+                (0, frame(5, 3, "0", Some((0, 0)))),
+                (1, frame(5, 3, "1", Some((0, 0)))),
+                (2, frame(5, 3, "2", Some((0, 0)))),
+                (3, frame(5, 3, "3", Some((2, 1)))),
+            ],
+            Some(3),
+        );
+        assert_eq!(
+            composed.cursor.as_ref().map(|cursor| (cursor.x, cursor.y)),
+            Some((8, 5))
+        );
+        assert!(composed.text().contains('0'));
+        assert!(composed.text().contains('3'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_grid_focus_and_close_share_one_layout_tree() {
+        let options = Options {
+            cols: 41,
+            rows: 13,
+            ..Options::default()
+        };
+        let mut workspace = Workspace::start(
+            &["sh".to_owned(), "-c".to_owned(), "cat".to_owned()],
+            None,
+            None,
+            &options,
+        )
+        .unwrap();
+        workspace.shell = vec!["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+
+        workspace.set_grid(2, 2).unwrap();
+        let panes = workspace.panes().unwrap();
+        assert_eq!(
+            panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(workspace.active_id(), Some(0));
+        assert_eq!(
+            panes
+                .iter()
+                .map(|pane| (pane.x, pane.y, pane.cols, pane.rows))
+                .collect::<Vec<_>>(),
+            [(0, 0, 20, 6), (21, 0, 20, 6), (0, 7, 20, 6), (21, 7, 20, 6),]
+        );
+        assert!(workspace.set_grid(2, 1).is_err());
+        workspace.focus_pane(3).unwrap();
+        assert_eq!(workspace.active_id(), Some(3));
+        workspace.close_pane(1).unwrap();
+        assert_eq!(workspace.active_id(), Some(3));
+        assert_eq!(workspace.panes().unwrap().len(), 3);
+        assert!(workspace.focus_direction(Direction::Up).unwrap());
+        assert_eq!(workspace.active_id(), Some(0));
+        workspace.begin_paste().unwrap();
+        workspace.close_pane(0).unwrap();
+        assert!(workspace.send_paste(b"ignored after close").unwrap());
+        assert!(workspace.end_paste().unwrap());
         workspace.stop();
     }
 }

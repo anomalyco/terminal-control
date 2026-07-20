@@ -9,13 +9,17 @@ use crate::frame::Frame;
 use crate::recording::{self, InputOrigin};
 use crate::shot::{self, Host, Options, Shot, respond_to_output};
 use crate::terminal_core::{InputModes, SCROLLBACK_ROWS, TerminalCore};
+use crate::terminal_theme::TerminalTheme;
 use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 
+pub use crate::workspace::PaneStatus;
+
 const OUTPUT_QUEUE: usize = 64;
 const OUTPUT_BATCH: usize = OUTPUT_QUEUE;
 const OUTPUT_CHUNK: usize = 1024;
+const CONTROL_PROTOCOL_VERSION: u8 = 1;
 
 struct Output {
     at_ms: u64,
@@ -151,6 +155,16 @@ impl Session {
         record: Option<&Path>,
         options: &Options,
     ) -> Result<Self> {
+        Self::start_with_theme(command, cwd, record, options, TerminalTheme::default())
+    }
+
+    pub(crate) fn start_with_theme(
+        command: &[String],
+        cwd: Option<&Path>,
+        record: Option<&Path>,
+        options: &Options,
+        theme: TerminalTheme,
+    ) -> Result<Self> {
         if command.is_empty() {
             bail!("provide a command after --");
         }
@@ -165,7 +179,8 @@ impl Session {
             None => std::env::current_dir().context("resolve session working directory")?,
         };
         let cwd = fs::canonicalize(&cwd).context("canonicalize session working directory")?;
-        let terminal = TerminalCore::new(options.rows, options.cols, SCROLLBACK_ROWS)?;
+        let terminal =
+            TerminalCore::new_with_theme(options.rows, options.cols, SCROLLBACK_ROWS, theme)?;
         let started = Instant::now();
         let recording = record
             .map(|path| {
@@ -235,7 +250,7 @@ impl Session {
             process_group,
             terminal,
             ansi: Vec::new(),
-            host: Host::new(writer, options),
+            host: Host::new_with_theme(writer, options, theme),
             receive,
             max_bytes: options.max_bytes,
             ansi_truncated: false,
@@ -445,6 +460,11 @@ impl Session {
     ) -> Result<()> {
         if cols == 0 || rows == 0 {
             bail!("terminal dimensions must be greater than zero");
+        }
+        if (cols, rows, cell_width, cell_height)
+            == (self.cols, self.rows, self.cell_width, self.cell_height)
+        {
+            return Ok(());
         }
         self.consume_batch()?;
         self.master
@@ -779,17 +799,51 @@ enum Request {
         name: String,
     },
     Panes,
+    Layout {
+        columns: u16,
+        rows: u16,
+    },
+    FocusPane {
+        pane: crate::workspace::PaneId,
+    },
+    ClosePane {
+        pane: crate::workspace::PaneId,
+    },
     Stop,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Response {
+    #[serde(default)]
+    protocol_version: u8,
     error: Option<String>,
     captured: Option<Shot>,
     status: Option<SessionStatus>,
     logs: Option<Vec<u8>>,
     #[serde(default)]
     panes: Option<Vec<crate::workspace::PaneStatus>>,
+}
+
+impl Default for Response {
+    fn default() -> Self {
+        Self {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            error: None,
+            captured: None,
+            status: None,
+            logs: None,
+            panes: None,
+        }
+    }
+}
+
+impl Response {
+    fn error(error: impl Into<String>) -> Self {
+        Self {
+            error: Some(error.into()),
+            ..Self::default()
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -895,9 +949,45 @@ pub fn show_pane(
 
 #[doc(hidden)]
 pub fn panes(name: &str) -> Result<Vec<crate::workspace::PaneStatus>> {
-    request(name, Request::Panes)?
+    pane_response(request(name, Request::Panes)?)
+}
+
+fn pane_response(response: Response) -> Result<Vec<crate::workspace::PaneStatus>> {
+    response
         .panes
         .ok_or_else(|| anyhow::anyhow!("session did not return panes"))
+}
+
+fn require_pane_protocol(response: &Response) -> Result<()> {
+    if response.protocol_version < CONTROL_PROTOCOL_VERSION {
+        bail!("running session predates pane layout control; restart it with the current termctrl");
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn set_workspace_layout(
+    name: &str,
+    columns: u16,
+    rows: u16,
+) -> Result<Vec<crate::workspace::PaneStatus>> {
+    pane_response(request(name, Request::Layout { columns, rows })?)
+}
+
+#[doc(hidden)]
+pub fn focus_workspace_pane(
+    name: &str,
+    pane: crate::workspace::PaneId,
+) -> Result<Vec<crate::workspace::PaneStatus>> {
+    pane_response(request(name, Request::FocusPane { pane })?)
+}
+
+#[doc(hidden)]
+pub fn close_workspace_pane(
+    name: &str,
+    pane: crate::workspace::PaneId,
+) -> Result<Vec<crate::workspace::PaneStatus>> {
+    pane_response(request(name, Request::ClosePane { pane })?)
 }
 
 #[doc(hidden)]
@@ -991,7 +1081,17 @@ pub fn infer_name(command: &[String]) -> Result<String> {
 
 fn request(name: &str, request: Request) -> Result<Response> {
     validate_name(name)?;
+    let requires_pane_protocol = matches!(
+        request,
+        Request::Panes
+            | Request::Layout { .. }
+            | Request::FocusPane { .. }
+            | Request::ClosePane { .. }
+    );
     let response = implementation::request(socket_path(name)?, &request)?;
+    if requires_pane_protocol {
+        require_pane_protocol(&response)?;
+    }
     if let Some(error) = response.error {
         bail!(error);
     }
@@ -1347,8 +1447,15 @@ mod implementation {
             fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("secure {}", socket.display()))?;
             listener.set_nonblocking(true)?;
-            let mut workspace = Workspace::start(command, cwd, record, options)?;
+            let raw = RawMode::enter()?;
+            let (theme, retained_input) = crate::terminal_theme::discover();
+            let mut workspace = Workspace::start_with_theme(command, cwd, record, options, theme)?;
             let (input_send, input_receive) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+            if !retained_input.is_empty() {
+                input_send
+                    .send(retained_input)
+                    .context("retain input received during terminal theme discovery")?;
+            }
             thread::spawn(move || {
                 let mut stdin = std::io::stdin().lock();
                 let mut bytes = [0_u8; 1024];
@@ -1358,7 +1465,6 @@ mod implementation {
                     }
                 }
             });
-            let raw = RawMode::enter()?;
             let mut terminal = WorkspaceTerminal::enter(input_receive, options)?;
             'workspace: loop {
                 let running = terminal.tick(&mut workspace)?;
@@ -1436,63 +1542,12 @@ mod implementation {
     }
 
     fn handle(mut stream: UnixStream, session: &mut Session) -> Result<bool> {
-        stream
-            .set_nonblocking(false)
-            .context("set session connection blocking")?;
-        stream
-            .set_read_timeout(Some(CONTROL_TIMEOUT))
-            .context("set session request timeout")?;
-        stream
-            .set_write_timeout(Some(CONTROL_TIMEOUT))
-            .context("set session response timeout")?;
-        let mut bytes = Vec::new();
-        let response = match Read::by_ref(&mut stream)
-            .take(MAX_REQUEST_BYTES + 1)
-            .read_to_end(&mut bytes)
-        {
-            Ok(_) if bytes.len() as u64 > MAX_REQUEST_BYTES => Response {
-                error: Some("session request exceeds 1 MiB".to_owned()),
-                captured: None,
-                status: None,
-                logs: None,
-                panes: None,
-            },
-            Ok(_) => match serde_json::from_slice::<Request>(&bytes) {
-                Ok(request) => {
-                    let stop = matches!(request, Request::Stop);
-                    let response = match respond(session, request) {
-                        Ok(response) => response,
-                        Err(error) => Response {
-                            error: Some(format!("{error:#}")),
-                            captured: None,
-                            status: None,
-                            logs: None,
-                            panes: None,
-                        },
-                    };
-                    if write_response(&mut stream, &response).is_ok() && stop {
-                        return Ok(true);
-                    }
-                    return Ok(false);
-                }
-                Err(error) => Response {
-                    error: Some(format!("invalid session request: {error}")),
-                    captured: None,
-                    status: None,
-                    logs: None,
-                    panes: None,
-                },
-            },
-            Err(error) => Response {
-                error: Some(format!("failed to read session request: {error}")),
-                captured: None,
-                status: None,
-                logs: None,
-                panes: None,
-            },
-        };
-        let _ = write_response(&mut stream, &response);
-        Ok(false)
+        handle_control(&mut stream, "session", |request| {
+            let stop = matches!(request, Request::Stop);
+            let response = respond(session, request)
+                .unwrap_or_else(|error| Response::error(format!("{error:#}")));
+            (response, stop)
+        })
     }
 
     fn handle_workspace(
@@ -1500,62 +1555,48 @@ mod implementation {
         workspace: &mut Workspace,
         tick: &mut impl FnMut(&mut Workspace) -> Result<bool>,
     ) -> Result<bool> {
+        handle_control(&mut stream, "workspace", |request| {
+            let stop = matches!(request, Request::Stop);
+            let response = respond_workspace(workspace, request, tick)
+                .unwrap_or_else(|error| Response::error(format!("{error:#}")));
+            let finished = stop || (response.error.is_none() && workspace.is_empty());
+            (response, finished)
+        })
+    }
+
+    fn handle_control(
+        stream: &mut UnixStream,
+        subject: &str,
+        mut dispatch: impl FnMut(Request) -> (Response, bool),
+    ) -> Result<bool> {
         stream
             .set_nonblocking(false)
-            .context("set workspace connection blocking")?;
+            .with_context(|| format!("set {subject} connection blocking"))?;
         stream
             .set_read_timeout(Some(CONTROL_TIMEOUT))
-            .context("set workspace request timeout")?;
+            .with_context(|| format!("set {subject} request timeout"))?;
         stream
             .set_write_timeout(Some(CONTROL_TIMEOUT))
-            .context("set workspace response timeout")?;
+            .with_context(|| format!("set {subject} response timeout"))?;
         let mut bytes = Vec::new();
-        let response = match Read::by_ref(&mut stream)
+        let response = match Read::by_ref(stream)
             .take(MAX_REQUEST_BYTES + 1)
             .read_to_end(&mut bytes)
         {
-            Ok(_) if bytes.len() as u64 > MAX_REQUEST_BYTES => Response {
-                error: Some("workspace request exceeds 1 MiB".to_owned()),
-                captured: None,
-                status: None,
-                logs: None,
-                panes: None,
-            },
+            Ok(_) if bytes.len() as u64 > MAX_REQUEST_BYTES => {
+                Response::error(format!("{subject} request exceeds 1 MiB"))
+            }
             Ok(_) => match serde_json::from_slice::<Request>(&bytes) {
                 Ok(request) => {
-                    let stop = matches!(request, Request::Stop);
-                    let response =
-                        respond_workspace(workspace, request, tick).unwrap_or_else(|error| {
-                            Response {
-                                error: Some(format!("{error:#}")),
-                                captured: None,
-                                status: None,
-                                logs: None,
-                                panes: None,
-                            }
-                        });
-                    if write_response(&mut stream, &response).is_ok() && stop {
-                        return Ok(true);
-                    }
-                    return Ok(false);
+                    let (response, finished) = dispatch(request);
+                    let written = write_response(stream, &response).is_ok();
+                    return Ok(written && finished);
                 }
-                Err(error) => Response {
-                    error: Some(format!("invalid workspace request: {error}")),
-                    captured: None,
-                    status: None,
-                    logs: None,
-                    panes: None,
-                },
+                Err(error) => Response::error(format!("invalid {subject} request: {error}")),
             },
-            Err(error) => Response {
-                error: Some(format!("failed to read workspace request: {error}")),
-                captured: None,
-                status: None,
-                logs: None,
-                panes: None,
-            },
+            Err(error) => Response::error(format!("failed to read {subject} request: {error}")),
         };
-        let _ = write_response(&mut stream, &response);
+        let _ = write_response(stream, &response);
         Ok(false)
     }
 
@@ -1565,13 +1606,7 @@ mod implementation {
     }
 
     fn respond(session: &mut Session, request: Request) -> Result<Response> {
-        let mut response = Response {
-            error: None,
-            captured: None,
-            status: None,
-            logs: None,
-            panes: None,
-        };
+        let mut response = Response::default();
         match request {
             Request::Ping => {}
             Request::Status => response.status = Some(session.status()?),
@@ -1634,11 +1669,17 @@ mod implementation {
                     id: 0,
                     active: true,
                     state: status.state,
+                    x: 0,
+                    y: 0,
                     cols: status.cols,
                     rows: status.rows,
+                    title: session.title()?,
                     command: status.launch.command,
                     cwd: status.launch.cwd,
                 }]);
+            }
+            Request::Layout { .. } | Request::FocusPane { .. } | Request::ClosePane { .. } => {
+                bail!("only attached workspaces support pane layout control")
             }
             Request::Stop => session.stop()?,
         }
@@ -1650,13 +1691,7 @@ mod implementation {
         request: Request,
         tick: &mut impl FnMut(&mut Workspace) -> Result<bool>,
     ) -> Result<Response> {
-        let mut response = Response {
-            error: None,
-            captured: None,
-            status: None,
-            logs: None,
-            panes: None,
-        };
+        let mut response = Response::default();
         match request {
             Request::Ping => {}
             Request::Status => response.status = Some(workspace.status()?),
@@ -1701,6 +1736,30 @@ mod implementation {
             }
             Request::Mark { name } => workspace.mark_recording(&name)?,
             Request::Panes => response.panes = Some(workspace.panes()?),
+            Request::Layout { columns, rows } => {
+                tick(workspace)?;
+                if workspace.is_empty() {
+                    bail!("workspace has ended");
+                }
+                workspace.set_grid(columns, rows)?;
+                response.panes = Some(workspace.panes()?);
+            }
+            Request::FocusPane { pane } => {
+                tick(workspace)?;
+                if workspace.is_empty() {
+                    bail!("workspace has ended");
+                }
+                workspace.focus_pane(pane)?;
+                response.panes = Some(workspace.panes()?);
+            }
+            Request::ClosePane { pane } => {
+                tick(workspace)?;
+                if workspace.is_empty() {
+                    bail!("workspace has ended");
+                }
+                workspace.close_pane(pane)?;
+                response.panes = Some(workspace.panes()?);
+            }
             Request::Stop => workspace.stop(),
         }
         Ok(response)
@@ -1789,6 +1848,58 @@ mod implementation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_control_responses_deserialize_but_require_a_workspace_restart() {
+        let response: Response = serde_json::from_str(
+            r#"{
+                "error": null,
+                "captured": null,
+                "status": null,
+                "logs": null,
+                "panes": [{
+                    "id": 0,
+                    "active": true,
+                    "state": "running",
+                    "cols": 80,
+                    "rows": 24,
+                    "command": ["zsh"],
+                    "cwd": "/tmp"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(response.protocol_version, 0);
+        let pane = &response.panes.as_ref().unwrap()[0];
+        assert_eq!((pane.x, pane.y), (0, 0));
+        assert!(pane.title.is_empty());
+        assert!(
+            require_pane_protocol(&response)
+                .unwrap_err()
+                .to_string()
+                .contains("restart it with the current termctrl")
+        );
+    }
+
+    #[test]
+    fn semantic_workspace_requests_round_trip() {
+        for request in [
+            Request::Layout {
+                columns: 2,
+                rows: 2,
+            },
+            Request::FocusPane { pane: 3 },
+            Request::ClosePane { pane: 2 },
+        ] {
+            let encoded = serde_json::to_vec(&request).unwrap();
+            let decoded: Request = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap(),
+                serde_json::to_value(request).unwrap()
+            );
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

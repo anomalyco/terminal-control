@@ -18,7 +18,7 @@ An embedded session owns the same live terminal lifecycle in-process; the named 
 
 ### Workspace
 
-An attached terminal containing one or two embedded sessions, called panes, arranged side by side or stacked. A workspace composes pane frames into one visible frame, serializes human stdin and named-session control on one foreground loop, and keeps agent pane targeting independent from human focus. The attached terminal is authoritative for workspace geometry. Workspace terminal presentation owns prefix decoding, transient notices, input-mode synchronization, and damage-based painting without exposing those mechanisms to the session control adapter.
+An attached terminal containing one to four embedded sessions, called panes, in a recursive split layout. A private ID-only layout tree is authoritative for geometry, divider placement, directional focus, and close promotion while a flat pane collection retains process ownership. Human prefix controls and semantic CLI/MCP layout, focus, and close operations are adapters over this same model. Stable pane IDs are independent from position; agents discover position from pane geometry and can target input without changing human focus. The attached terminal is authoritative for workspace size. Workspace terminal presentation owns prefix decoding, transient notices, input-mode synchronization, inherited outer-terminal colors, and damage-based painting without exposing those mechanisms to the session control adapter.
 
 ### Driver
 

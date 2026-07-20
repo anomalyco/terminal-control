@@ -73,12 +73,16 @@ or NAME to expose a stable explicit control socket.
 Use ctrl-b % to split left/right, ctrl-b \" to split top/bottom, ctrl-b h/j/k/l to focus, ctrl-b ?
 for help, and ctrl-b ctrl-b to send a literal ctrl-b. Destructive ctrl-b x and ctrl-b q actions
 require a second press. Agents can inspect the composed workspace or a specific pane, list stable
-pane ids, and send input without stealing human focus.
+pane ids and geometry, grow a layout, and send input without stealing human focus. Foreground
+workspaces inherit the outer terminal's default and ANSI colors.
 
 Examples:
   termctrl run
   termctrl panes workspace
+  termctrl layout workspace --grid 2x2
   termctrl send workspace --pane 1 text:opencode2 enter
+  termctrl focus workspace --pane 1
+  termctrl close-pane workspace --pane 1
   termctrl show workspace --pane 1
   termctrl run editor --cwd ~/src/project -- nvim
   termctrl run -- /usr/bin/nvim";
@@ -183,6 +187,12 @@ enum Command {
     List(ListArgs),
     /// List panes in a running workspace.
     Panes(PanesArgs),
+    /// Declaratively arrange one, two, or four workspace panes.
+    Layout(LayoutArgs),
+    /// Intentionally move human focus to one workspace pane.
+    Focus(PaneActionArgs),
+    /// Terminate exactly one workspace pane.
+    ClosePane(PaneActionArgs),
     /// Resize a named live session.
     Resize(ResizeArgs),
     /// Add a named moment to an active recording for later editing.
@@ -451,6 +461,24 @@ struct PanesArgs {
 }
 
 #[derive(Args)]
+struct LayoutArgs {
+    /// Name of a running workspace.
+    name: String,
+    /// Desired grid: 1x1, 2x1, 1x2, or 2x2.
+    #[arg(long, value_parser = parse_grid)]
+    grid: (u16, u16),
+}
+
+#[derive(Args)]
+struct PaneActionArgs {
+    /// Name of a running workspace.
+    name: String,
+    /// Stable pane id returned by `termctrl panes`.
+    #[arg(long)]
+    pane: u32,
+}
+
+#[derive(Args)]
 struct ResizeArgs {
     /// Name of a running session.
     name: String,
@@ -659,6 +687,18 @@ fn main() -> Result<()> {
         Command::Status(args) => status(args)?,
         Command::List(args) => list(args)?,
         Command::Panes(args) => panes(args)?,
+        Command::Layout(args) => {
+            let panes = session::set_workspace_layout(&args.name, args.grid.0, args.grid.1)?;
+            print_panes(&panes, true)?;
+        }
+        Command::Focus(args) => {
+            let panes = session::focus_workspace_pane(&args.name, args.pane)?;
+            print_panes(&panes, true)?;
+        }
+        Command::ClosePane(args) => {
+            let panes = session::close_workspace_pane(&args.name, args.pane)?;
+            print_panes(&panes, true)?;
+        }
         Command::Resize(args) => {
             validate_terminal_size(args.cols, args.rows)?;
             session::resize(
@@ -1040,21 +1080,49 @@ fn run_session(args: &RunArgs) -> Result<()> {
 
 fn panes(args: PanesArgs) -> Result<()> {
     let panes = session::panes(&args.name)?;
-    if args.json {
+    print_panes(&panes, args.json)
+}
+
+fn print_panes(panes: &[session::PaneStatus], json: bool) -> Result<()> {
+    if json {
         println!("{}", serde_json::to_string_pretty(&panes)?);
         return Ok(());
     }
     for pane in panes {
+        let position = format!("{},{}", pane.x, pane.y);
+        let title = pane
+            .title
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>();
         println!(
-            "{}\t{}\t{}x{}\t{}",
+            "{}\t{}\t{}\t{}x{}\t{}\t{}",
             pane.id,
             if pane.active { "active" } else { "" },
+            position,
             pane.cols,
             pane.rows,
+            title,
             pane.command.join(" ")
         );
     }
     Ok(())
+}
+
+fn parse_grid(value: &str) -> std::result::Result<(u16, u16), String> {
+    let Some((columns, rows)) = value.split_once('x') else {
+        return Err("grid must be 1x1, 2x1, 1x2, or 2x2".to_owned());
+    };
+    let columns = columns
+        .parse::<u16>()
+        .map_err(|_| "grid columns must be 1 or 2".to_owned())?;
+    let rows = rows
+        .parse::<u16>()
+        .map_err(|_| "grid rows must be 1 or 2".to_owned())?;
+    if !(1..=2).contains(&columns) || !(1..=2).contains(&rows) {
+        return Err("grid must be 1x1, 2x1, 1x2, or 2x2".to_owned());
+    }
+    Ok((columns, rows))
 }
 
 fn restart_session(args: &RestartArgs) -> Result<()> {
@@ -1352,6 +1420,12 @@ mod tests {
         assert!(Cli::try_parse_from(["termctrl", "run"]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "run", "editor", "--", "nvim", "."]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "panes", "workspace", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "layout", "workspace", "--grid", "2x2"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "focus", "workspace", "--pane", "2"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["termctrl", "close-pane", "workspace", "--pane", "2"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["termctrl", "layout", "workspace", "--grid", "3x2"]).is_err());
         assert!(
             Cli::try_parse_from(["termctrl", "send", "workspace", "--pane", "1", "enter"]).is_ok()
         );

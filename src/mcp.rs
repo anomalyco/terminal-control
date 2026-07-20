@@ -126,6 +126,26 @@ struct ResizeRequest {
     cell_height: Option<u16>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct LayoutRequest {
+    #[schemars(description = "Named attached Terminal Control workspace")]
+    name: String,
+    #[schemars(description = "Grid columns, either 1 or 2")]
+    columns: u16,
+    #[schemars(description = "Grid rows, either 1 or 2")]
+    rows: u16,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PaneRequest {
+    #[schemars(description = "Named attached Terminal Control workspace")]
+    name: String,
+    #[schemars(description = "Stable workspace pane id")]
+    pane: u32,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct SessionSummary {
@@ -151,8 +171,11 @@ struct PaneSummary {
     id: u32,
     active: bool,
     state: String,
+    x: u16,
+    y: u16,
     cols: u16,
     rows: u16,
+    title: String,
     command: Vec<String>,
     cwd: String,
 }
@@ -247,20 +270,53 @@ impl TerminalControl {
     ) -> Result<Json<PaneList>, String> {
         blocking(move || {
             let panes = session::panes(&name).map_err(format_error)?;
-            Ok(Json(PaneList {
-                panes: panes
-                    .into_iter()
-                    .map(|pane| PaneSummary {
-                        id: pane.id,
-                        active: pane.active,
-                        state: state(pane.state).to_owned(),
-                        cols: pane.cols,
-                        rows: pane.rows,
-                        command: pane.command,
-                        cwd: path_string(&pane.cwd),
-                    })
-                    .collect(),
-            }))
+            Ok(Json(pane_list(panes)))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Set an attached workspace to a 1x1, 2x1, 1x2, or 2x2 grid. Missing cells open shells; surplus panes must be closed explicitly"
+    )]
+    async fn set_workspace_layout(
+        &self,
+        Parameters(request): Parameters<LayoutRequest>,
+    ) -> Result<Json<PaneList>, String> {
+        blocking(move || {
+            session::set_workspace_layout(&request.name, request.columns, request.rows)
+                .map(pane_list)
+                .map(Json)
+                .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(description = "Intentionally move human focus to one stable workspace pane id")]
+    async fn focus_workspace_pane(
+        &self,
+        Parameters(request): Parameters<PaneRequest>,
+    ) -> Result<Json<PaneList>, String> {
+        blocking(move || {
+            session::focus_workspace_pane(&request.name, request.pane)
+                .map(pane_list)
+                .map(Json)
+                .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Terminate exactly one stable workspace pane id. Closing the final pane ends the workspace"
+    )]
+    async fn close_workspace_pane(
+        &self,
+        Parameters(request): Parameters<PaneRequest>,
+    ) -> Result<Json<PaneList>, String> {
+        blocking(move || {
+            session::close_workspace_pane(&request.name, request.pane)
+                .map(pane_list)
+                .map(Json)
+                .map_err(format_error)
         })
         .await
     }
@@ -386,6 +442,26 @@ fn capture(request: ScreenRequest) -> Result<Screen, String> {
         cols: shot.frame.cols,
         rows: shot.frame.rows,
     })
+}
+
+fn pane_list(panes: Vec<session::PaneStatus>) -> PaneList {
+    PaneList {
+        panes: panes
+            .into_iter()
+            .map(|pane| PaneSummary {
+                id: pane.id,
+                active: pane.active,
+                state: state(pane.state).to_owned(),
+                x: pane.x,
+                y: pane.y,
+                cols: pane.cols,
+                rows: pane.rows,
+                title: pane.title,
+                command: pane.command,
+                cwd: path_string(&pane.cwd),
+            })
+            .collect(),
+    }
 }
 
 fn session_details(name: String, status: session::SessionStatus) -> SessionDetails {
@@ -523,6 +599,8 @@ mod tests {
         assert_eq!(
             names,
             [
+                "close_workspace_pane",
+                "focus_workspace_pane",
                 "get_screen",
                 "get_session_status",
                 "interact",
@@ -530,6 +608,7 @@ mod tests {
                 "list_sessions",
                 "resize_session",
                 "send_input",
+                "set_workspace_layout",
                 "stop_session",
             ]
         );
@@ -551,8 +630,13 @@ mod tests {
             .iter()
             .find(|tool| tool.name.as_ref() == "get_session_status")
             .unwrap();
+        let panes = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "list_panes")
+            .unwrap();
         let list_schema = serde_json::to_value(list.output_schema.as_ref().unwrap()).unwrap();
         let status_schema = serde_json::to_value(status.output_schema.as_ref().unwrap()).unwrap();
+        let pane_schema = serde_json::to_value(panes.output_schema.as_ref().unwrap()).unwrap();
 
         let summary_properties = &list_schema["$defs"]["SessionSummary"]["properties"];
         assert!(summary_properties.get("command").is_some());
@@ -576,6 +660,12 @@ mod tests {
             "logsTruncated",
         ] {
             assert!(properties.get(field).is_some(), "missing {field}");
+        }
+        let properties = &pane_schema["$defs"]["PaneSummary"]["properties"];
+        for field in [
+            "id", "active", "state", "x", "y", "cols", "rows", "title", "command", "cwd",
+        ] {
+            assert!(properties.get(field).is_some(), "missing pane {field}");
         }
     }
 

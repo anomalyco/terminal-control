@@ -137,20 +137,27 @@ termctrl run -- nvim
 termctrl run editor --cwd ~/src/project -- nvim
 ```
 
-Use `ctrl-b %` for left/right panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l` to focus directionally, and `ctrl-b ?` for in-workspace help. Killing the active pane with `ctrl-b x` or quitting with `ctrl-b q` requires a second press. The initial workspace supports two panes.
+Use `ctrl-b %` for left/right panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l` to focus directionally, and `ctrl-b ?` for in-workspace help. Splitting either half of a two-pane workspace builds up to a four-pane layout. Killing the active pane with `ctrl-b x` or quitting with `ctrl-b q` requires a second press.
 
-Agents discover stable pane IDs and can inspect or drive a pane without changing human focus:
+Agents discover stable pane IDs and geometry, declaratively grow a layout, and inspect or drive a pane without changing human focus:
 
 ```bash
 termctrl panes workspace --json
+termctrl layout workspace --grid 2x2
 termctrl show workspace
 termctrl show workspace --pane 1
 termctrl send workspace --pane 1 text:opencode2 enter
+termctrl focus workspace --pane 1
+termctrl close-pane workspace --pane 1
 ```
+
+Layout growth opens missing `$SHELL` panes in row-major order while preserving existing pane IDs and human focus. Layout shrinkage never kills a process implicitly; close exact pane IDs first. Only `focus` changes human focus. Pane titles are application-owned terminal titles, not stable identities.
 
 Without a command or name, the workspace is named `workspace`. When a command is supplied without `NAME`, its executable basename remains the inferred name.
 
 An attached workspace follows the size of its terminal, so resize the terminal itself rather than using `termctrl resize`. `--record` currently records the initial pane; use an outer Terminal Control session when a composed workspace recording is required. Composed ANSI saves are rendered snapshots, while `--pane ID --format ansi` retains that pane's original VT stream.
+
+Foreground workspaces query the outer terminal's default foreground, background, and ANSI 0-15 palette before opening the first pane. Ghostty-backed child terminals, dividers, overlays, and panes opened later therefore inherit the visible terminal theme; unsupported terminals retain Terminal Control's deterministic fallback palette.
 
 ## Record And Export Video
 

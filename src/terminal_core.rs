@@ -9,9 +9,9 @@ use libghostty_vt::style::{PaletteIndex, RgbColor, Underline as GhosttyUnderline
 use libghostty_vt::{RenderState, Terminal, TerminalOptions, terminal::Mode};
 
 use crate::frame::{
-    Attributes, Cell, Color, Cursor, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, FORMAT_VERSION, Frame,
-    Underline, indexed_color,
+    Attributes, Cell, Color, Cursor, FORMAT_VERSION, Frame, Underline, indexed_color,
 };
+use crate::terminal_theme::TerminalTheme;
 
 pub(crate) const SCROLLBACK_ROWS: usize = 10_000;
 
@@ -19,8 +19,22 @@ pub(crate) const SCROLLBACK_ROWS: usize = 10_000;
 pub(crate) struct InputModes {
     pub cursor_keys: bool,
     pub keypad_keys: bool,
+    pub normal_mouse: bool,
+    pub button_mouse: bool,
+    pub any_mouse: bool,
+    pub sgr_mouse: bool,
     pub focus_events: bool,
     pub bracketed_paste: bool,
+}
+
+impl InputModes {
+    pub(crate) fn without_mouse(mut self) -> Self {
+        self.normal_mouse = false;
+        self.button_mouse = false;
+        self.any_mouse = false;
+        self.sgr_mouse = false;
+        self
+    }
 }
 
 pub(crate) struct TerminalCore {
@@ -36,6 +50,15 @@ pub(crate) struct TerminalCore {
 
 impl TerminalCore {
     pub(crate) fn new(rows: u16, cols: u16, max_scrollback: usize) -> Result<Self> {
+        Self::new_with_theme(rows, cols, max_scrollback, TerminalTheme::default())
+    }
+
+    pub(crate) fn new_with_theme(
+        rows: u16,
+        cols: u16,
+        max_scrollback: usize,
+        theme: TerminalTheme,
+    ) -> Result<Self> {
         let responses = Rc::new(RefCell::new(Vec::new()));
         let bells = Rc::new(CounterCell::new(0_u64));
         let mut terminal = Terminal::new(TerminalOptions {
@@ -57,17 +80,22 @@ impl TerminalCore {
             })
             .context("configure Ghostty bell events")?;
         terminal
-            .set_default_fg_color(Some(to_ghostty_color(DEFAULT_FOREGROUND)))
+            .set_default_fg_color(Some(to_ghostty_color(theme.foreground)))
             .context("configure Ghostty foreground")?
-            .set_default_bg_color(Some(to_ghostty_color(DEFAULT_BACKGROUND)))
+            .set_default_bg_color(Some(to_ghostty_color(theme.background)))
             .context("configure Ghostty background")?
-            .set_default_cursor_color(Some(to_ghostty_color(DEFAULT_FOREGROUND)))
+            .set_default_cursor_color(Some(to_ghostty_color(theme.foreground)))
             .context("configure Ghostty cursor")?;
         let mut palette = terminal
             .default_color_palette()
             .context("read Ghostty color palette")?;
         for index in 0..=u8::MAX {
-            palette.set(PaletteIndex(index), to_ghostty_color(indexed_color(index)));
+            let color = theme
+                .ansi
+                .get(usize::from(index))
+                .copied()
+                .unwrap_or_else(|| indexed_color(index));
+            palette.set(PaletteIndex(index), to_ghostty_color(color));
         }
         terminal
             .set_default_color_palette(Some(palette))
@@ -122,6 +150,10 @@ impl TerminalCore {
         Ok(InputModes {
             cursor_keys: self.terminal.mode(Mode::DECCKM)?,
             keypad_keys: self.terminal.mode(Mode::KEYPAD_KEYS)?,
+            normal_mouse: self.terminal.mode(Mode::NORMAL_MOUSE)?,
+            button_mouse: self.terminal.mode(Mode::BUTTON_MOUSE)?,
+            any_mouse: self.terminal.mode(Mode::ANY_MOUSE)?,
+            sgr_mouse: self.terminal.mode(Mode::SGR_MOUSE)?,
             focus_events: self.terminal.mode(Mode::FOCUS_EVENT)?,
             bracketed_paste: self.terminal.mode(Mode::BRACKETED_PASTE)?,
         })
@@ -310,6 +342,8 @@ fn from_ghostty_color(color: RgbColor) -> Color {
 #[cfg(test)]
 mod tests {
     use super::TerminalCore;
+    use crate::frame::Color;
+    use crate::terminal_theme::TerminalTheme;
 
     #[test]
     fn captures_terminal_responses() {
@@ -331,13 +365,41 @@ mod tests {
     #[test]
     fn exposes_input_modes_requested_by_the_application() {
         let mut terminal = TerminalCore::new(1, 20, 0).unwrap();
-        let _responses = terminal.apply_output(b"\x1b[?1h\x1b=\x1b[?1004h\x1b[?2004h");
+        let _responses = terminal.apply_output(
+            b"\x1b[?1h\x1b=\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h",
+        );
 
         let modes = terminal.input_modes().unwrap();
         assert!(modes.cursor_keys);
         assert!(modes.keypad_keys);
+        assert!(modes.normal_mouse);
+        assert!(modes.button_mouse);
+        assert!(modes.any_mouse);
+        assert!(modes.sgr_mouse);
         assert!(modes.focus_events);
         assert!(modes.bracketed_paste);
+    }
+
+    #[test]
+    fn inherited_theme_configures_defaults_and_ansi_palette() {
+        let theme = TerminalTheme {
+            foreground: Color { r: 1, g: 2, b: 3 },
+            background: Color { r: 4, g: 5, b: 6 },
+            ansi: std::array::from_fn(|index| Color {
+                r: index as u8,
+                g: 20,
+                b: 30,
+            }),
+        };
+        let mut terminal = TerminalCore::new_with_theme(1, 4, 0, theme).unwrap();
+        let _responses = terminal.apply_output(b"A\x1b[31mB\x1b[91mC");
+        let frame = terminal.frame().unwrap();
+
+        assert_eq!(frame.foreground, theme.foreground);
+        assert_eq!(frame.background, theme.background);
+        assert_eq!(frame.cells[0].foreground, theme.foreground);
+        assert_eq!(frame.cells[1].foreground, theme.ansi[1]);
+        assert_eq!(frame.cells[2].foreground, theme.ansi[9]);
     }
 
     #[test]

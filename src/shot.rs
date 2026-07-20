@@ -6,13 +6,15 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::frame::{DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, Frame};
+use crate::frame::{Color, Frame, indexed_color};
 use crate::terminal_core::TerminalCore;
+use crate::terminal_theme::TerminalTheme;
 use anyhow::{Context, Result, bail};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 
 const OPENTUI_QUERY: &[u8] = b"\x1b]10;?\x07\x1b]11;?\x07";
+#[cfg(test)]
 const PALETTE_QUERY: &[u8] = b"\x1b]4;0;?\x07";
 const KITTY_QUERY: &[u8] = b"\x1b_Gi=31337";
 
@@ -514,24 +516,34 @@ pub(crate) struct Host {
     writer: Box<dyn Write + Send>,
     enabled: bool,
     opentui_replied: bool,
-    palette_replied: bool,
     kitty_replied: bool,
     probe: Vec<u8>,
+    color_probe: Vec<u8>,
     pixel_width: u32,
     pixel_height: u32,
+    theme: TerminalTheme,
 }
 
 impl Host {
     pub(crate) fn new(writer: Box<dyn Write + Send>, options: &Options) -> Self {
+        Self::new_with_theme(writer, options, TerminalTheme::default())
+    }
+
+    pub(crate) fn new_with_theme(
+        writer: Box<dyn Write + Send>,
+        options: &Options,
+        theme: TerminalTheme,
+    ) -> Self {
         Self {
             writer,
             enabled: options.opentui_host,
             opentui_replied: false,
-            palette_replied: false,
             kitty_replied: false,
             probe: Vec::new(),
+            color_probe: Vec::new(),
             pixel_width: u32::from(options.cols) * u32::from(options.cell_width),
             pixel_height: u32::from(options.rows) * u32::from(options.cell_height),
+            theme,
         }
     }
 
@@ -565,6 +577,26 @@ impl Host {
         }
         let mut response = Vec::new();
         self.probe.extend_from_slice(output);
+        self.color_probe.extend_from_slice(output);
+        for query in take_color_queries(&mut self.color_probe) {
+            match query {
+                ColorQuery::Foreground => {
+                    append_color_response(&mut response, "10", self.theme.foreground)
+                }
+                ColorQuery::Background => {
+                    append_color_response(&mut response, "11", self.theme.background)
+                }
+                ColorQuery::Palette(index) => {
+                    let color = self
+                        .theme
+                        .ansi
+                        .get(usize::from(index))
+                        .copied()
+                        .unwrap_or_else(|| indexed_color(index));
+                    append_color_response(&mut response, &format!("4;{index}"), color);
+                }
+            }
+        }
         if !self.opentui_replied
             && self
                 .probe
@@ -573,19 +605,7 @@ impl Host {
         {
             response.extend_from_slice(
                 format!(
-                        "\x1b]10;rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\\x1b]11;rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\\x1bP>|termctrl {}\x1b\\\x1b[1;1R\x1b[?1016;0$y\x1b[?2027;0$y\x1b[?2031;2$y\x1b[?1004;1$y\x1b[?2004;2$y\x1b[?2026;2$y\x1b[?0u\x1b[1;1R\x1b[1;1R\x1b[4;{};{}t\x1b[?6c",
-                        DEFAULT_FOREGROUND.r,
-                        DEFAULT_FOREGROUND.r,
-                        DEFAULT_FOREGROUND.g,
-                        DEFAULT_FOREGROUND.g,
-                        DEFAULT_FOREGROUND.b,
-                        DEFAULT_FOREGROUND.b,
-                        DEFAULT_BACKGROUND.r,
-                        DEFAULT_BACKGROUND.r,
-                        DEFAULT_BACKGROUND.g,
-                        DEFAULT_BACKGROUND.g,
-                        DEFAULT_BACKGROUND.b,
-                        DEFAULT_BACKGROUND.b,
+                        "\x1bP>|termctrl {}\x1b\\\x1b[1;1R\x1b[?1016;0$y\x1b[?2027;0$y\x1b[?2031;2$y\x1b[?1004;1$y\x1b[?2004;2$y\x1b[?2026;2$y\x1b[?0u\x1b[1;1R\x1b[1;1R\x1b[4;{};{}t\x1b[?6c",
                         env!("CARGO_PKG_VERSION"),
                         self.pixel_height,
                         self.pixel_width,
@@ -593,15 +613,6 @@ impl Host {
                 .as_bytes(),
             );
             self.opentui_replied = true;
-        }
-        if !self.palette_replied
-            && self
-                .probe
-                .windows(PALETTE_QUERY.len())
-                .any(|window| window == PALETTE_QUERY)
-        {
-            response.extend_from_slice(b"\x1b]4;0;rgb:0000/0000/0000\x1b\\");
-            self.palette_replied = true;
         }
         if !self.kitty_replied
             && self
@@ -620,6 +631,73 @@ impl Host {
         }
         Ok(response)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorQuery {
+    Foreground,
+    Background,
+    Palette(u8),
+}
+
+fn append_color_response(response: &mut Vec<u8>, selector: &str, color: Color) {
+    response.extend_from_slice(
+        format!(
+            "\x1b]{selector};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\",
+            color.r, color.r, color.g, color.g, color.b, color.b,
+        )
+        .as_bytes(),
+    );
+}
+
+fn take_color_queries(probe: &mut Vec<u8>) -> Vec<ColorQuery> {
+    let mut queries = Vec::new();
+    let mut index = 0;
+    while index < probe.len() {
+        let prefix = if probe[index..].starts_with(b"\x1b]") {
+            2
+        } else if probe[index] == 0x9d {
+            1
+        } else {
+            index += 1;
+            continue;
+        };
+        let start = index + prefix;
+        let Some((end, terminator)) = color_osc_end(probe, start) else {
+            probe.drain(..index);
+            return queries;
+        };
+        if let Ok(content) = std::str::from_utf8(&probe[start..end]) {
+            let mut parts = content.split(';');
+            match parts.next() {
+                Some("10") if parts.next() == Some("?") => queries.push(ColorQuery::Foreground),
+                Some("11") if parts.next() == Some("?") => queries.push(ColorQuery::Background),
+                Some("4") => {
+                    while let (Some(index), Some("?")) = (parts.next(), parts.next()) {
+                        if let Ok(index) = index.parse() {
+                            queries.push(ColorQuery::Palette(index));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        index = end + terminator;
+    }
+    probe.clear();
+    queries
+}
+
+fn color_osc_end(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            0x07 | 0x9c => return Some((index, 1)),
+            0x1b if bytes.get(index + 1) == Some(&b'\\') => return Some((index, 2)),
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 fn terminal_input_closed(error: &anyhow::Error) -> bool {
@@ -771,6 +849,40 @@ mod tests {
         assert!(output.contains("\x1b[4;480;900t"));
         assert!(output.contains("\x1b]4;0;rgb:0000/0000/0000\x1b\\"));
         assert!(output.contains("\x1b_Gi=31337;EINVAL:graphics unavailable\x1b\\"));
+    }
+
+    #[test]
+    fn opentui_host_replies_with_the_inherited_theme() {
+        let result = Arc::new(Mutex::new(Vec::new()));
+        let theme = crate::terminal_theme::TerminalTheme {
+            foreground: crate::frame::Color { r: 1, g: 2, b: 3 },
+            background: crate::frame::Color { r: 4, g: 5, b: 6 },
+            ansi: std::array::from_fn(|index| crate::frame::Color {
+                r: index as u8,
+                g: 7,
+                b: 8,
+            }),
+        };
+        let mut host = Host::new_with_theme(
+            Box::new(Writer(result.clone())),
+            &Options {
+                opentui_host: true,
+                ..Options::default()
+            },
+            theme,
+        );
+
+        host.respond(OPENTUI_QUERY).unwrap();
+        host.respond(PALETTE_QUERY).unwrap();
+        host.respond(b"\x1b]4;1;?;15;?\x07\x1b]10;?\x07").unwrap();
+
+        let output = String::from_utf8(result.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("\x1b]10;rgb:0101/0202/0303"));
+        assert!(output.contains("\x1b]11;rgb:0404/0505/0606"));
+        assert!(output.contains("\x1b]4;0;rgb:0000/0707/0808"));
+        assert!(output.contains("\x1b]4;1;rgb:0101/0707/0808"));
+        assert!(output.contains("\x1b]4;15;rgb:0f0f/0707/0808"));
+        assert_eq!(output.matches("\x1b]10;rgb:0101/0202/0303").count(), 2);
     }
 
     #[test]

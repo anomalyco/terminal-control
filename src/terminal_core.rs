@@ -27,16 +27,6 @@ pub(crate) struct InputModes {
     pub bracketed_paste: bool,
 }
 
-impl InputModes {
-    pub(crate) fn without_mouse(mut self) -> Self {
-        self.normal_mouse = false;
-        self.button_mouse = false;
-        self.any_mouse = false;
-        self.sgr_mouse = false;
-        self
-    }
-}
-
 pub(crate) struct TerminalCore {
     terminal: Terminal<'static, 'static>,
     render_state: RenderState<'static>,

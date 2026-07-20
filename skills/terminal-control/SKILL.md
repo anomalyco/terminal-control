@@ -45,14 +45,15 @@ termctrl close-pane workspace --pane 1
 ```
 
 With no arguments, `run` starts `$SHELL` in the `workspace` session. Use `ctrl-b %` for left/right
-panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l` or a mouse click to focus, `ctrl-b d` to
-detach, and `ctrl-b ?` for help. Killing a pane with `ctrl-b x` or quitting with `ctrl-b q` requires a second press. A supplied
+panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l`, arrow keys, or a mouse click to focus, `ctrl-b d` to
+detach, `ctrl-b q` to show stable pane IDs, and `ctrl-b ?` for help. Killing a pane with `ctrl-b x`
+or quitting with `ctrl-b &` requires `y` confirmation. A supplied
 command still uses its executable basename when `NAME` is omitted. Splits can build up to four
 panes.
 
 `run NAME` creates when absent and reattaches when the workspace already exists. `attach NAME`
-requires an existing workspace. Closing the terminal detaches without killing panes; `ctrl-b q`
-twice or `termctrl stop NAME` ends the workspace. Only one human terminal may be attached, while
+requires an existing workspace. Closing the terminal detaches without killing panes; `ctrl-b &`
+followed by `y`, or `termctrl stop NAME`, ends the workspace. Only one human terminal may be attached, while
 agent pane controls remain available when detached.
 
 Pane IDs are stable identities; do not infer identity from list order, position, or application-owned

@@ -139,9 +139,12 @@ termctrl run editor
 termctrl attach editor
 ```
 
-The workspace daemon owns panes independently from any terminal. Closing an attached terminal detaches without killing panes; `ctrl-b q` twice, `termctrl stop NAME`, or closing the final pane ends the workspace. One human terminal may be attached at a time, while agent controls remain available whether attached or detached. A new attachment adopts its terminal size and theme and performs a full repaint.
+The workspace daemon owns panes independently from any terminal. Closing an attached terminal detaches without killing panes; `ctrl-b &` followed by `y`, `termctrl stop NAME`, or closing the final pane ends the workspace. One human terminal may be attached at a time, while agent controls remain available whether attached or detached. A new attachment adopts its terminal size and theme and performs a full repaint.
 
-Use `ctrl-b %` for left/right panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l` or a mouse click to focus, `ctrl-b d` to detach, and `ctrl-b ?` for in-workspace help. Splitting either half of a two-pane workspace builds up to a four-pane layout. Killing the active pane with `ctrl-b x` or quitting with `ctrl-b q` requires a second press.
+Use `ctrl-b %` for left/right panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l`, arrow keys, or a mouse click to focus, `ctrl-b q` to show stable pane IDs, `ctrl-b d` to detach, and `ctrl-b ?` for in-workspace help. Splitting either half of a two-pane workspace builds up to a four-pane layout. Killing the active pane with `ctrl-b x` or quitting with `ctrl-b &` requires `y` confirmation.
+
+Mouse events over a pane use pane-local coordinates and continue to mouse-aware applications. A
+primary click also focuses that pane; divider clicks are ignored.
 
 Agents discover stable pane IDs and geometry, declaratively grow a layout, and inspect or drive a pane without changing human focus:
 

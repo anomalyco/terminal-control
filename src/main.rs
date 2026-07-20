@@ -71,9 +71,9 @@ Run creates or reattaches a visible Terminal Control workspace. With no argument
 default name `workspace`. Supply a command after -- to replace the first shell when creating, or
 NAME to expose a stable explicit control socket. If NAME already exists, no command may be supplied.
 
-Use ctrl-b % to split left/right, ctrl-b \" to split top/bottom, ctrl-b h/j/k/l to focus, ctrl-b ?
-for help, and ctrl-b ctrl-b to send a literal ctrl-b. Destructive ctrl-b x and ctrl-b q actions
-require a second press. Agents can inspect the composed workspace or a specific pane, list stable
+Use ctrl-b % to split left/right, ctrl-b \" to split top/bottom, ctrl-b h/j/k/l or arrow keys to
+focus, ctrl-b q to show pane ids, ctrl-b d to detach, ctrl-b ? for help, and ctrl-b ctrl-b to send a literal ctrl-b.
+Destructive ctrl-b x and ctrl-b & actions require y/n confirmation. Agents can inspect the composed workspace or a specific pane, list stable
 pane ids and geometry, grow a layout, and send input without stealing human focus. Foreground
 workspaces inherit the outer terminal's default and ANSI colors.
 

@@ -519,48 +519,26 @@ impl Workspace {
         self.send_focus(self.active, true)
     }
 
-    fn focus_at(&mut self, x: u16, y: u16) -> Result<bool> {
-        let target = self
+    fn pane_at(&self, x: u16, y: u16) -> Option<(PaneId, u16, u16)> {
+        self.applied.geometry().panes.iter().find_map(|pane| {
+            let local_x = x.checked_sub(pane.rect.x)?;
+            let local_y = y.checked_sub(pane.rect.y)?;
+            (local_x < pane.rect.cols && local_y < pane.rect.rows)
+                .then_some((pane.id, local_x, local_y))
+        })
+    }
+
+    fn pane_position(&self, pane: PaneId, x: u16, y: u16) -> Option<(PaneId, u16, u16)> {
+        let rect = self
             .applied
             .geometry()
             .panes
             .iter()
-            .map(|pane| {
-                let right = pane.rect.x.saturating_add(pane.rect.cols);
-                let bottom = pane.rect.y.saturating_add(pane.rect.rows);
-                let dx = if x < pane.rect.x {
-                    pane.rect.x - x
-                } else if x >= right {
-                    x - right + 1
-                } else {
-                    0
-                };
-                let dy = if y < pane.rect.y {
-                    pane.rect.y - y
-                } else if y >= bottom {
-                    y - bottom + 1
-                } else {
-                    0
-                };
-                (dx.saturating_add(dy), pane.id)
-            })
-            .min()
-            .map(|(_, pane)| pane);
-        let Some(target) = target else {
-            return Ok(false);
-        };
-        if self.active == Some(target) {
-            return Ok(false);
-        }
-        self.focus_pane(target)?;
-        Ok(true)
-    }
-
-    pub(crate) fn close_active(&mut self) -> Result<()> {
-        let Some(active) = self.active else {
-            return Ok(());
-        };
-        self.close_pane(active)
+            .find(|placed| placed.id == pane)?
+            .rect;
+        let local_x = x.saturating_sub(rect.x).min(rect.cols.checked_sub(1)?);
+        let local_y = y.saturating_sub(rect.y).min(rect.rows.checked_sub(1)?);
+        Some((pane, local_x, local_y))
     }
 
     pub(crate) fn close_pane(&mut self, pane: PaneId) -> Result<()> {
@@ -601,6 +579,11 @@ impl Workspace {
 
     pub(crate) fn send_active_if_open(&mut self, input: &[u8]) -> Result<bool> {
         let index = self.resolve_pane(None)?;
+        self.panes[index].session.send_current_if_open(input)
+    }
+
+    fn send_to_if_open(&mut self, pane: PaneId, input: &[u8]) -> Result<bool> {
+        let index = self.resolve_pane(Some(pane))?;
         self.panes[index].session.send_current_if_open(input)
     }
 
@@ -836,6 +819,11 @@ impl Workspace {
         let index = self.resolve_pane(None)?;
         let modes = self.panes[index].session.input_modes()?;
         Ok(outer_input_modes(modes, self.panes.len()))
+    }
+
+    fn pane_input_modes(&self, pane: PaneId) -> Result<InputModes> {
+        let index = self.resolve_pane(Some(pane))?;
+        self.panes[index].session.input_modes()
     }
 
     pub(crate) fn active_title(&self) -> Result<String> {
@@ -1331,10 +1319,15 @@ enum InputAction {
     Focus(Direction),
     Mouse {
         input: Vec<u8>,
-        focus: Option<(u16, u16)>,
+        position: Option<(u16, u16)>,
+        primary_press: bool,
+        capture_start: bool,
+        captured_event: bool,
+        capture_end: bool,
     },
     CloseActive,
     Detach,
+    PaneNumbers,
     Quit,
     Help,
     Cancel,
@@ -1397,6 +1390,20 @@ impl PrefixDecoder {
                 break;
             }
             let remaining = &input[index..];
+            if self.waiting {
+                if let Some((direction, length)) = prefix_arrow(remaining) {
+                    flush_plain(&mut actions, &mut plain);
+                    actions.push(InputAction::Focus(direction));
+                    self.waiting = false;
+                    index += length;
+                    continue;
+                }
+                if is_prefix_arrow_start(remaining) {
+                    self.pending.extend_from_slice(remaining);
+                    self.pending_since = Some(Instant::now());
+                    break;
+                }
+            }
             if remaining.starts_with(SGR_MOUSE_PREFIX) {
                 if let Some(end) = remaining
                     .iter()
@@ -1445,7 +1452,8 @@ impl PrefixDecoder {
                     b'j' => InputAction::Focus(Direction::Down),
                     b'x' => InputAction::CloseActive,
                     b'd' => InputAction::Detach,
-                    b'q' => InputAction::Quit,
+                    b'q' => InputAction::PaneNumbers,
+                    b'&' => InputAction::Quit,
                     b'?' => InputAction::Help,
                     0x1b => InputAction::Cancel,
                     PREFIX => InputAction::Send(vec![PREFIX]),
@@ -1496,25 +1504,87 @@ impl PrefixDecoder {
     }
 }
 
+fn prefix_arrow(bytes: &[u8]) -> Option<(Direction, usize)> {
+    let direction = match bytes.get(..3)? {
+        b"\x1b[D" | b"\x1bOD" => Direction::Left,
+        b"\x1b[C" | b"\x1bOC" => Direction::Right,
+        b"\x1b[A" | b"\x1bOA" => Direction::Up,
+        b"\x1b[B" | b"\x1bOB" => Direction::Down,
+        _ => return None,
+    };
+    Some((direction, 3))
+}
+
+fn is_prefix_arrow_start(bytes: &[u8]) -> bool {
+    const ARROWS: [&[u8]; 8] = [
+        b"\x1b[D", b"\x1bOD", b"\x1b[C", b"\x1bOC", b"\x1b[A", b"\x1bOA", b"\x1b[B", b"\x1bOB",
+    ];
+    ARROWS.iter().any(|arrow| arrow.starts_with(bytes))
+}
+
 fn sgr_mouse_action(bytes: &[u8]) -> InputAction {
-    let focus = (|| {
-        if bytes.last() != Some(&b'M') {
-            return None;
-        }
+    let parsed = (|| {
+        let final_byte = *bytes.last()?;
         let body = std::str::from_utf8(&bytes[SGR_MOUSE_PREFIX.len()..bytes.len() - 1]).ok()?;
         let mut fields = body.split(';');
         let button = fields.next()?.parse::<u16>().ok()?;
         let x = fields.next()?.parse::<u16>().ok()?.checked_sub(1)?;
         let y = fields.next()?.parse::<u16>().ok()?.checked_sub(1)?;
-        if fields.next().is_some() || button & 0b11 != 0 || button & 0b1100_0000 != 0 {
+        if fields.next().is_some() {
             return None;
         }
-        Some((x, y))
+        let wheel = button & 0b1100_0000 != 0;
+        let motion = button & 0b0010_0000 != 0;
+        let press = final_byte == b'M' && !wheel && !motion && button & 0b11 != 3;
+        let captured_event = (motion && button & 0b11 != 3) || final_byte == b'm';
+        Some((
+            (x, y),
+            press && button & 0b11 == 0,
+            press,
+            captured_event,
+            final_byte == b'm',
+        ))
     })();
     InputAction::Mouse {
         input: bytes.to_vec(),
-        focus,
+        position: parsed.map(|(position, _, _, _, _)| position),
+        primary_press: parsed.is_some_and(|(_, primary_press, _, _, _)| primary_press),
+        capture_start: parsed.is_some_and(|(_, _, capture_start, _, _)| capture_start),
+        captured_event: parsed
+            .is_some_and(|(_, _, _, captured_event, capture_end)| captured_event || capture_end),
+        capture_end: parsed.is_some_and(|(_, _, _, _, capture_end)| capture_end),
     }
+}
+
+fn translate_mouse(input: &[u8], x: u16, y: u16, sgr: bool) -> Option<Vec<u8>> {
+    if !input.starts_with(SGR_MOUSE_PREFIX) || input.len() <= SGR_MOUSE_PREFIX.len() + 1 {
+        return None;
+    }
+    let final_byte = *input.last()?;
+    let body = std::str::from_utf8(&input[SGR_MOUSE_PREFIX.len()..input.len() - 1]).ok()?;
+    let mut button = body.split(';').next()?.parse::<u16>().ok()?;
+    if sgr {
+        return Some(
+            format!(
+                "\x1b[<{button};{};{}{}",
+                x + 1,
+                y + 1,
+                char::from(final_byte)
+            )
+            .into_bytes(),
+        );
+    }
+    if final_byte == b'm' {
+        button = (button & !0b11) | 0b11;
+    }
+    Some(vec![
+        0x1b,
+        b'[',
+        b'M',
+        u8::try_from(button).ok()?.checked_add(32)?,
+        u8::try_from(x).ok()?.checked_add(33)?,
+        u8::try_from(y).ok()?.checked_add(33)?,
+    ])
 }
 
 fn flush_plain(actions: &mut Vec<InputAction>, plain: &mut Vec<u8>) {
@@ -1561,18 +1631,29 @@ impl WorkspaceUi {
         }
     }
 
-    fn confirm(&mut self, action: ArmedAction, prompt: &str) -> bool {
-        let now = Instant::now();
-        if self
-            .armed
-            .is_some_and(|(armed, expires)| armed == action && expires >= now)
-        {
-            self.armed = None;
-            return true;
+    fn arm(&mut self, action: ArmedAction, prompt: &str) {
+        self.armed = Some((action, Instant::now() + Duration::from_secs(5)));
+        self.notice(prompt, Duration::from_secs(5));
+    }
+
+    fn confirmation(&mut self, input: &[u8]) -> Option<Option<ArmedAction>> {
+        let (action, expires) = self.armed?;
+        if expires < Instant::now() {
+            self.clear_armed();
+            return None;
         }
-        self.armed = Some((action, now + Duration::from_millis(1_500)));
-        self.notice(prompt, Duration::from_millis(1_500));
-        false
+        match input.first() {
+            Some(b'y' | b'Y') => {
+                self.armed = None;
+                self.notice = None;
+                Some(Some(action))
+            }
+            Some(b'n' | b'N' | 0x1b) => {
+                self.clear_armed();
+                Some(None)
+            }
+            _ => None,
+        }
     }
 
     fn overlay(&mut self, prefix: bool) -> Option<String> {
@@ -1602,6 +1683,7 @@ pub(crate) struct WorkspaceTerminal {
     attachment: Option<WorkspaceAttachment>,
     decoder: PrefixDecoder,
     ui: WorkspaceUi,
+    mouse_target: Option<PaneId>,
     pending_removal: bool,
     finished: bool,
 }
@@ -1627,6 +1709,7 @@ impl WorkspaceTerminal {
             attachment: None,
             decoder: PrefixDecoder::default(),
             ui: WorkspaceUi::new(),
+            mouse_target: None,
             pending_removal: false,
             finished: false,
         }
@@ -1655,6 +1738,7 @@ impl WorkspaceTerminal {
         )?;
         self.decoder = PrefixDecoder::default();
         self.ui = WorkspaceUi::new();
+        self.mouse_target = None;
         self.attachment = Some(WorkspaceAttachment {
             id: options.id,
             input,
@@ -1756,6 +1840,31 @@ impl WorkspaceTerminal {
             for action in actions {
                 match action {
                     InputAction::Send(input) => {
+                        if let Some(confirmation) = self.ui.confirmation(&input) {
+                            match confirmation {
+                                Some(ArmedAction::Close(pane)) => {
+                                    match workspace.close_pane(pane) {
+                                        Ok(()) => self.ui.notice(
+                                            format!("pane {pane} killed"),
+                                            Duration::from_millis(1_200),
+                                        ),
+                                        Err(error) => {
+                                            attachment.screen.bell()?;
+                                            self.ui.notice(
+                                                error.to_string(),
+                                                Duration::from_millis(1_500),
+                                            );
+                                        }
+                                    }
+                                }
+                                Some(ArmedAction::Quit) => workspace.stop(),
+                                None => self.ui.notice("canceled", Duration::from_millis(1_000)),
+                            }
+                            if workspace.is_empty() {
+                                return Ok(true);
+                            }
+                            continue;
+                        }
                         self.ui.clear_armed();
                         if !workspace.send_active_if_open(&input)? {
                             workspace.observe_exits()?;
@@ -1807,11 +1916,43 @@ impl WorkspaceTerminal {
                                 .notice(direction.unavailable(), Duration::from_millis(1_000));
                         }
                     }
-                    InputAction::Mouse { input, focus } => {
-                        if workspace.is_multi_pane() {
-                            if let Some((x, y)) = focus {
-                                self.ui.clear_armed();
-                                workspace.focus_at(x, y)?;
+                    InputAction::Mouse {
+                        input,
+                        position,
+                        primary_press,
+                        capture_start,
+                        captured_event,
+                        capture_end,
+                    } => {
+                        if workspace.is_multi_pane() || self.mouse_target.is_some() {
+                            let target = position.and_then(|(x, y)| {
+                                if captured_event {
+                                    self.mouse_target
+                                        .and_then(|pane| workspace.pane_position(pane, x, y))
+                                } else {
+                                    workspace.pane_at(x, y)
+                                }
+                            });
+                            if capture_end {
+                                self.mouse_target = None;
+                            }
+                            if let Some((pane, local_x, local_y)) = target {
+                                if capture_start {
+                                    self.mouse_target = Some(pane);
+                                }
+                                if primary_press {
+                                    self.ui.clear_armed();
+                                    workspace.focus_pane(pane)?;
+                                }
+                                let modes = workspace.pane_input_modes(pane)?;
+                                if (modes.normal_mouse || modes.button_mouse || modes.any_mouse)
+                                    && let Some(input) =
+                                        translate_mouse(&input, local_x, local_y, modes.sgr_mouse)
+                                    && !workspace.send_to_if_open(pane, &input)?
+                                {
+                                    workspace.observe_exits()?;
+                                    break;
+                                }
                             }
                         } else if !workspace.send_active_if_open(&input)? {
                             workspace.observe_exits()?;
@@ -1820,30 +1961,47 @@ impl WorkspaceTerminal {
                     }
                     InputAction::CloseActive => {
                         let pane = workspace.active_id().unwrap_or(0);
-                        if self.ui.confirm(
-                            ArmedAction::Close(pane),
-                            &format!("^B x again to kill pane {pane}"),
-                        ) {
-                            workspace.close_active()?;
-                            self.ui.notice(
-                                format!("pane {pane} killed"),
-                                Duration::from_millis(1_200),
-                            );
-                        }
+                        let prompt = if workspace.panes.len() == 1 {
+                            format!("kill final pane {pane} and end workspace? (y/n)")
+                        } else {
+                            format!("kill pane {pane}? (y/n)")
+                        };
+                        self.ui.arm(ArmedAction::Close(pane), &prompt);
                     }
                     InputAction::Detach => return Ok(false),
+                    InputAction::PaneNumbers => {
+                        self.ui.clear_armed();
+                        let mut panes = workspace
+                            .panes
+                            .iter()
+                            .map(|pane| pane.id)
+                            .collect::<Vec<_>>();
+                        panes.sort_unstable();
+                        let active = workspace.active_id();
+                        let panes = panes
+                            .into_iter()
+                            .map(|pane| {
+                                if active == Some(pane) {
+                                    format!("[{pane}]")
+                                } else {
+                                    pane.to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("  ");
+                        self.ui.notice(
+                            format!("panes: {panes}  active pane in brackets"),
+                            Duration::from_secs(4),
+                        );
+                    }
                     InputAction::Quit => {
-                        if self
-                            .ui
-                            .confirm(ArmedAction::Quit, "^B q again to kill all panes")
-                        {
-                            workspace.stop();
-                        }
+                        self.ui
+                            .arm(ArmedAction::Quit, "kill workspace and all panes? (y/n)");
                     }
                     InputAction::Help => {
                         self.ui.clear_armed();
                         self.ui.notice(
-                            "^B % side  \" stack  h/j/k/l focus  x pane  d detach  q all",
+                            "^B % side  \" stack  h/j/k/l focus  q panes  x pane  d detach  & all",
                             Duration::from_secs(4),
                         );
                     }
@@ -2243,7 +2401,7 @@ fn outer_input_modes(modes: InputModes, pane_count: usize) -> InputModes {
     if pane_count == 1 {
         modes
     } else {
-        let mut modes = modes.without_mouse();
+        let mut modes = modes;
         modes.normal_mouse = true;
         modes.sgr_mouse = true;
         modes
@@ -2327,7 +2485,7 @@ mod tests {
     }
 
     #[test]
-    fn split_workspace_requests_only_workspace_click_mouse_modes() {
+    fn split_workspace_adds_click_focus_without_disabling_child_mouse_modes() {
         let modes = InputModes {
             normal_mouse: true,
             button_mouse: true,
@@ -2339,8 +2497,8 @@ mod tests {
         let outer = outer_input_modes(modes, 2);
 
         assert!(outer.normal_mouse);
-        assert!(!outer.button_mouse);
-        assert!(!outer.any_mouse);
+        assert!(outer.button_mouse);
+        assert!(outer.any_mouse);
         assert!(outer.sgr_mouse);
     }
 
@@ -2554,6 +2712,15 @@ mod tests {
             [InputAction::Focus(Direction::Up)]
         );
         assert_eq!(decoder.push(&[PREFIX, b'd']), [InputAction::Detach]);
+        assert_eq!(decoder.push(&[PREFIX, b'q']), [InputAction::PaneNumbers]);
+        assert_eq!(decoder.push(&[PREFIX, b'&']), [InputAction::Quit]);
+        assert!(decoder.push(&[PREFIX, 0x1b]).is_empty());
+        assert!(decoder.push(b"[").is_empty());
+        assert_eq!(decoder.push(b"A"), [InputAction::Focus(Direction::Up)]);
+        assert_eq!(
+            decoder.push(&[PREFIX, 0x1b, b'O', b'D']),
+            [InputAction::Focus(Direction::Left)]
+        );
         assert_eq!(decoder.push(&[PREFIX, b'z']), [InputAction::Unknown(b'z')]);
         assert_eq!(
             decoder.push(&[PREFIX, PREFIX]),
@@ -2570,22 +2737,53 @@ mod tests {
             decoder.push(b";13M"),
             [InputAction::Mouse {
                 input: b"\x1b[<0;42;13M".to_vec(),
-                focus: Some((41, 12)),
+                position: Some((41, 12)),
+                primary_press: true,
+                capture_start: true,
+                captured_event: false,
+                capture_end: false,
             }]
         );
         assert_eq!(
             decoder.push(b"\x1b[<0;42;13m"),
             [InputAction::Mouse {
                 input: b"\x1b[<0;42;13m".to_vec(),
-                focus: None,
+                position: Some((41, 12)),
+                primary_press: false,
+                capture_start: false,
+                captured_event: true,
+                capture_end: true,
             }]
         );
         assert_eq!(
             decoder.push(b"\x1b[<64;42;13M"),
             [InputAction::Mouse {
                 input: b"\x1b[<64;42;13M".to_vec(),
-                focus: None,
+                position: Some((41, 12)),
+                primary_press: false,
+                capture_start: false,
+                captured_event: false,
+                capture_end: false,
             }]
+        );
+        assert_eq!(
+            decoder.push(b"\x1b[<32;42;13M"),
+            [InputAction::Mouse {
+                input: b"\x1b[<32;42;13M".to_vec(),
+                position: Some((41, 12)),
+                primary_press: false,
+                capture_start: false,
+                captured_event: true,
+                capture_end: false,
+            }]
+        );
+        assert_eq!(
+            translate_mouse(b"\x1b[<64;42;13M", 2, 3, true).as_deref(),
+            Some(b"\x1b[<64;3;4M".as_slice())
+        );
+        assert_eq!(
+            translate_mouse(b"\x1b[<0;42;13M", 2, 3, false).as_deref(),
+            Some(b"\x1b[M #$".as_slice())
         );
     }
 
@@ -2662,15 +2860,16 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_input_clears_destructive_confirmation_and_notice() {
+    fn destructive_confirmation_accepts_yes_and_rejects_no() {
         let mut ui = WorkspaceUi::new();
 
-        assert!(!ui.confirm(ArmedAction::Quit, "confirm quit"));
+        ui.arm(ArmedAction::Quit, "confirm quit");
         assert_eq!(ui.overlay(false).as_deref(), Some("confirm quit"));
-        ui.clear_armed();
-
+        assert_eq!(ui.confirmation(b"n\r"), Some(None));
         assert_eq!(ui.overlay(false), None);
-        assert!(!ui.confirm(ArmedAction::Quit, "confirm quit"));
+        ui.arm(ArmedAction::Close(3), "confirm close");
+        assert_eq!(ui.confirmation(b"y\r"), Some(Some(ArmedAction::Close(3))));
+        assert_eq!(ui.overlay(false), None);
     }
 
     #[test]
@@ -2834,7 +3033,9 @@ mod tests {
         let restored = workspace.frame().unwrap().text();
         assert!(restored.contains("TOP"));
         assert!(restored.contains("BOTTOM"));
-        workspace.close_active().unwrap();
+        workspace
+            .close_pane(workspace.active_id().unwrap())
+            .unwrap();
         let panes = workspace.panes().unwrap();
         assert_eq!(panes.len(), 1);
         assert_eq!((panes[0].cols, panes[0].rows), (21, 9));
@@ -3058,10 +3259,13 @@ mod tests {
         assert!(workspace.set_grid(2, 1).is_err());
         workspace.focus_pane(3).unwrap();
         assert_eq!(workspace.active_id(), Some(3));
-        assert!(workspace.focus_at(1, 1).unwrap());
+        workspace.focus_pane(0).unwrap();
         assert_eq!(workspace.active_id(), Some(0));
-        assert!(workspace.focus_at(22, 8).unwrap());
+        workspace.focus_pane(3).unwrap();
         assert_eq!(workspace.active_id(), Some(3));
+        assert_eq!(workspace.pane_at(22, 8), Some((3, 1, 1)));
+        assert_eq!(workspace.pane_at(20, 6), None);
+        assert_eq!(workspace.pane_position(0, 22, 8), Some((0, 19, 5)));
         workspace.close_pane(1).unwrap();
         assert_eq!(workspace.active_id(), Some(3));
         assert_eq!(workspace.panes().unwrap().len(), 3);

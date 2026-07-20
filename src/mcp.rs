@@ -30,11 +30,13 @@ struct ScreenRequest {
     pane: Option<u32>,
     #[serde(default)]
     #[schemars(
-        description = "Optional quiet period before returning; omit for an immediate snapshot"
+        description = "Optional quiet period before returning. Defaults to 0; omit unless intentionally settling, and never send an explicit 0"
     )]
     settle_ms: u64,
     #[serde(default)]
-    #[schemars(description = "Maximum optional settling wait; omit for an immediate snapshot")]
+    #[schemars(
+        description = "Maximum optional settling wait. Defaults to 0; omit unless intentionally settling, and never send an explicit 0"
+    )]
     deadline_ms: u64,
 }
 
@@ -71,11 +73,13 @@ struct InteractRequest {
     timeout_ms: u64,
     #[serde(default)]
     #[schemars(
-        description = "Optional quiet period before returning; omit for an immediate snapshot"
+        description = "Optional quiet period before returning. Defaults to 0; omit unless intentionally settling, and never send an explicit 0"
     )]
     settle_ms: u64,
     #[serde(default)]
-    #[schemars(description = "Maximum optional settling wait; omit for an immediate snapshot")]
+    #[schemars(
+        description = "Maximum optional settling wait. Defaults to 0; omit unless intentionally settling, and never send an explicit 0"
+    )]
     deadline_ms: u64,
 }
 
@@ -587,7 +591,9 @@ mod tests {
             for field in ["settleMs", "deadlineMs"] {
                 let property = &schema["properties"][field];
                 assert_eq!(property["default"], 0);
-                assert!(property["description"].as_str().unwrap().contains("omit"));
+                let description = property["description"].as_str().unwrap();
+                assert!(description.contains("omit"));
+                assert!(description.contains("never send an explicit 0"));
                 assert!(!required.iter().any(|value| value == field));
             }
         }

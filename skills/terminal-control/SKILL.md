@@ -57,6 +57,10 @@ needed. Composed ANSI output is a rendered snapshot; pane-targeted ANSI is the o
 
 Do not treat logs as the visible state of an alternate-screen TUI.
 
+Named-session screen reads are immediate by default. Do not pass `--settle-ms 0` or
+`--deadline-ms 0`; omit both options. Set them only to intentional nonzero values when a specific
+transition needs quiet-output settling.
+
 ## Drive Input Precisely
 
 Send plain text with `text:<value>` and named keys as separate input atoms:

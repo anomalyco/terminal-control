@@ -41,6 +41,7 @@ termctrl mcp
 
 MCP screen reads and interactions return the current frame immediately. Agents can opt into
 quiet-output settling with `settleMs` and `deadlineMs` when a specific transition requires it.
+Omit both fields for immediate reads; never send explicit zero values.
 
 Then ask for terminal work in ordinary language:
 
@@ -57,6 +58,8 @@ The skill teaches the safe workflow: start named sessions, wait for visible text
 ## Read A Screen
 
 `show` runs a program in a PTY and prints its settled visible screen to stdout. No files are created.
+Named-session reads such as `termctrl show app` are immediate by default; omit `--settle-ms` and
+`--deadline-ms` unless intentional nonzero settling is required.
 
 ```bash
 termctrl show --cols 100 --rows 32 -- my-terminal-app

@@ -266,10 +266,10 @@ struct SourceArgs {
     /// Color environment policy for a command source (default: auto for PTY, always for pipe).
     #[arg(long, value_enum)]
     color: Option<ColorMode>,
-    /// Capture after this many milliseconds without output (default: 250).
+    /// Quiet period before capture (default: 0 for named sessions, 250 for commands).
     #[arg(long)]
     settle_ms: Option<u64>,
-    /// Capture or return after this deadline even if output continues (default: 5000).
+    /// Settling deadline (default: 0 for named sessions, 5000 for commands).
     #[arg(long)]
     deadline_ms: Option<u64>,
     /// Wait this long before allowing the initial screen to settle.
@@ -747,12 +747,7 @@ fn save(args: SaveArgs) -> Result<()> {
 
 fn read_source(args: &SourceArgs, render: &RenderArgs) -> Result<shot_engine::Shot> {
     let defaults = shot_engine::Options::default();
-    let settle =
-        Duration::from_millis(args.settle_ms.unwrap_or(defaults.settle.as_millis() as u64));
-    let deadline = Duration::from_millis(
-        args.deadline_ms
-            .unwrap_or(defaults.deadline.as_millis() as u64),
-    );
+    let (settle, deadline) = capture_timing(args, &defaults);
     if let Some(path) = args.recording.as_ref() {
         if args.name.is_some()
             || args.pipe
@@ -869,6 +864,23 @@ fn read_source(args: &SourceArgs, render: &RenderArgs) -> Result<shot_engine::Sh
     } else {
         shot_engine::from_command(&args.command, args.cwd.as_deref(), &options)
     }
+}
+
+fn capture_timing(args: &SourceArgs, defaults: &shot_engine::Options) -> (Duration, Duration) {
+    let default_settle = if args.name.is_some() {
+        0
+    } else {
+        defaults.settle.as_millis() as u64
+    };
+    let default_deadline = if args.name.is_some() {
+        0
+    } else {
+        defaults.deadline.as_millis() as u64
+    };
+    (
+        Duration::from_millis(args.settle_ms.unwrap_or(default_settle)),
+        Duration::from_millis(args.deadline_ms.unwrap_or(default_deadline)),
+    )
 }
 
 fn send(args: SendArgs) -> Result<()> {
@@ -1293,6 +1305,46 @@ mod tests {
         };
         assert_eq!(args.source.name.as_deref(), Some("demo"));
         assert_eq!(args.formats, [ShotFormat::Png, ShotFormat::Txt]);
+    }
+
+    #[test]
+    fn named_screen_reads_are_immediate_without_explicit_zero_flags() {
+        let defaults = shot_engine::Options::default();
+        let cli = Cli::try_parse_from(["termctrl", "show", "demo"]).unwrap();
+        let Command::Show(args) = cli.command else {
+            panic!("expected show command");
+        };
+        assert_eq!(
+            capture_timing(&args.source, &defaults),
+            (Duration::ZERO, Duration::ZERO)
+        );
+
+        let cli = Cli::try_parse_from(["termctrl", "show", "--", "app"]).unwrap();
+        let Command::Show(args) = cli.command else {
+            panic!("expected show command");
+        };
+        assert_eq!(
+            capture_timing(&args.source, &defaults),
+            (defaults.settle, defaults.deadline)
+        );
+
+        let cli = Cli::try_parse_from([
+            "termctrl",
+            "show",
+            "demo",
+            "--settle-ms",
+            "25",
+            "--deadline-ms",
+            "500",
+        ])
+        .unwrap();
+        let Command::Show(args) = cli.command else {
+            panic!("expected show command");
+        };
+        assert_eq!(
+            capture_timing(&args.source, &defaults),
+            (Duration::from_millis(25), Duration::from_millis(500))
+        );
     }
 
     #[test]

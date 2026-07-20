@@ -1181,6 +1181,8 @@ mod implementation {
     const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
     const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_CONTROL_DURATION_MS: u64 = 10 * 60 * 1000;
+    const DETACHED_WORKSPACE_POLL: Duration = Duration::from_millis(50);
+    const DETACHED_WORKSPACE_ACTIVE: Duration = Duration::from_millis(500);
     static NEXT_ATTACHMENT_ID: AtomicU64 = AtomicU64::new(1);
 
     struct StartLock(fs::File);
@@ -1757,12 +1759,15 @@ mod implementation {
                 crate::terminal_theme::TerminalTheme::default(),
             )?;
             let mut terminal = WorkspaceTerminal::detached();
+            let mut active_until = Instant::now();
             'workspace: loop {
                 let running = terminal.tick(&mut workspace)?;
                 loop {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            if handle_workspace(stream, &mut workspace, &mut terminal)? {
+                            let finished = handle_workspace(stream, &mut workspace, &mut terminal)?;
+                            active_until = Instant::now() + DETACHED_WORKSPACE_ACTIVE;
+                            if finished {
                                 break 'workspace;
                             }
                         }
@@ -1773,12 +1778,35 @@ mod implementation {
                 if !running || terminal.finished() {
                     break;
                 }
-                thread::sleep(Duration::from_millis(5));
+                if terminal.is_attached() || Instant::now() < active_until {
+                    thread::sleep(Duration::from_millis(5));
+                } else {
+                    wait_for_workspace_request(&listener, DETACHED_WORKSPACE_POLL)?;
+                }
             }
             Ok(())
         })();
         let _ = fs::remove_file(&socket);
         result
+    }
+
+    fn wait_for_workspace_request(listener: &UnixListener, timeout: Duration) -> Result<()> {
+        let mut descriptor = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        loop {
+            let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+            if result >= 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != ErrorKind::Interrupted {
+                return Err(error).context("wait for detached workspace request");
+            }
+        }
     }
 
     struct RawMode;

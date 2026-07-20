@@ -1455,14 +1455,28 @@ mod implementation {
         let mut stream = UnixStream::connect(&socket).with_context(|| {
             format!("connect to session at {}; is it running?", socket.display())
         })?;
-        serde_json::to_writer(&mut stream, request).context("write session request")?;
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut stream);
+        serde_json::to_writer(&mut writer, request).context("write session request")?;
+        writer.flush().context("flush session request")?;
+        drop(writer);
         stream
             .shutdown(std::net::Shutdown::Write)
             .context("finish session request")?;
-        serde_json::from_reader(stream).context("read session response")
+        serde_json::from_reader(std::io::BufReader::with_capacity(64 * 1024, stream))
+            .context("read session response")
     }
 
     pub fn attach(socket: PathBuf, name: &str, options: &Options) -> Result<()> {
+        let timing = std::env::var_os("TERMCTRL_ATTACH_TIMING").is_some();
+        let attach_started = Instant::now();
+        let mark = move |label: &str| {
+            if timing {
+                eprintln!(
+                    "TIMING attach {label}={:.1}ms",
+                    attach_started.elapsed().as_secs_f64() * 1_000.0
+                );
+            }
+        };
         ensure_socket_path(&socket)?;
         require_attachment_terminal()?;
         let response = request(socket.clone(), &Request::Ping)?;
@@ -1474,8 +1488,10 @@ mod implementation {
         if let Some(error) = response.error {
             bail!(error);
         }
+        mark("ping");
         let raw = RawMode::enter()?;
         let (theme, retained_input) = crate::terminal_theme::discover();
+        mark("theme");
         let endpoint = AttachmentEndpoint::bind(name)?;
         let result = (|| {
             let response = request(
@@ -1498,7 +1514,9 @@ mod implementation {
             if let Some(error) = response.error {
                 bail!(error);
             }
+            mark("attach-request");
             let mut stream = endpoint.accept(Instant::now() + Duration::from_secs(5))?;
+            mark("accepted");
             stream
                 .set_write_timeout(Some(Duration::from_millis(250)))
                 .context("bound workspace attachment input")?;
@@ -1551,6 +1569,9 @@ mod implementation {
     }
 
     fn relay_attachment(stream: &mut UnixStream) -> Result<()> {
+        let timing = std::env::var_os("TERMCTRL_ATTACH_TIMING").is_some();
+        let relay_started = Instant::now();
+        let mut first_output = true;
         let stream_fd = stream.as_raw_fd();
         let max_fd = stream_fd.max(libc::STDIN_FILENO) + 1;
         let mut stdout = std::io::stdout().lock();
@@ -1582,6 +1603,12 @@ mod implementation {
                 match stream.read(&mut bytes) {
                     Ok(0) => break,
                     Ok(length) => {
+                        if timing && std::mem::take(&mut first_output) {
+                            eprintln!(
+                                "TIMING attach first-output={:.1}ms",
+                                relay_started.elapsed().as_secs_f64() * 1_000.0
+                            );
+                        }
                         stdout
                             .write_all(&bytes[..length])
                             .context("write attached workspace output")?;
@@ -1898,12 +1925,36 @@ mod implementation {
     }
 
     fn run(listener: &UnixListener, session: &mut Session) -> Result<()> {
+        let timing = std::env::var_os("TERMCTRL_SERVE_TIMING").map(PathBuf::from);
+        let log = |line: String| {
+            if let Some(path) = &timing
+                && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
+            {
+                let _ = writeln!(file, "{line}");
+            }
+        };
+        let serve_started = Instant::now();
         loop {
             // Keep parsing and recording output even when no control request is in flight.
+            let phase_started = Instant::now();
             session.consume_batch()?;
+            if phase_started.elapsed() > Duration::from_millis(50) {
+                log(format!(
+                    "TIMING serve consume at={:.0}ms took={:.0}ms",
+                    serve_started.elapsed().as_secs_f64() * 1_000.0,
+                    phase_started.elapsed().as_secs_f64() * 1_000.0,
+                ));
+            }
             match listener.accept() {
                 Ok((stream, _)) => {
-                    if handle(stream, session)? {
+                    let handle_started = Instant::now();
+                    let stopped = handle(stream, session)?;
+                    log(format!(
+                        "TIMING serve handle at={:.0}ms took={:.0}ms",
+                        serve_started.elapsed().as_secs_f64() * 1_000.0,
+                        handle_started.elapsed().as_secs_f64() * 1_000.0,
+                    ));
+                    if stopped {
                         return Ok(());
                     }
                 }
@@ -1943,6 +1994,15 @@ mod implementation {
         subject: &str,
         mut dispatch: impl FnMut(Request) -> (Response, bool),
     ) -> Result<bool> {
+        let timing = std::env::var_os("TERMCTRL_SERVE_TIMING").map(PathBuf::from);
+        let log = |line: String| {
+            if let Some(path) = &timing
+                && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
+            {
+                let _ = writeln!(file, "{line}");
+            }
+        };
+        let handle_started = Instant::now();
         stream
             .set_nonblocking(false)
             .with_context(|| format!("set {subject} connection blocking"))?;
@@ -1962,8 +2022,22 @@ mod implementation {
             }
             Ok(_) => match serde_json::from_slice::<Request>(&bytes) {
                 Ok(request) => {
+                    log(format!(
+                        "TIMING control read={:.0}ms",
+                        handle_started.elapsed().as_secs_f64() * 1_000.0
+                    ));
+                    let dispatch_started = Instant::now();
                     let (response, finished) = dispatch(request);
+                    log(format!(
+                        "TIMING control dispatch={:.0}ms",
+                        dispatch_started.elapsed().as_secs_f64() * 1_000.0
+                    ));
+                    let write_started = Instant::now();
                     let written = write_response(stream, &response).is_ok();
+                    log(format!(
+                        "TIMING control write={:.0}ms",
+                        write_started.elapsed().as_secs_f64() * 1_000.0
+                    ));
                     return Ok(written && finished);
                 }
                 Err(error) => Response::error(format!("invalid {subject} request: {error}")),
@@ -1975,8 +2049,9 @@ mod implementation {
     }
 
     fn write_response(stream: &mut UnixStream, response: &Response) -> Result<()> {
-        serde_json::to_writer(&mut *stream, response).context("write session response")?;
-        stream.flush().context("flush session response")
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut *stream);
+        serde_json::to_writer(&mut writer, response).context("write session response")?;
+        writer.flush().context("flush session response")
     }
 
     fn respond(session: &mut Session, request: Request) -> Result<Response> {

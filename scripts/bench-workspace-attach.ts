@@ -59,6 +59,8 @@ try {
   Bun.sleepSync(20)
 
   const measured: Array<number> = []
+  const startPhases: Array<number> = []
+  const framePhases: Array<number> = []
   for (let index = 0; index <= runs; index++) {
     const client = `bench-client-${suffix}-${index}`
     clients.push(client)
@@ -75,11 +77,19 @@ try {
       "attach",
       workspace,
     ])
+    const startDone = performance.now()
     waitForScreen(client)
     const elapsed = performance.now() - started
     cleanup(client)
     Bun.sleepSync(20)
-    if (index > 0) measured.push(elapsed)
+    if (index > 0) {
+      measured.push(elapsed)
+      startPhases.push(startDone - started)
+      framePhases.push(elapsed - (startDone - started))
+      console.log(
+        `run ${index}: total=${elapsed.toFixed(1)}ms start=${(startDone - started).toFixed(1)}ms frame=${(elapsed - (startDone - started)).toFixed(1)}ms`,
+      )
+    }
   }
 
   const result = median(measured)
@@ -92,6 +102,12 @@ try {
   console.log(`METRIC workspace_attach_median_ms=${result.toFixed(1)}`)
   console.log(
     `METRIC workspace_attach_mad_ms=${median(deviations).toFixed(1)}`,
+  )
+  console.log(
+    `METRIC workspace_attach_start_median_ms=${median(startPhases).toFixed(1)}`,
+  )
+  console.log(
+    `METRIC workspace_attach_frame_median_ms=${median(framePhases).toFixed(1)}`,
   )
 } finally {
   for (const client of clients) cleanup(client)

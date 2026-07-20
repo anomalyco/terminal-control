@@ -32,6 +32,19 @@ preserving the workspace daemon.
 2. Instrument only when the median or spread identifies a real boundary.
 3. Change one boundary at a time and keep only durable wins outside the noise floor.
 
+## Results
+
+| Experiment | Median | MAD |
+| --- | ---: | ---: |
+| Baseline (unbuffered control-socket JSON) | 2,845.9 ms | 262.4 ms |
+| Buffered control-socket reads and writes | 56.6 ms | 0.8 ms |
+
+Phase instrumentation (`TERMCTRL_ATTACH_TIMING`, `TERMCTRL_SERVE_TIMING`) showed the attach
+handshake itself completed in ~16 ms; the remaining ~1.2 s per observation was
+`serde_json::to_writer`/`from_reader` running directly against the Unix socket, one syscall per
+JSON token. Wrapping both directions in 64 KiB buffers removed the boundary entirely. The same
+fix applies to every `show`, `wait`, `interact`, and MCP capture round trip carrying a `Shot`.
+
 ## Correctness Guardrails
 
 - Pane processes and IDs survive every measured detach.

@@ -1,6 +1,7 @@
-use std::io::{Stdout, Write};
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -21,6 +22,7 @@ const HORIZONTAL_DIVIDER: &str = "─";
 const PREFIX: u8 = 0x02;
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
+const SGR_MOUSE_PREFIX: &[u8] = b"\x1b[<";
 const PASTE_CHUNK_BYTES: usize = 64 * 1024;
 
 pub(crate) struct Workspace {
@@ -36,7 +38,6 @@ pub(crate) struct Workspace {
     options: Options,
     theme: TerminalTheme,
     launch: SessionLaunch,
-    stopped: bool,
     paste: Option<(PaneId, bool)>,
 }
 
@@ -240,8 +241,6 @@ struct Divider {
     x: u16,
     y: u16,
     len: u16,
-    first_active: bool,
-    second_active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,7 +322,6 @@ impl Workspace {
             options: options.clone(),
             theme,
             launch,
-            stopped: false,
             paste: None,
         })
     }
@@ -338,6 +336,18 @@ impl Workspace {
 
     pub(crate) fn active_id(&self) -> Option<PaneId> {
         self.active
+    }
+
+    fn is_multi_pane(&self) -> bool {
+        self.panes.len() > 1
+    }
+
+    pub(crate) fn set_theme(&mut self, theme: TerminalTheme) -> Result<()> {
+        for pane in &mut self.panes {
+            pane.session.set_theme(theme)?;
+        }
+        self.theme = theme;
+        Ok(())
     }
 
     pub(crate) fn pump(&mut self) -> Result<()> {
@@ -405,7 +415,7 @@ impl Workspace {
         if !layout.split_leaf(active, axis, new_id) {
             bail!("workspace layout has no pane {active}");
         }
-        let geometry = geometry(&layout, self.cols, self.rows, Some(new_id))?;
+        let geometry = geometry(&layout, self.cols, self.rows)?;
         let rect = geometry
             .panes
             .iter()
@@ -445,7 +455,7 @@ impl Workspace {
         if self.layout.as_ref() == Some(&layout) {
             return Ok(());
         }
-        let geometry = geometry(&layout, self.cols, self.rows, self.active)?;
+        let geometry = geometry(&layout, self.cols, self.rows)?;
         let mut added = Vec::new();
         for id in ids
             .iter()
@@ -504,22 +514,46 @@ impl Workspace {
         if self.active == Some(pane) {
             return Ok(());
         }
-        let applied = if self.applied.is_constrained() {
-            None
-        } else {
-            Some(geometry(
-                self.layout.as_ref().context("workspace has no layout")?,
-                self.cols,
-                self.rows,
-                Some(pane),
-            )?)
-        };
         self.send_focus(self.active, false)?;
         self.active = Some(pane);
-        if let Some(applied) = applied {
-            self.applied = AppliedLayout::Ready(applied);
-        }
         self.send_focus(self.active, true)
+    }
+
+    fn focus_at(&mut self, x: u16, y: u16) -> Result<bool> {
+        let target = self
+            .applied
+            .geometry()
+            .panes
+            .iter()
+            .map(|pane| {
+                let right = pane.rect.x.saturating_add(pane.rect.cols);
+                let bottom = pane.rect.y.saturating_add(pane.rect.rows);
+                let dx = if x < pane.rect.x {
+                    pane.rect.x - x
+                } else if x >= right {
+                    x - right + 1
+                } else {
+                    0
+                };
+                let dy = if y < pane.rect.y {
+                    pane.rect.y - y
+                } else if y >= bottom {
+                    y - bottom + 1
+                } else {
+                    0
+                };
+                (dx.saturating_add(dy), pane.id)
+            })
+            .min()
+            .map(|(_, pane)| pane);
+        let Some(target) = target else {
+            return Ok(false);
+        };
+        if self.active == Some(target) {
+            return Ok(false);
+        }
+        self.focus_pane(target)?;
+        Ok(true)
     }
 
     pub(crate) fn close_active(&mut self) -> Result<()> {
@@ -548,7 +582,6 @@ impl Workspace {
                 panes: Vec::new(),
                 dividers: Vec::new(),
             });
-            self.stopped = true;
             return Ok(());
         }
         if closing_active {
@@ -603,6 +636,15 @@ impl Workspace {
             return self.panes[index].session.send_current_if_open(PASTE_END);
         }
         Ok(true)
+    }
+
+    fn cancel_paste(&mut self) {
+        let Some((target, bracketed)) = self.paste.take() else {
+            return;
+        };
+        if bracketed && let Some(index) = self.pane_index(target) {
+            let _ = self.panes[index].session.send_current_if_open(PASTE_END);
+        }
     }
 
     pub(crate) fn send_all(
@@ -882,7 +924,6 @@ impl Workspace {
     }
 
     pub(crate) fn stop(&mut self) {
-        self.stopped = true;
         self.paste = None;
         for pane in &mut self.panes {
             let _ = pane.session.stop();
@@ -896,10 +937,6 @@ impl Workspace {
         });
     }
 
-    pub(crate) fn was_stopped(&self) -> bool {
-        self.stopped
-    }
-
     fn refresh_layout(&mut self) -> Result<()> {
         let Some(layout) = &self.layout else {
             self.applied = AppliedLayout::Ready(WorkspaceGeometry {
@@ -908,7 +945,7 @@ impl Workspace {
             });
             return Ok(());
         };
-        match geometry(layout, self.cols, self.rows, self.active) {
+        match geometry(layout, self.cols, self.rows) {
             Ok(geometry) => self.apply_geometry(geometry),
             Err(_) => {
                 self.applied = AppliedLayout::Constrained(self.applied.geometry().clone());
@@ -1019,12 +1056,7 @@ fn shell_command() -> Vec<String> {
     vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned())]
 }
 
-fn geometry(
-    layout: &LayoutNode,
-    cols: u16,
-    rows: u16,
-    active: Option<PaneId>,
-) -> Result<WorkspaceGeometry> {
+fn geometry(layout: &LayoutNode, cols: u16, rows: u16) -> Result<WorkspaceGeometry> {
     let mut geometry = WorkspaceGeometry {
         panes: Vec::new(),
         dividers: Vec::new(),
@@ -1037,7 +1069,6 @@ fn geometry(
             cols,
             rows,
         },
-        active,
         &mut geometry,
     )?;
     Ok(geometry)
@@ -1076,7 +1107,6 @@ fn grid_layout(panes: &[PaneId], columns: u16, rows: u16) -> Result<LayoutNode> 
 fn place_layout(
     layout: &LayoutNode,
     rect: PaneRect,
-    active: Option<PaneId>,
     geometry: &mut WorkspaceGeometry,
 ) -> Result<()> {
     match layout {
@@ -1104,8 +1134,6 @@ fn place_layout(
                             x: rect.x + first_cols,
                             y: rect.y,
                             len: rect.rows,
-                            first_active: active.is_some_and(|active| first.contains(active)),
-                            second_active: active.is_some_and(|active| second.contains(active)),
                         },
                     )
                 }
@@ -1126,8 +1154,6 @@ fn place_layout(
                             x: rect.x,
                             y: rect.y + first_rows,
                             len: rect.cols,
-                            first_active: active.is_some_and(|active| first.contains(active)),
-                            second_active: active.is_some_and(|active| second.contains(active)),
                         },
                     )
                 }
@@ -1135,8 +1161,8 @@ fn place_layout(
                 SplitAxis::Rows => bail!("layout needs more rows"),
             };
             geometry.dividers.push(divider);
-            place_layout(first, first_rect, active, geometry)?;
-            place_layout(second, second_rect, active, geometry)?;
+            place_layout(first, first_rect, geometry)?;
+            place_layout(second, second_rect, geometry)?;
         }
     }
     Ok(())
@@ -1199,37 +1225,41 @@ fn compose_workspace(
             cells.push(cell);
         }
     }
+    let mut divider_cells = BTreeMap::new();
     for divider in &geometry.dividers {
         for offset in 0..divider.len {
-            let marker = offset == 0 && (divider.first_active || divider.second_active);
-            let text = match (divider.axis, marker, divider.first_active) {
-                (SplitAxis::Columns, true, true) => "◀",
-                (SplitAxis::Columns, true, false) => "▶",
-                (SplitAxis::Columns, false, _) => VERTICAL_DIVIDER,
-                (SplitAxis::Rows, true, true) => "▲",
-                (SplitAxis::Rows, true, false) => "▼",
-                (SplitAxis::Rows, false, _) => HORIZONTAL_DIVIDER,
-            };
-            cells.push(Cell {
-                x: divider.x
-                    + if divider.axis == SplitAxis::Rows {
-                        offset
-                    } else {
-                        0
-                    },
-                y: divider.y
-                    + if divider.axis == SplitAxis::Columns {
-                        offset
-                    } else {
-                        0
-                    },
-                text: text.to_owned(),
-                width: 1,
-                foreground,
-                background,
-                attributes: divider_attributes(marker),
-            });
+            let x = divider.x
+                + if divider.axis == SplitAxis::Rows {
+                    offset
+                } else {
+                    0
+                };
+            let y = divider.y
+                + if divider.axis == SplitAxis::Columns {
+                    offset
+                } else {
+                    0
+                };
+            divider_cells
+                .entry((x, y))
+                .and_modify(|axes| *axes |= divider_axis(divider.axis))
+                .or_insert_with(|| divider_axis(divider.axis));
         }
+    }
+    for (&(x, y), &axes) in &divider_cells {
+        let left = x > 0 && divider_cells.contains_key(&(x - 1, y));
+        let right = x + 1 < cols && divider_cells.contains_key(&(x + 1, y));
+        let up = y > 0 && divider_cells.contains_key(&(x, y - 1));
+        let down = y + 1 < rows && divider_cells.contains_key(&(x, y + 1));
+        cells.push(Cell {
+            x,
+            y,
+            text: divider_glyph(axes, left, right, up, down).to_owned(),
+            width: 1,
+            foreground,
+            background,
+            attributes: divider_attributes(),
+        });
     }
     let cursor = active
         .and_then(|active| {
@@ -1261,17 +1291,33 @@ fn compose_workspace(
     }
 }
 
-fn divider_attributes(active: bool) -> Attributes {
-    if active {
-        Attributes {
-            bold: true,
-            ..Attributes::default()
-        }
-    } else {
-        Attributes {
-            faint: true,
-            ..Attributes::default()
-        }
+fn divider_axis(axis: SplitAxis) -> u8 {
+    match axis {
+        SplitAxis::Columns => 1,
+        SplitAxis::Rows => 2,
+    }
+}
+
+fn divider_glyph(axes: u8, left: bool, right: bool, up: bool, down: bool) -> &'static str {
+    match (left, right, up, down) {
+        (true, true, true, true) => "┼",
+        (true, true, false, true) => "┬",
+        (true, true, true, false) => "┴",
+        (false, true, true, true) => "├",
+        (true, false, true, true) => "┤",
+        (false, true, false, true) => "┌",
+        (true, false, false, true) => "┐",
+        (false, true, true, false) => "└",
+        (true, false, true, false) => "┘",
+        _ if axes & 1 != 0 => VERTICAL_DIVIDER,
+        _ => HORIZONTAL_DIVIDER,
+    }
+}
+
+fn divider_attributes() -> Attributes {
+    Attributes {
+        faint: true,
+        ..Attributes::default()
     }
 }
 
@@ -1283,7 +1329,12 @@ enum InputAction {
     PasteEnd,
     Split(SplitAxis),
     Focus(Direction),
+    Mouse {
+        input: Vec<u8>,
+        focus: Option<(u16, u16)>,
+    },
     CloseActive,
+    Detach,
     Quit,
     Help,
     Cancel,
@@ -1346,6 +1397,25 @@ impl PrefixDecoder {
                 break;
             }
             let remaining = &input[index..];
+            if remaining.starts_with(SGR_MOUSE_PREFIX) {
+                if let Some(end) = remaining
+                    .iter()
+                    .position(|byte| matches!(byte, b'M' | b'm'))
+                {
+                    flush_plain(&mut actions, &mut plain);
+                    actions.push(sgr_mouse_action(&remaining[..=end]));
+                    index += end + 1;
+                    continue;
+                }
+                self.pending.extend_from_slice(remaining);
+                self.pending_since = Some(Instant::now());
+                break;
+            }
+            if SGR_MOUSE_PREFIX.starts_with(remaining) {
+                self.pending.extend_from_slice(remaining);
+                self.pending_since = Some(Instant::now());
+                break;
+            }
             if remaining.starts_with(PASTE_START) {
                 if self.waiting {
                     flush_plain(&mut actions, &mut plain);
@@ -1374,6 +1444,7 @@ impl PrefixDecoder {
                     b'k' => InputAction::Focus(Direction::Up),
                     b'j' => InputAction::Focus(Direction::Down),
                     b'x' => InputAction::CloseActive,
+                    b'd' => InputAction::Detach,
                     b'q' => InputAction::Quit,
                     b'?' => InputAction::Help,
                     0x1b => InputAction::Cancel,
@@ -1410,6 +1481,9 @@ impl PrefixDecoder {
             return Vec::new();
         }
         let pending = std::mem::take(&mut self.pending);
+        if pending.starts_with(SGR_MOUSE_PREFIX) {
+            return Vec::new();
+        }
         if self.waiting && pending.first() == Some(&0x1b) {
             self.waiting = false;
             let mut actions = vec![InputAction::Cancel];
@@ -1419,6 +1493,27 @@ impl PrefixDecoder {
             return actions;
         }
         vec![InputAction::Send(pending)]
+    }
+}
+
+fn sgr_mouse_action(bytes: &[u8]) -> InputAction {
+    let focus = (|| {
+        if bytes.last() != Some(&b'M') {
+            return None;
+        }
+        let body = std::str::from_utf8(&bytes[SGR_MOUSE_PREFIX.len()..bytes.len() - 1]).ok()?;
+        let mut fields = body.split(';');
+        let button = fields.next()?.parse::<u16>().ok()?;
+        let x = fields.next()?.parse::<u16>().ok()?.checked_sub(1)?;
+        let y = fields.next()?.parse::<u16>().ok()?.checked_sub(1)?;
+        if fields.next().is_some() || button & 0b11 != 0 || button & 0b1100_0000 != 0 {
+            return None;
+        }
+        Some((x, y))
+    })();
+    InputAction::Mouse {
+        input: bytes.to_vec(),
+        focus,
     }
 }
 
@@ -1503,40 +1598,85 @@ impl WorkspaceUi {
     }
 }
 
-#[derive(Default)]
-struct WorkspaceFrames {
-    content: Option<Frame>,
-}
-
 pub(crate) struct WorkspaceTerminal {
-    input: Receiver<Vec<u8>>,
+    attachment: Option<WorkspaceAttachment>,
     decoder: PrefixDecoder,
     ui: WorkspaceUi,
-    screen: OuterScreen,
-    frames: WorkspaceFrames,
-    cell_width: u16,
-    cell_height: u16,
     pending_removal: bool,
     finished: bool,
 }
 
+struct WorkspaceAttachment {
+    id: u64,
+    input: Receiver<Vec<u8>>,
+    screen: OuterScreen,
+}
+
+pub(crate) struct WorkspaceAttachmentOptions {
+    pub(crate) id: u64,
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+    pub(crate) cell_width: u16,
+    pub(crate) cell_height: u16,
+    pub(crate) theme: TerminalTheme,
+}
+
 impl WorkspaceTerminal {
-    pub(crate) fn enter(input: Receiver<Vec<u8>>, options: &Options) -> Result<Self> {
-        Ok(Self {
-            input,
+    pub(crate) fn detached() -> Self {
+        Self {
+            attachment: None,
             decoder: PrefixDecoder::default(),
             ui: WorkspaceUi::new(),
-            screen: OuterScreen::enter()?,
-            frames: WorkspaceFrames::default(),
-            cell_width: options.cell_width,
-            cell_height: options.cell_height,
             pending_removal: false,
             finished: false,
-        })
+        }
     }
 
-    pub(crate) fn content(&self) -> Option<&Frame> {
-        self.frames.content.as_ref()
+    pub(crate) fn is_attached(&self) -> bool {
+        self.attachment.is_some()
+    }
+
+    pub(crate) fn attach(
+        &mut self,
+        workspace: &mut Workspace,
+        input: Receiver<Vec<u8>>,
+        writer: Box<dyn Write + Send>,
+        options: WorkspaceAttachmentOptions,
+    ) -> Result<()> {
+        if self.is_attached() {
+            bail!("workspace already has an attached terminal");
+        }
+        workspace.set_theme(options.theme)?;
+        workspace.resize(
+            options.cols,
+            options.rows,
+            options.cell_width,
+            options.cell_height,
+        )?;
+        self.decoder = PrefixDecoder::default();
+        self.ui = WorkspaceUi::new();
+        self.attachment = Some(WorkspaceAttachment {
+            id: options.id,
+            input,
+            screen: OuterScreen::enter(writer)?,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn resize_attachment(
+        &mut self,
+        workspace: &mut Workspace,
+        id: u64,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+    ) -> Result<()> {
+        if self.attachment.as_ref().map(|attachment| attachment.id) != Some(id) {
+            bail!("attachment is no longer active");
+        }
+        workspace.resize(cols, rows, cell_width, cell_height)?;
+        Ok(())
     }
 
     pub(crate) fn finished(&self) -> bool {
@@ -1557,14 +1697,60 @@ impl WorkspaceTerminal {
         }
         workspace.pump()?;
         let exited = workspace.observe_exits()?;
-        if workspace.take_bells() > 0 {
-            self.screen.bell()?;
+        let bells = workspace.take_bells();
+        let mut attachment = self.attachment.take();
+        if let Some(attached) = attachment.as_mut() {
+            let result = self.tick_attachment(workspace, attached, exited, bells);
+            match result {
+                Ok(true) => {}
+                Ok(false) => {
+                    workspace.cancel_paste();
+                    attachment = None;
+                }
+                Err(error) if attachment_closed(&error) => {
+                    workspace.cancel_paste();
+                    attachment = None;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        self.screen.sync_title(&workspace.active_title()?)?;
+        self.attachment = attachment;
+        if workspace.is_empty() {
+            self.finished = true;
+            return Ok(false);
+        }
+        if exited && self.attachment.is_none() {
+            let _final_frame = workspace.frame()?;
+        }
+        if exited {
+            if workspace.all_exits_observed() {
+                self.finished = true;
+                return Ok(false);
+            }
+            self.pending_removal = true;
+        }
+        Ok(true)
+    }
+
+    fn tick_attachment(
+        &mut self,
+        workspace: &mut Workspace,
+        attachment: &mut WorkspaceAttachment,
+        exited: bool,
+        bells: u64,
+    ) -> Result<bool> {
+        if bells > 0 {
+            attachment.screen.bell()?;
+        }
+        attachment.screen.sync_title(&workspace.active_title()?)?;
         if !exited {
             let mut actions = Vec::new();
-            while let Ok(input) = self.input.try_recv() {
-                actions.extend(self.decoder.push(&input));
+            loop {
+                match attachment.input.try_recv() {
+                    Ok(input) => actions.extend(self.decoder.push(&input)),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return Ok(false),
+                }
             }
             actions.extend(self.decoder.flush_ambiguous(Duration::from_millis(25)));
             for action in actions {
@@ -1603,7 +1789,7 @@ impl WorkspaceTerminal {
                                 Duration::from_millis(1_200),
                             ),
                             Err(error) => {
-                                self.screen.bell()?;
+                                attachment.screen.bell()?;
                                 self.ui
                                     .notice(error.to_string(), Duration::from_millis(1_500));
                             }
@@ -1621,6 +1807,17 @@ impl WorkspaceTerminal {
                                 .notice(direction.unavailable(), Duration::from_millis(1_000));
                         }
                     }
+                    InputAction::Mouse { input, focus } => {
+                        if workspace.is_multi_pane() {
+                            if let Some((x, y)) = focus {
+                                self.ui.clear_armed();
+                                workspace.focus_at(x, y)?;
+                            }
+                        } else if !workspace.send_active_if_open(&input)? {
+                            workspace.observe_exits()?;
+                            break;
+                        }
+                    }
                     InputAction::CloseActive => {
                         let pane = workspace.active_id().unwrap_or(0);
                         if self.ui.confirm(
@@ -1634,6 +1831,7 @@ impl WorkspaceTerminal {
                             );
                         }
                     }
+                    InputAction::Detach => return Ok(false),
                     InputAction::Quit => {
                         if self
                             .ui
@@ -1645,7 +1843,7 @@ impl WorkspaceTerminal {
                     InputAction::Help => {
                         self.ui.clear_armed();
                         self.ui.notice(
-                            "^B % side  \" stack  h/j/k/l focus  x pane  q all  ^B literal",
+                            "^B % side  \" stack  h/j/k/l focus  x pane  d detach  q all",
                             Duration::from_secs(4),
                         );
                     }
@@ -1656,7 +1854,7 @@ impl WorkspaceTerminal {
                     }
                     InputAction::Unknown(byte) => {
                         self.ui.clear_armed();
-                        self.screen.bell()?;
+                        attachment.screen.bell()?;
                         let key = if byte.is_ascii_graphic() {
                             char::from(byte).to_string()
                         } else {
@@ -1669,43 +1867,41 @@ impl WorkspaceTerminal {
                     }
                 }
                 if workspace.is_empty() {
-                    break;
+                    return Ok(true);
                 }
             }
         }
-        if workspace.is_empty() {
-            self.finished = true;
-            return Ok(false);
-        }
-        if let Ok((cols, rows)) = crossterm::terminal::size()
-            && cols > 0
-            && rows > 0
-        {
-            workspace.resize(cols, rows, self.cell_width, self.cell_height)?;
-        }
-        self.screen
+        attachment
+            .screen
             .sync_input_modes(workspace.active_input_modes()?)?;
         let mut frame = workspace.frame()?;
-        if self.frames.content.as_ref() != Some(&frame) {
-            self.frames.content = Some(frame.clone());
-        }
-        self.screen.sync_cursor_style(
+        attachment.screen.sync_cursor_style(
             workspace.active_cursor_style(),
             frame.cursor.as_ref().is_some_and(|cursor| cursor.blinking),
         )?;
         if let Some(overlay) = self.ui.overlay(self.decoder.waiting()) {
             add_overlay(&mut frame, &overlay);
         }
-        self.screen.paint(&frame)?;
-        if exited {
-            if workspace.all_exits_observed() {
-                self.finished = true;
-                return Ok(false);
-            }
-            self.pending_removal = true;
-        }
+        attachment.screen.paint(&frame)?;
         Ok(true)
     }
+}
+
+fn attachment_closed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let Some(error) = cause.downcast_ref::<std::io::Error>() else {
+            return false;
+        };
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::UnexpectedEof
+        ) || error.raw_os_error() == Some(libc::EIO)
+    })
 }
 
 fn add_overlay(frame: &mut Frame, text: &str) {
@@ -1758,7 +1954,7 @@ fn add_overlay(frame: &mut Frame, text: &str) {
 }
 
 struct OuterScreen {
-    stdout: Stdout,
+    writer: Box<dyn Write + Send>,
     modes: InputModes,
     previous: Option<Frame>,
     title: String,
@@ -1767,14 +1963,13 @@ struct OuterScreen {
 }
 
 impl OuterScreen {
-    pub(crate) fn enter() -> Result<Self> {
-        let mut stdout = std::io::stdout();
-        stdout
+    pub(crate) fn enter(mut writer: Box<dyn Write + Send>) -> Result<Self> {
+        writer
             .write_all(b"\x1b[22;0t\x1b[?1049h\x1b[?2004h\x1b[?25l\x1b[2J\x1b[H")
             .context("enter workspace screen")?;
-        stdout.flush().context("flush workspace screen")?;
+        writer.flush().context("flush workspace screen")?;
         Ok(Self {
-            stdout,
+            writer,
             modes: InputModes::default(),
             previous: None,
             title: String::new(),
@@ -1801,10 +1996,10 @@ impl OuterScreen {
         if self.output.is_empty() {
             return Ok(());
         }
-        self.stdout
+        self.writer
             .write_all(&self.output)
             .context("write workspace update")?;
-        self.stdout.flush().context("flush workspace frame")?;
+        self.writer.flush().context("flush workspace frame")?;
         self.output.clear();
         Ok(())
     }
@@ -2009,16 +2204,16 @@ fn frame_ansi(frame: &Frame) -> Result<Vec<u8>> {
 
 impl Drop for OuterScreen {
     fn drop(&mut self) {
-        let _ = self.stdout.write_all(&self.output);
+        let _ = self.writer.write_all(&self.output);
         let _ = self
-            .stdout
+            .writer
             .write_all(
                 b"\x1b[?2026l\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l",
             );
         let _ = self
-            .stdout
+            .writer
             .write_all(b"\x1b[0 q\x1b[0m\x1b[?25h\x1b[?1049l\x1b[23;0t");
-        let _ = self.stdout.flush();
+        let _ = self.writer.flush();
     }
 }
 
@@ -2048,7 +2243,10 @@ fn outer_input_modes(modes: InputModes, pane_count: usize) -> InputModes {
     if pane_count == 1 {
         modes
     } else {
-        modes.without_mouse()
+        let mut modes = modes.without_mouse();
+        modes.normal_mouse = true;
+        modes.sgr_mouse = true;
+        modes
     }
 }
 
@@ -2129,7 +2327,7 @@ mod tests {
     }
 
     #[test]
-    fn split_workspace_does_not_forward_untranslated_mouse_coordinates() {
+    fn split_workspace_requests_only_workspace_click_mouse_modes() {
         let modes = InputModes {
             normal_mouse: true,
             button_mouse: true,
@@ -2140,17 +2338,17 @@ mod tests {
 
         let outer = outer_input_modes(modes, 2);
 
-        assert!(!outer.normal_mouse);
+        assert!(outer.normal_mouse);
         assert!(!outer.button_mouse);
         assert!(!outer.any_mouse);
-        assert!(!outer.sgr_mouse);
+        assert!(outer.sgr_mouse);
     }
 
     #[test]
     fn two_pane_layout_reserves_one_divider_column() {
         let layout = grid_layout(&[0, 1], 2, 1).unwrap();
         assert_eq!(
-            geometry(&layout, 80, 24, Some(0)).unwrap().panes,
+            geometry(&layout, 80, 24).unwrap().panes,
             [
                 PlacedPane {
                     id: 0,
@@ -2177,7 +2375,7 @@ mod tests {
     #[test]
     fn composition_offsets_right_cells_and_active_cursor() {
         let layout = grid_layout(&[0, 1], 2, 1).unwrap();
-        let geometry = geometry(&layout, 11, 3, Some(1)).unwrap();
+        let geometry = geometry(&layout, 11, 3).unwrap();
         let composed = compose_workspace(
             11,
             3,
@@ -2196,13 +2394,13 @@ mod tests {
                 .any(|cell| cell.text == "R" && cell.x == 6)
         );
         assert_eq!(composed.cursor.as_ref().unwrap().x, 8);
-        assert_eq!(composed.text(), "L    ▶R\n     │\n     │");
+        assert_eq!(composed.text(), "L    │R\n     │\n     │");
     }
 
     #[test]
     fn stacked_layout_reserves_one_divider_row_and_offsets_the_bottom_pane() {
         let layout = grid_layout(&[0, 1], 1, 2).unwrap();
-        let geometry = geometry(&layout, 8, 5, Some(1)).unwrap();
+        let geometry = geometry(&layout, 8, 5).unwrap();
         assert_eq!(
             geometry.panes,
             [
@@ -2238,26 +2436,26 @@ mod tests {
         );
 
         assert_eq!(composed.cursor.as_ref().unwrap().y, 4);
-        assert_eq!(composed.text(), "T\n\n▼───────\nB");
+        assert_eq!(composed.text(), "T\n\n────────\nB");
     }
 
     #[test]
     fn stacked_layout_offsets_bottom_background_spans_and_rejects_short_screens() {
         assert_eq!(
-            geometry(&grid_layout(&[0, 1], 1, 2).unwrap(), 8, 2, Some(0))
+            geometry(&grid_layout(&[0, 1], 1, 2).unwrap(), 8, 2)
                 .unwrap_err()
                 .to_string(),
             "layout needs more rows"
         );
         assert_eq!(
-            geometry(&grid_layout(&[0, 1], 2, 1).unwrap(), 2, 8, Some(0))
+            geometry(&grid_layout(&[0, 1], 2, 1).unwrap(), 2, 8)
                 .unwrap_err()
                 .to_string(),
             "layout needs more columns"
         );
 
         let layout = grid_layout(&[0, 1], 1, 2).unwrap();
-        let geometry = geometry(&layout, 8, 5, Some(0)).unwrap();
+        let geometry = geometry(&layout, 8, 5).unwrap();
         let top = frame(8, 2, "T", None);
         let mut bottom = frame(8, 2, "B", None);
         bottom.background = crate::frame::Color { r: 1, g: 2, b: 3 };
@@ -2355,10 +2553,39 @@ mod tests {
             decoder.push(&[PREFIX, b'k']),
             [InputAction::Focus(Direction::Up)]
         );
+        assert_eq!(decoder.push(&[PREFIX, b'd']), [InputAction::Detach]);
         assert_eq!(decoder.push(&[PREFIX, b'z']), [InputAction::Unknown(b'z')]);
         assert_eq!(
             decoder.push(&[PREFIX, PREFIX]),
             [InputAction::Send(vec![PREFIX])]
+        );
+    }
+
+    #[test]
+    fn prefix_decoder_turns_chunked_left_clicks_into_workspace_focus() {
+        let mut decoder = PrefixDecoder::default();
+
+        assert!(decoder.push(b"\x1b[<0;42").is_empty());
+        assert_eq!(
+            decoder.push(b";13M"),
+            [InputAction::Mouse {
+                input: b"\x1b[<0;42;13M".to_vec(),
+                focus: Some((41, 12)),
+            }]
+        );
+        assert_eq!(
+            decoder.push(b"\x1b[<0;42;13m"),
+            [InputAction::Mouse {
+                input: b"\x1b[<0;42;13m".to_vec(),
+                focus: None,
+            }]
+        );
+        assert_eq!(
+            decoder.push(b"\x1b[<64;42;13M"),
+            [InputAction::Mouse {
+                input: b"\x1b[<64;42;13M".to_vec(),
+                focus: None,
+            }]
         );
     }
 
@@ -2567,7 +2794,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
 
-        assert!(frame.text().contains("▼────────────────────"));
+        assert!(frame.text().contains("─────────────────────"));
         assert_eq!(workspace.active_id(), Some(1));
         assert!(workspace.focus_direction(Direction::Up).unwrap());
         assert_eq!(workspace.active_id(), Some(0));
@@ -2726,7 +2953,7 @@ mod tests {
     #[test]
     fn grid_geometry_places_four_stable_pane_ids_and_recursive_dividers() {
         let layout = grid_layout(&[0, 1, 2, 3], 2, 2).unwrap();
-        let geometry = geometry(&layout, 11, 7, Some(3)).unwrap();
+        let geometry = geometry(&layout, 11, 7).unwrap();
 
         assert_eq!(
             geometry.panes,
@@ -2788,6 +3015,13 @@ mod tests {
         );
         assert!(composed.text().contains('0'));
         assert!(composed.text().contains('3'));
+        let junction = composed
+            .cells
+            .iter()
+            .find(|cell| (cell.x, cell.y) == (5, 3))
+            .unwrap();
+        assert_eq!(junction.text, "┼");
+        assert!(junction.attributes.faint);
     }
 
     #[cfg(unix)]
@@ -2823,6 +3057,10 @@ mod tests {
         );
         assert!(workspace.set_grid(2, 1).is_err());
         workspace.focus_pane(3).unwrap();
+        assert_eq!(workspace.active_id(), Some(3));
+        assert!(workspace.focus_at(1, 1).unwrap());
+        assert_eq!(workspace.active_id(), Some(0));
+        assert!(workspace.focus_at(22, 8).unwrap());
         assert_eq!(workspace.active_id(), Some(3));
         workspace.close_pane(1).unwrap();
         assert_eq!(workspace.active_id(), Some(3));

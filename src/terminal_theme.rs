@@ -2,13 +2,14 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use libghostty_vt::style::RgbColor;
+use serde::{Deserialize, Serialize};
 
 use crate::frame::{Color, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, indexed_color};
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const REPLY_DRAIN: Duration = Duration::from_millis(25);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct TerminalTheme {
     pub(crate) foreground: Color,
     pub(crate) background: Color,

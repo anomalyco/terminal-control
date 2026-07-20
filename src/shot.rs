@@ -571,6 +571,10 @@ impl Host {
         self.pixel_height = u32::from(rows) * u32::from(cell_height);
     }
 
+    pub(crate) fn set_theme(&mut self, theme: TerminalTheme) {
+        self.theme = theme;
+    }
+
     pub(crate) fn respond(&mut self, output: &[u8]) -> Result<Vec<u8>> {
         if !self.enabled {
             return Ok(Vec::new());

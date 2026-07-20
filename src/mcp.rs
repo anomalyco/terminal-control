@@ -129,7 +129,7 @@ struct ResizeRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct LayoutRequest {
-    #[schemars(description = "Named attached Terminal Control workspace")]
+    #[schemars(description = "Named Terminal Control workspace")]
     name: String,
     #[schemars(description = "Grid columns, either 1 or 2")]
     columns: u16,
@@ -140,7 +140,7 @@ struct LayoutRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct PaneRequest {
-    #[schemars(description = "Named attached Terminal Control workspace")]
+    #[schemars(description = "Named Terminal Control workspace")]
     name: String,
     #[schemars(description = "Stable workspace pane id")]
     pane: u32,
@@ -276,7 +276,7 @@ impl TerminalControl {
     }
 
     #[tool(
-        description = "Set an attached workspace to a 1x1, 2x1, 1x2, or 2x2 grid. Missing cells open shells; surplus panes must be closed explicitly"
+        description = "Set a named workspace to a 1x1, 2x1, 1x2, or 2x2 grid. Missing cells open shells; surplus panes must be closed explicitly"
     )]
     async fn set_workspace_layout(
         &self,
@@ -385,7 +385,7 @@ impl TerminalControl {
     }
 
     #[tool(
-        description = "Resize a named detached session; attached workspaces follow their terminal"
+        description = "Resize a named detached session; workspaces follow their current human attachment"
     )]
     async fn resize_session(
         &self,

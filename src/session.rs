@@ -20,6 +20,7 @@ const OUTPUT_QUEUE: usize = 64;
 const OUTPUT_BATCH: usize = OUTPUT_QUEUE;
 const OUTPUT_CHUNK: usize = 1024;
 const CONTROL_PROTOCOL_VERSION: u8 = 1;
+const ATTACH_PROTOCOL_VERSION: u8 = 2;
 
 struct Output {
     at_ms: u64,
@@ -298,6 +299,12 @@ impl Session {
             bail!("session command has exited");
         }
         self.write_input(input)
+    }
+
+    pub(crate) fn set_theme(&mut self, theme: TerminalTheme) -> Result<()> {
+        self.terminal.set_theme(theme)?;
+        self.host.set_theme(theme);
+        Ok(())
     }
 
     pub(crate) fn send_current_if_open(&mut self, input: &[u8]) -> Result<bool> {
@@ -809,6 +816,22 @@ enum Request {
     ClosePane {
         pane: crate::workspace::PaneId,
     },
+    Attach {
+        id: u64,
+        socket: PathBuf,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+        theme: TerminalTheme,
+    },
+    ResizeAttachment {
+        id: u64,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+    },
     Stop,
 }
 
@@ -827,7 +850,7 @@ struct Response {
 impl Default for Response {
     fn default() -> Self {
         Self {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
+            protocol_version: ATTACH_PROTOCOL_VERSION,
             error: None,
             captured: None,
             status: None,
@@ -1045,6 +1068,17 @@ pub fn serve(
     implementation::serve(socket, command, cwd, record, options)
 }
 
+#[doc(hidden)]
+pub fn serve_workspace(
+    socket: PathBuf,
+    command: Vec<String>,
+    cwd: Option<PathBuf>,
+    record: Option<PathBuf>,
+    options: Options,
+) -> Result<()> {
+    implementation::serve_workspace(socket, command, cwd, record, options)
+}
+
 /// Run a named session in the foreground, mirrored through the current terminal.
 pub fn run_foreground(
     name: &str,
@@ -1055,6 +1089,12 @@ pub fn run_foreground(
 ) -> Result<()> {
     validate_name(name)?;
     implementation::run_foreground(name, command, cwd, record, options)
+}
+
+/// Attach the current terminal to an existing named workspace.
+pub fn attach(name: &str, options: &Options) -> Result<()> {
+    validate_name(name)?;
+    implementation::attach(socket_path(name)?, name, options)
 }
 
 #[doc(hidden)]
@@ -1119,25 +1159,105 @@ mod implementation {
     use std::fs::OpenOptions;
     use std::io::{ErrorKind, Read, Write};
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use anyhow::{Context, Result, bail};
 
-    use super::{NamedSessionStatus, Request, Response, Session, UnavailableReason};
+    use super::{
+        ATTACH_PROTOCOL_VERSION, NamedSessionStatus, Request, Response, Session, UnavailableReason,
+    };
     use crate::shot::{self, Options};
-    use crate::workspace::{Workspace, WorkspaceTerminal};
+    use crate::workspace::{Workspace, WorkspaceAttachmentOptions, WorkspaceTerminal};
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
     const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
     const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_CONTROL_DURATION_MS: u64 = 10 * 60 * 1000;
+    static NEXT_ATTACHMENT_ID: AtomicU64 = AtomicU64::new(1);
 
     struct StartLock(fs::File);
+
+    struct AttachmentWriter(UnixStream);
+
+    struct AttachmentEndpoint {
+        id: u64,
+        path: PathBuf,
+        listener: UnixListener,
+    }
+
+    impl AttachmentEndpoint {
+        fn bind(name: &str) -> Result<Self> {
+            let runtime = runtime_dir()?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let id = now
+                ^ (u64::from(std::process::id()) << 32)
+                ^ NEXT_ATTACHMENT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = runtime.join(format!("{name}.attach-{id:016x}"));
+            ensure_socket_path(&path)?;
+            let listener = UnixListener::bind(&path)
+                .with_context(|| format!("bind attachment socket {}", path.display()))?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("secure attachment socket {}", path.display()))?;
+            listener
+                .set_nonblocking(true)
+                .context("set attachment socket nonblocking")?;
+            Ok(Self { id, path, listener })
+        }
+
+        fn accept(&self, deadline: Instant) -> Result<UnixStream> {
+            loop {
+                match self.listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = fs::remove_file(&self.path);
+                        stream
+                            .set_nonblocking(false)
+                            .context("set workspace attachment blocking")?;
+                        return Ok(stream);
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            bail!("timed out waiting for workspace attachment");
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error).context("accept workspace attachment"),
+                }
+            }
+        }
+    }
+
+    impl Drop for AttachmentEndpoint {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    impl Write for AttachmentWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl Drop for AttachmentWriter {
+        fn drop(&mut self) {
+            let _ = self.0.shutdown(std::net::Shutdown::Write);
+        }
+    }
 
     impl StartLock {
         fn acquire(path: &Path) -> Result<Self> {
@@ -1342,6 +1462,184 @@ mod implementation {
         serde_json::from_reader(stream).context("read session response")
     }
 
+    pub fn attach(socket: PathBuf, name: &str, options: &Options) -> Result<()> {
+        ensure_socket_path(&socket)?;
+        require_attachment_terminal()?;
+        let response = request(socket.clone(), &Request::Ping)?;
+        if response.protocol_version < ATTACH_PROTOCOL_VERSION {
+            bail!(
+                "running workspace predates terminal reattachment; restart it with the current termctrl"
+            );
+        }
+        if let Some(error) = response.error {
+            bail!(error);
+        }
+        let raw = RawMode::enter()?;
+        let (theme, retained_input) = crate::terminal_theme::discover();
+        let endpoint = AttachmentEndpoint::bind(name)?;
+        let result = (|| {
+            let response = request(
+                socket.clone(),
+                &Request::Attach {
+                    id: endpoint.id,
+                    socket: endpoint.path.clone(),
+                    cols: options.cols,
+                    rows: options.rows,
+                    cell_width: options.cell_width,
+                    cell_height: options.cell_height,
+                    theme,
+                },
+            )?;
+            if response.protocol_version < ATTACH_PROTOCOL_VERSION {
+                bail!(
+                    "running workspace predates terminal reattachment; restart it with the current termctrl"
+                );
+            }
+            if let Some(error) = response.error {
+                bail!(error);
+            }
+            let mut stream = endpoint.accept(Instant::now() + Duration::from_secs(5))?;
+            stream
+                .set_write_timeout(Some(Duration::from_millis(250)))
+                .context("bound workspace attachment input")?;
+            if !retained_input.is_empty() {
+                stream
+                    .write_all(&retained_input)
+                    .context("forward input retained during theme discovery")?;
+            }
+            let resize_running = Arc::new(AtomicBool::new(true));
+            let resize_flag = Arc::clone(&resize_running);
+            let resize_socket = socket.clone();
+            let mut last_size = (options.cols, options.rows);
+            let cell_width = options.cell_width;
+            let cell_height = options.cell_height;
+            let resize = thread::spawn(move || {
+                while resize_flag.load(Ordering::Relaxed) {
+                    if let Ok((cols, rows)) = crossterm::terminal::size()
+                        && cols > 0
+                        && rows > 0
+                        && (cols, rows) != last_size
+                    {
+                        let resized = request(
+                            resize_socket.clone(),
+                            &Request::ResizeAttachment {
+                                id: endpoint.id,
+                                cols,
+                                rows,
+                                cell_width,
+                                cell_height,
+                            },
+                        )
+                        .is_ok_and(|response| response.error.is_none());
+                        if resized {
+                            last_size = (cols, rows);
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            });
+            let _resize_loop = ResizeLoop {
+                running: resize_running,
+                thread: Some(resize),
+            };
+            let _screen = AttachedTerminal;
+            relay_attachment(&mut stream)?;
+            Ok(())
+        })();
+        drop(raw);
+        result
+    }
+
+    fn relay_attachment(stream: &mut UnixStream) -> Result<()> {
+        let stream_fd = stream.as_raw_fd();
+        let max_fd = stream_fd.max(libc::STDIN_FILENO) + 1;
+        let mut stdout = std::io::stdout().lock();
+        let mut bytes = [0_u8; 16 * 1024];
+        loop {
+            let mut read_fds = unsafe { std::mem::zeroed::<libc::fd_set>() };
+            unsafe {
+                libc::FD_ZERO(&mut read_fds);
+                libc::FD_SET(libc::STDIN_FILENO, &mut read_fds);
+                libc::FD_SET(stream_fd, &mut read_fds);
+            }
+            let ready = unsafe {
+                libc::pselect(
+                    max_fd,
+                    &mut read_fds,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(std::io::Error::last_os_error()).context("wait for attachment I/O");
+            }
+            if unsafe { libc::FD_ISSET(stream_fd, &read_fds) } {
+                match stream.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(length) => {
+                        stdout
+                            .write_all(&bytes[..length])
+                            .context("write attached workspace output")?;
+                        stdout.flush().context("flush attached workspace output")?;
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error).context("read attached workspace output"),
+                }
+            }
+            if unsafe { libc::FD_ISSET(libc::STDIN_FILENO, &read_fds) } {
+                let length = unsafe {
+                    libc::read(libc::STDIN_FILENO, bytes.as_mut_ptr().cast(), bytes.len())
+                };
+                if length == 0 {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
+                if length < 0 {
+                    if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(std::io::Error::last_os_error()).context("read attachment input");
+                }
+                stream
+                    .write_all(&bytes[..usize::try_from(length).unwrap_or(0)])
+                    .context("send attachment input")?;
+                stream.flush().context("flush attachment input")?;
+            }
+        }
+        Ok(())
+    }
+
+    struct AttachedTerminal;
+
+    struct ResizeLoop {
+        running: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for ResizeLoop {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    impl Drop for AttachedTerminal {
+        fn drop(&mut self) {
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout.write_all(
+                b"\x1b[?2026l\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[0 q\x1b[0m\x1b[?25h\x1b[?1049l\x1b[23;0t",
+            );
+            let _ = stdout.flush();
+        }
+    }
+
     pub fn list() -> Result<Vec<NamedSessionStatus>> {
         let mut sessions = Vec::new();
         for entry in fs::read_dir(runtime_dir()?).context("read session runtime directory")? {
@@ -1408,6 +1706,54 @@ mod implementation {
         result
     }
 
+    pub fn serve_workspace(
+        socket: PathBuf,
+        command: Vec<String>,
+        cwd: Option<PathBuf>,
+        record: Option<PathBuf>,
+        options: Options,
+    ) -> Result<()> {
+        ensure_socket_path(&socket)?;
+        let result = (|| {
+            let listener = UnixListener::bind(&socket)
+                .with_context(|| format!("bind {}", socket.display()))?;
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("secure {}", socket.display()))?;
+            listener
+                .set_nonblocking(true)
+                .context("set workspace socket nonblocking")?;
+            let mut workspace = Workspace::start_with_theme(
+                &command,
+                cwd.as_deref(),
+                record.as_deref(),
+                &options,
+                crate::terminal_theme::TerminalTheme::default(),
+            )?;
+            let mut terminal = WorkspaceTerminal::detached();
+            'workspace: loop {
+                let running = terminal.tick(&mut workspace)?;
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            if handle_workspace(stream, &mut workspace, &mut terminal)? {
+                                break 'workspace;
+                            }
+                        }
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                        Err(error) => return Err(error).context("accept workspace request"),
+                    }
+                }
+                if !running || terminal.finished() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        })();
+        let _ = fs::remove_file(&socket);
+        result
+    }
+
     struct RawMode;
 
     impl RawMode {
@@ -1430,87 +1776,115 @@ mod implementation {
         record: Option<&Path>,
         options: &Options,
     ) -> Result<()> {
+        require_attachment_terminal()?;
         let runtime = runtime_dir()?;
         let socket = runtime.join(format!("{name}.sock"));
         ensure_socket_path(&socket)?;
         let _lock = StartLock::acquire(&runtime.join(format!("{name}.lock")))?;
         if socket.exists() {
             if request(socket.clone(), &Request::Ping).is_ok() {
-                bail!("session {name:?} is already running");
+                if !command.is_empty() {
+                    bail!("workspace {name:?} already exists; omit the command to attach");
+                }
+                drop(_lock);
+                return attach(socket, name, options);
             }
             fs::remove_file(&socket)
                 .with_context(|| format!("remove stale {}", socket.display()))?;
         }
-        let result = (|| {
-            let listener = UnixListener::bind(&socket)
-                .with_context(|| format!("bind {}", socket.display()))?;
-            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("secure {}", socket.display()))?;
-            listener.set_nonblocking(true)?;
-            let raw = RawMode::enter()?;
-            let (theme, retained_input) = crate::terminal_theme::discover();
-            let mut workspace = Workspace::start_with_theme(command, cwd, record, options, theme)?;
-            let (input_send, input_receive) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
-            if !retained_input.is_empty() {
-                input_send
-                    .send(retained_input)
-                    .context("retain input received during terminal theme discovery")?;
+        spawn_workspace(name, command, cwd, record, options, &socket)?;
+        drop(_lock);
+        attach(socket, name, options)
+    }
+
+    fn require_attachment_terminal() -> Result<()> {
+        if unsafe { libc::isatty(libc::STDIN_FILENO) != 1 }
+            || unsafe { libc::isatty(libc::STDOUT_FILENO) != 1 }
+        {
+            bail!("workspace attachment requires terminal stdin and stdout");
+        }
+        Ok(())
+    }
+
+    fn spawn_workspace(
+        name: &str,
+        command: &[String],
+        cwd: Option<&Path>,
+        record: Option<&Path>,
+        options: &Options,
+        socket: &Path,
+    ) -> Result<()> {
+        let mut daemon =
+            Command::new(std::env::current_exe().context("locate termctrl executable")?);
+        daemon
+            .arg("__serve-workspace")
+            .arg("--socket")
+            .arg(socket)
+            .arg("--cols")
+            .arg(options.cols.to_string())
+            .arg("--rows")
+            .arg(options.rows.to_string())
+            .arg("--cell-width")
+            .arg(options.cell_width.to_string())
+            .arg("--cell-height")
+            .arg(options.cell_height.to_string())
+            .arg("--max-bytes")
+            .arg(options.max_bytes.to_string());
+        if options.opentui_host {
+            daemon.arg("--opentui-host");
+        }
+        match options.color {
+            shot::ColorMode::Auto => {}
+            shot::ColorMode::Always => {
+                daemon.arg("--color").arg("always");
             }
-            thread::spawn(move || {
-                let mut stdin = std::io::stdin().lock();
-                let mut bytes = [0_u8; 1024];
-                while let Ok(length) = stdin.read(&mut bytes) {
-                    if length == 0 || input_send.send(bytes[..length].to_vec()).is_err() {
-                        break;
-                    }
+            shot::ColorMode::Never => {
+                daemon.arg("--color").arg("never");
+            }
+        }
+        if let Some(cwd) = cwd {
+            daemon.arg("--cwd").arg(cwd);
+        }
+        if let Some(record) = record {
+            let record = if record.is_absolute() {
+                record.to_owned()
+            } else {
+                std::env::current_dir()
+                    .context("resolve recording output directory")?
+                    .join(record)
+            };
+            daemon.arg("--record").arg(record);
+        }
+        if !command.is_empty() {
+            daemon.arg("--").args(command);
+        }
+        unsafe {
+            daemon.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
+                Ok(())
             });
-            let mut terminal = WorkspaceTerminal::enter(input_receive, options)?;
-            'workspace: loop {
-                let running = terminal.tick(&mut workspace)?;
-                loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            let stopped =
-                                handle_workspace(stream, &mut workspace, &mut |workspace| {
-                                    terminal.tick(workspace)
-                                })?;
-                            if stopped {
-                                break 'workspace;
-                            }
-                            if running && !terminal.finished() {
-                                break;
-                            }
-                        }
-                        Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                        Err(error) => return Err(error).context("accept session request"),
-                    }
-                }
-                if !running || terminal.finished() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(5));
+        }
+        daemon
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut daemon = daemon.spawn().context("start workspace daemon")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if request(socket.to_owned(), &Request::Ping).is_ok() {
+                return Ok(());
             }
-            let final_text = (!command.is_empty() && !workspace.was_stopped())
-                .then(|| terminal.content().map(crate::frame::Frame::text))
-                .flatten()
-                .filter(|text| !text.is_empty());
-            drop(terminal);
-            drop(raw);
-            if let Some(text) = final_text {
-                let mut stdout = std::io::stdout().lock();
-                stdout
-                    .write_all(text.as_bytes())
-                    .context("write final workspace screen")?;
-                stdout
-                    .write_all(b"\n")
-                    .context("write final workspace newline")?;
-                stdout.flush().context("flush final workspace screen")?;
+            if let Some(status) = daemon.try_wait().context("poll workspace daemon")? {
+                bail!("workspace daemon for {name:?} exited before becoming ready: {status}");
             }
-            Ok(())
-        })();
-        let _ = fs::remove_file(&socket);
-        result
+            if Instant::now() >= deadline {
+                let _ = daemon.kill();
+                bail!("timed out starting workspace {name:?}");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn ensure_socket_path(path: &Path) -> Result<()> {
@@ -1553,11 +1927,11 @@ mod implementation {
     fn handle_workspace(
         mut stream: UnixStream,
         workspace: &mut Workspace,
-        tick: &mut impl FnMut(&mut Workspace) -> Result<bool>,
+        terminal: &mut WorkspaceTerminal,
     ) -> Result<bool> {
         handle_control(&mut stream, "workspace", |request| {
             let stop = matches!(request, Request::Stop);
-            let response = respond_workspace(workspace, request, tick)
+            let response = respond_workspace(workspace, request, terminal)
                 .unwrap_or_else(|error| Response::error(format!("{error:#}")));
             let finished = stop || (response.error.is_none() && workspace.is_empty());
             (response, finished)
@@ -1678,7 +2052,11 @@ mod implementation {
                     cwd: status.launch.cwd,
                 }]);
             }
-            Request::Layout { .. } | Request::FocusPane { .. } | Request::ClosePane { .. } => {
+            Request::Layout { .. }
+            | Request::FocusPane { .. }
+            | Request::ClosePane { .. }
+            | Request::Attach { .. }
+            | Request::ResizeAttachment { .. } => {
                 bail!("only attached workspaces support pane layout control")
             }
             Request::Stop => session.stop()?,
@@ -1689,7 +2067,7 @@ mod implementation {
     fn respond_workspace(
         workspace: &mut Workspace,
         request: Request,
-        tick: &mut impl FnMut(&mut Workspace) -> Result<bool>,
+        terminal: &mut WorkspaceTerminal,
     ) -> Result<Response> {
         let mut response = Response::default();
         match request {
@@ -1702,7 +2080,9 @@ mod implementation {
             } => {
                 let duration = pace_ms.saturating_mul(input.len().saturating_sub(1) as u64);
                 require_control_duration("paced input", duration)?;
-                workspace.send_all(pane, &input, Duration::from_millis(pace_ms), &mut *tick)?;
+                workspace.send_all(pane, &input, Duration::from_millis(pace_ms), |workspace| {
+                    terminal.tick(workspace)
+                })?;
             }
             Request::Wait {
                 text,
@@ -1714,7 +2094,7 @@ mod implementation {
                     pane,
                     &text,
                     Duration::from_millis(timeout_ms),
-                    &mut *tick,
+                    |workspace| terminal.tick(workspace),
                 )?;
             }
             Request::Show {
@@ -1727,7 +2107,7 @@ mod implementation {
                     pane,
                     Duration::from_millis(settle_ms),
                     Duration::from_millis(deadline_ms),
-                    &mut *tick,
+                    |workspace| terminal.tick(workspace),
                 )?);
             }
             Request::Logs { ansi } => response.logs = Some(workspace.active_logs(ansi)?),
@@ -1737,7 +2117,7 @@ mod implementation {
             Request::Mark { name } => workspace.mark_recording(&name)?,
             Request::Panes => response.panes = Some(workspace.panes()?),
             Request::Layout { columns, rows } => {
-                tick(workspace)?;
+                terminal.tick(workspace)?;
                 if workspace.is_empty() {
                     bail!("workspace has ended");
                 }
@@ -1745,7 +2125,7 @@ mod implementation {
                 response.panes = Some(workspace.panes()?);
             }
             Request::FocusPane { pane } => {
-                tick(workspace)?;
+                terminal.tick(workspace)?;
                 if workspace.is_empty() {
                     bail!("workspace has ended");
                 }
@@ -1753,13 +2133,87 @@ mod implementation {
                 response.panes = Some(workspace.panes()?);
             }
             Request::ClosePane { pane } => {
-                tick(workspace)?;
+                terminal.tick(workspace)?;
                 if workspace.is_empty() {
                     bail!("workspace has ended");
                 }
                 workspace.close_pane(pane)?;
                 response.panes = Some(workspace.panes()?);
             }
+            Request::Attach {
+                id,
+                socket,
+                cols,
+                rows,
+                cell_width,
+                cell_height,
+                theme,
+            } => {
+                terminal.tick(workspace)?;
+                if terminal.finished() || workspace.is_empty() {
+                    bail!("workspace has ended");
+                }
+                if terminal.is_attached() {
+                    bail!("workspace already has an attached terminal");
+                }
+                let runtime = runtime_dir()?;
+                let metadata = fs::metadata(&socket)
+                    .with_context(|| format!("inspect attachment socket {}", socket.display()))?;
+                if socket.parent() != Some(runtime.as_path())
+                    || !metadata.file_type().is_socket()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.permissions().mode() & 0o077 != 0
+                {
+                    bail!(
+                        "attachment socket must be an owner-only socket in the runtime directory"
+                    );
+                }
+                let stream = UnixStream::connect(&socket).with_context(|| {
+                    format!("connect workspace attachment at {}", socket.display())
+                })?;
+                stream
+                    .set_write_timeout(Some(Duration::from_millis(250)))
+                    .context("bound workspace attachment output")?;
+                let mut reader = stream
+                    .try_clone()
+                    .context("clone workspace attachment reader")?;
+                let (send, receive) = std::sync::mpsc::sync_channel(64);
+                thread::spawn(move || {
+                    let mut bytes = [0_u8; 1024];
+                    loop {
+                        match reader.read(&mut bytes) {
+                            Ok(0) => break,
+                            Ok(length) => {
+                                if send.send(bytes[..length].to_vec()).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                            Err(_) => break,
+                        }
+                    }
+                });
+                terminal.attach(
+                    workspace,
+                    receive,
+                    Box::new(AttachmentWriter(stream)),
+                    WorkspaceAttachmentOptions {
+                        id,
+                        cols,
+                        rows,
+                        cell_width,
+                        cell_height,
+                        theme,
+                    },
+                )?;
+            }
+            Request::ResizeAttachment {
+                id,
+                cols,
+                rows,
+                cell_width,
+                cell_height,
+            } => terminal.resize_attachment(workspace, id, cols, rows, cell_width, cell_height)?,
             Request::Stop => workspace.stop(),
         }
         Ok(response)
@@ -1801,6 +2255,15 @@ mod implementation {
     pub fn runtime_dir() -> Result<PathBuf> {
         bail!("persistent sessions require Unix sockets")
     }
+    pub fn serve_workspace(
+        _: PathBuf,
+        _: Vec<String>,
+        _: Option<PathBuf>,
+        _: Option<PathBuf>,
+        _: Options,
+    ) -> Result<()> {
+        bail!("persistent workspaces require Unix sockets")
+    }
     pub fn start(
         _: &str,
         _: &[String],
@@ -1821,6 +2284,10 @@ mod implementation {
     }
     pub fn request(_: PathBuf, _: &Request) -> Result<Response> {
         bail!("persistent sessions require Unix sockets")
+    }
+
+    pub fn attach(_: PathBuf, _: &str, _: &Options) -> Result<()> {
+        bail!("workspace attachment requires Unix sockets")
     }
     pub fn list() -> Result<Vec<NamedSessionStatus>> {
         bail!("persistent sessions require Unix sockets")
@@ -1891,6 +2358,22 @@ mod tests {
             },
             Request::FocusPane { pane: 3 },
             Request::ClosePane { pane: 2 },
+            Request::Attach {
+                id: 7,
+                socket: PathBuf::from("/tmp/attach.sock"),
+                cols: 80,
+                rows: 24,
+                cell_width: 9,
+                cell_height: 18,
+                theme: TerminalTheme::default(),
+            },
+            Request::ResizeAttachment {
+                id: 7,
+                cols: 100,
+                rows: 30,
+                cell_width: 9,
+                cell_height: 18,
+            },
         ] {
             let encoded = serde_json::to_vec(&request).unwrap();
             let decoded: Request = serde_json::from_slice(&encoded).unwrap();

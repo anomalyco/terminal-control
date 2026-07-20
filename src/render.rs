@@ -190,21 +190,21 @@ fn graphic(cell: &Cell, options: &Options) -> Option<String> {
     };
     let codepoint = char as u32;
     if (0x2800..=0x28ff).contains(&codepoint) {
-        return Some(braille_dots(
-            codepoint - 0x2800,
-            &circle,
-            width.min(height) * 0.09,
+        return Some(graphic_opacity(
+            cell,
+            braille_dots(codepoint - 0x2800, &circle, width.min(height) * 0.09),
         ));
     }
     if let Some(rects) = box_drawing::rects(char, width, height) {
-        return Some(
+        return Some(graphic_opacity(
+            cell,
             rects
                 .into_iter()
                 .map(|rect| single(rect.left, rect.top, rect.width, rect.height))
                 .collect(),
-        );
+        ));
     }
-    Some(match char {
+    let graphic = match char {
         '█' => single(0.0, 0.0, 1.0, 1.0),
         '▀' => single(0.0, 0.0, 1.0, 0.5),
         '▄' => single(0.0, 0.5, 1.0, 0.5),
@@ -248,7 +248,16 @@ fn graphic(cell: &Cell, options: &Options) -> Option<String> {
         }
         '◔' => ring(0.5, 0.52, width.min(height) * 0.32) + &single(0.5, 0.2, 0.32, 0.32),
         _ => return None,
-    })
+    };
+    Some(graphic_opacity(cell, graphic))
+}
+
+fn graphic_opacity(cell: &Cell, graphic: String) -> String {
+    if cell.attributes.faint {
+        format!(r#"<g opacity="0.55">{graphic}</g>"#)
+    } else {
+        graphic
+    }
 }
 
 fn braille_dots(pattern: u32, circle: &impl Fn(f32, f32, f32) -> String, radius: f32) -> String {
@@ -420,7 +429,10 @@ mod tests {
                         b: 255,
                     },
                     background: Color { r: 0, g: 0, b: 0 },
-                    attributes: Attributes::default(),
+                    attributes: Attributes {
+                        faint: true,
+                        ..Attributes::default()
+                    },
                 })
                 .collect(),
         };
@@ -429,6 +441,7 @@ mod tests {
 
         assert!(!output.contains(">━</text>"));
         assert_eq!(output.matches("<rect").count(), 3);
+        assert_eq!(output.matches("<g opacity=\"0.55\">").count(), 2);
     }
 
     #[test]

@@ -129,15 +129,19 @@ Full-screen alternate-screen TUIs do not produce useful logs; read their visible
 
 ## Enter A Shared Workspace
 
-`run` opens a visible workspace with one shell in the current directory. Human and agent input share the same live Ghostty-backed panes:
+`run` creates a persistent workspace when its name is absent and attaches the current terminal. Running the same name later reattaches to the existing panes. `attach` is the strict attach-only form:
 
 ```bash
 termctrl run
 termctrl run -- nvim
 termctrl run editor --cwd ~/src/project -- nvim
+termctrl run editor
+termctrl attach editor
 ```
 
-Use `ctrl-b %` for left/right panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l` to focus directionally, and `ctrl-b ?` for in-workspace help. Splitting either half of a two-pane workspace builds up to a four-pane layout. Killing the active pane with `ctrl-b x` or quitting with `ctrl-b q` requires a second press.
+The workspace daemon owns panes independently from any terminal. Closing an attached terminal detaches without killing panes; `ctrl-b q` twice, `termctrl stop NAME`, or closing the final pane ends the workspace. One human terminal may be attached at a time, while agent controls remain available whether attached or detached. A new attachment adopts its terminal size and theme and performs a full repaint.
+
+Use `ctrl-b %` for left/right panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l` or a mouse click to focus, `ctrl-b d` to detach, and `ctrl-b ?` for in-workspace help. Splitting either half of a two-pane workspace builds up to a four-pane layout. Killing the active pane with `ctrl-b x` or quitting with `ctrl-b q` requires a second press.
 
 Agents discover stable pane IDs and geometry, declaratively grow a layout, and inspect or drive a pane without changing human focus:
 
@@ -155,9 +159,9 @@ Layout growth opens missing `$SHELL` panes in row-major order while preserving e
 
 Without a command or name, the workspace is named `workspace`. When a command is supplied without `NAME`, its executable basename remains the inferred name.
 
-An attached workspace follows the size of its terminal, so resize the terminal itself rather than using `termctrl resize`. `--record` currently records the initial pane; use an outer Terminal Control session when a composed workspace recording is required. Composed ANSI saves are rendered snapshots, while `--pane ID --format ansi` retains that pane's original VT stream.
+A workspace follows the size of its current human attachment, so resize that terminal itself rather than using `termctrl resize`. `--record` currently records the initial pane; use an outer Terminal Control session when a composed workspace recording is required. Composed ANSI saves are rendered snapshots, while `--pane ID --format ansi` retains that pane's original VT stream.
 
-Foreground workspaces query the outer terminal's default foreground, background, and ANSI 0-15 palette before opening the first pane. Ghostty-backed child terminals, dividers, overlays, and panes opened later therefore inherit the visible terminal theme; unsupported terminals retain Terminal Control's deterministic fallback palette.
+Each human attachment queries its terminal's default foreground, background, and ANSI 0-15 palette before repainting. Existing Ghostty-backed panes, dividers, overlays, and panes opened later therefore inherit the current visible terminal theme; unsupported terminals retain Terminal Control's deterministic fallback palette.
 
 ## Record And Export Video
 

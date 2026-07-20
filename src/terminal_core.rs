@@ -79,27 +79,7 @@ impl TerminalCore {
                 move |_terminal| bells.set(bells.get().saturating_add(1))
             })
             .context("configure Ghostty bell events")?;
-        terminal
-            .set_default_fg_color(Some(to_ghostty_color(theme.foreground)))
-            .context("configure Ghostty foreground")?
-            .set_default_bg_color(Some(to_ghostty_color(theme.background)))
-            .context("configure Ghostty background")?
-            .set_default_cursor_color(Some(to_ghostty_color(theme.foreground)))
-            .context("configure Ghostty cursor")?;
-        let mut palette = terminal
-            .default_color_palette()
-            .context("read Ghostty color palette")?;
-        for index in 0..=u8::MAX {
-            let color = theme
-                .ansi
-                .get(usize::from(index))
-                .copied()
-                .unwrap_or_else(|| indexed_color(index));
-            palette.set(PaletteIndex(index), to_ghostty_color(color));
-        }
-        terminal
-            .set_default_color_palette(Some(palette))
-            .context("configure Ghostty color palette")?;
+        apply_theme(&mut terminal, theme)?;
 
         Ok(Self {
             terminal,
@@ -116,6 +96,12 @@ impl TerminalCore {
     pub(crate) fn apply_output(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.terminal.vt_write(bytes);
         std::mem::take(&mut self.responses.borrow_mut())
+    }
+
+    pub(crate) fn set_theme(&mut self, theme: TerminalTheme) -> Result<()> {
+        apply_theme(&mut self.terminal, theme)?;
+        self.cached_frame = None;
+        Ok(())
     }
 
     pub(crate) fn resize(
@@ -313,6 +299,31 @@ impl TerminalCore {
     }
 }
 
+fn apply_theme(terminal: &mut Terminal<'static, 'static>, theme: TerminalTheme) -> Result<()> {
+    terminal
+        .set_default_fg_color(Some(to_ghostty_color(theme.foreground)))
+        .context("configure Ghostty foreground")?
+        .set_default_bg_color(Some(to_ghostty_color(theme.background)))
+        .context("configure Ghostty background")?
+        .set_default_cursor_color(Some(to_ghostty_color(theme.foreground)))
+        .context("configure Ghostty cursor")?;
+    let mut palette = terminal
+        .default_color_palette()
+        .context("read Ghostty color palette")?;
+    for index in 0..=u8::MAX {
+        let color = theme
+            .ansi
+            .get(usize::from(index))
+            .copied()
+            .unwrap_or_else(|| indexed_color(index));
+        palette.set(PaletteIndex(index), to_ghostty_color(color));
+    }
+    terminal
+        .set_default_color_palette(Some(palette))
+        .context("configure Ghostty color palette")?;
+    Ok(())
+}
+
 fn has_attributes(attributes: &Attributes) -> bool {
     attributes.bold
         || attributes.italic
@@ -400,6 +411,27 @@ mod tests {
         assert_eq!(frame.cells[0].foreground, theme.foreground);
         assert_eq!(frame.cells[1].foreground, theme.ansi[1]);
         assert_eq!(frame.cells[2].foreground, theme.ansi[9]);
+
+        let updated = TerminalTheme {
+            foreground: Color { r: 7, g: 8, b: 9 },
+            background: Color {
+                r: 10,
+                g: 11,
+                b: 12,
+            },
+            ansi: std::array::from_fn(|index| Color {
+                r: 100 + index as u8,
+                g: 40,
+                b: 50,
+            }),
+        };
+        terminal.set_theme(updated).unwrap();
+        let frame = terminal.frame().unwrap();
+        assert_eq!(frame.foreground, updated.foreground);
+        assert_eq!(frame.background, updated.background);
+        assert_eq!(frame.cells[0].foreground, updated.foreground);
+        assert_eq!(frame.cells[1].foreground, updated.ansi[1]);
+        assert_eq!(frame.cells[2].foreground, updated.ansi[9]);
     }
 
     #[test]

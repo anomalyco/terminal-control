@@ -17,6 +17,7 @@ Examples:
   termctrl save --format png --out captures/app.png -- my-terminal-app
   termctrl start demo --host opentui -- opencode
   termctrl run
+  termctrl attach workspace
   termctrl wait demo '/connect' && termctrl send demo text:/connect enter
   termctrl show demo
   termctrl save demo --format png --out captures/provider.png
@@ -66,9 +67,9 @@ Example:
   termctrl stop demo";
 
 const RUN_HELP: &str = "\
-Run enters a visible Terminal Control workspace. With no arguments it starts $SHELL in the current
-directory under the default name `workspace`. Supply a command after -- to replace the first shell,
-or NAME to expose a stable explicit control socket.
+Run creates or reattaches a visible Terminal Control workspace. With no arguments it uses the
+default name `workspace`. Supply a command after -- to replace the first shell when creating, or
+NAME to expose a stable explicit control socket. If NAME already exists, no command may be supplied.
 
 Use ctrl-b % to split left/right, ctrl-b \" to split top/bottom, ctrl-b h/j/k/l to focus, ctrl-b ?
 for help, and ctrl-b ctrl-b to send a literal ctrl-b. Destructive ctrl-b x and ctrl-b q actions
@@ -86,6 +87,14 @@ Examples:
   termctrl show workspace --pane 1
   termctrl run editor --cwd ~/src/project -- nvim
   termctrl run -- /usr/bin/nvim";
+
+const ATTACH_HELP: &str = "\
+Attach connects the current terminal to an existing detached workspace. It adopts this terminal's
+size and colors and repaints the complete workspace. A workspace accepts one human terminal at a
+time; agent controls remain available independently.
+
+Example:
+  termctrl attach workspace";
 
 const SEND_HELP: &str = "\
 Send ordered input to a live session. Text uses `text:<value>`; named keys include `enter`,
@@ -176,6 +185,9 @@ enum Command {
     /// Enter a visible, agent-controllable terminal workspace.
     #[command(after_help = RUN_HELP)]
     Run(RunArgs),
+    /// Attach this terminal to an existing workspace.
+    #[command(after_help = ATTACH_HELP)]
+    Attach(AttachArgs),
     /// Wait until a named session includes visible text.
     Wait(WaitArgs),
     /// Send ordered input to a named session.
@@ -217,6 +229,8 @@ enum Command {
     Mcp,
     #[command(name = "__serve", hide = true)]
     Serve(ServeArgs),
+    #[command(name = "__serve-workspace", hide = true)]
+    ServeWorkspace(ServeWorkspaceArgs),
 }
 
 #[derive(Args)]
@@ -404,6 +418,18 @@ struct RunArgs {
 }
 
 #[derive(Args)]
+struct AttachArgs {
+    /// Existing workspace name.
+    name: String,
+    /// Terminal cell width in pixels.
+    #[arg(long, default_value_t = 9)]
+    cell_width: u16,
+    /// Terminal cell height in pixels.
+    #[arg(long, default_value_t = 18)]
+    cell_height: u16,
+}
+
+#[derive(Args)]
 struct WaitArgs {
     /// Name of a running session.
     name: String,
@@ -582,6 +608,32 @@ struct ServeArgs {
 }
 
 #[derive(Args)]
+struct ServeWorkspaceArgs {
+    #[arg(long)]
+    socket: PathBuf,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    #[arg(long)]
+    record: Option<PathBuf>,
+    #[arg(long)]
+    opentui_host: bool,
+    #[arg(long, value_enum, default_value = "auto")]
+    color: ColorMode,
+    #[arg(long)]
+    cols: u16,
+    #[arg(long)]
+    rows: u16,
+    #[arg(long)]
+    cell_width: u16,
+    #[arg(long)]
+    cell_height: u16,
+    #[arg(long)]
+    max_bytes: usize,
+    #[arg(last = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+}
+
+#[derive(Args)]
 struct VideoArgs {
     /// Recording created by `termctrl start --record`.
     input: PathBuf,
@@ -675,6 +727,7 @@ fn main() -> Result<()> {
             println!("{}", args.name);
         }
         Command::Run(args) => run_session(&args)?,
+        Command::Attach(args) => attach_session(&args)?,
         Command::Wait(args) => {
             session::wait_for(
                 &args.name,
@@ -746,6 +799,30 @@ fn main() -> Result<()> {
         }
         Command::Serve(args) => {
             session::serve(
+                args.socket,
+                args.command,
+                args.cwd,
+                args.record,
+                shot_engine::Options {
+                    cols: args.cols,
+                    rows: args.rows,
+                    cell_width: args.cell_width,
+                    cell_height: args.cell_height,
+                    settle: Duration::ZERO,
+                    deadline: Duration::ZERO,
+                    input: Vec::new(),
+                    initial_delay: Duration::ZERO,
+                    wait_for: None,
+                    max_bytes: args.max_bytes,
+                    opentui_host: args.opentui_host,
+                    color: args.color.into(),
+                    env: Default::default(),
+                    inherit_env: true,
+                },
+            )?;
+        }
+        Command::ServeWorkspace(args) => {
+            session::serve_workspace(
                 args.socket,
                 args.command,
                 args.cwd,
@@ -1060,19 +1137,42 @@ fn run_session(args: &RunArgs) -> Result<()> {
     };
     let (cols, rows) = crossterm::terminal::size().unwrap_or((args.cols, args.rows));
     validate_terminal_size(cols, rows)?;
+    let options = shot_engine::Options {
+        cols,
+        rows,
+        cell_width: args.cell_width,
+        cell_height: args.cell_height,
+        max_bytes: args.max_bytes,
+        opentui_host: matches!(args.host, Some(HostProfile::Opentui)),
+        color: args.color.into(),
+        ..shot_engine::Options::default()
+    };
+    if session::status(&name).is_ok() {
+        if !args.command.is_empty() {
+            bail!("workspace {name:?} already exists; omit the command to attach");
+        }
+        return session::attach(&name, &options);
+    }
     session::run_foreground(
         &name,
         &args.command,
         args.cwd.as_deref(),
         args.record.as_deref(),
+        &options,
+    )
+}
+
+fn attach_session(args: &AttachArgs) -> Result<()> {
+    let (cols, rows) = crossterm::terminal::size()
+        .context("read current terminal size for workspace attachment")?;
+    validate_terminal_size(cols, rows)?;
+    session::attach(
+        &args.name,
         &shot_engine::Options {
             cols,
             rows,
             cell_width: args.cell_width,
             cell_height: args.cell_height,
-            max_bytes: args.max_bytes,
-            opentui_host: matches!(args.host, Some(HostProfile::Opentui)),
-            color: args.color.into(),
             ..shot_engine::Options::default()
         },
     )
@@ -1418,6 +1518,7 @@ mod tests {
     #[test]
     fn parses_flat_session_control_commands() {
         assert!(Cli::try_parse_from(["termctrl", "run"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "attach", "workspace"]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "run", "editor", "--", "nvim", "."]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "panes", "workspace", "--json"]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "layout", "workspace", "--grid", "2x2"]).is_ok());

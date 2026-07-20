@@ -96,7 +96,7 @@ Use a named session when several interactions target the same running applicatio
 
 ```bash
 termctrl start demo --cols 112 --rows 34 -- my-terminal-app
-termctrl wait demo "Ready" --timeout 5000
+termctrl wait demo "Ready"
 termctrl send demo text:help enter
 termctrl show demo
 termctrl save demo --format png --out captures/help.png
@@ -104,7 +104,8 @@ termctrl stop demo
 ```
 
 - `send` accepts `text:<value>`, named keys (`enter`, `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, `page-down`), and `ctrl-a` through `ctrl-z`. Pipe exact bytes with `--stdin`.
-- `wait` blocks until text is visible; use it instead of sleeping.
+- `wait` blocks until text is visible; use it instead of sleeping. It defaults to a five-second
+  maximum, so omit `--timeout 5000` and override only when choosing a different limit.
 - `status` reports running/exited state, command, cwd, viewport, and recording path. `list` shows all sessions.
 - `resize demo --cols 132 --rows 38` tests responsive layouts.
 - `restart demo` relaunches with the stored command, cwd, viewport, and recording settings.
@@ -114,7 +115,7 @@ OpenTUI applications such as OpenCode need the opt-in host handshake:
 
 ```bash
 termctrl start demo --host opentui --cols 112 --rows 34 -- opencode
-termctrl wait demo "/connect" --timeout 5000
+termctrl wait demo "/connect"
 ```
 
 For normal-screen tools and log-like processes, read retained scrollback with `logs`:
@@ -136,7 +137,7 @@ termctrl run -- nvim
 termctrl run editor --cwd ~/src/project -- nvim
 ```
 
-Use `ctrl-b %` to split right, `ctrl-b h/l` to focus panes, and `ctrl-b ?` for in-workspace help. Killing the active pane with `ctrl-b x` or quitting with `ctrl-b q` requires a second press. The initial workspace supports two side-by-side panes.
+Use `ctrl-b %` for left/right panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l` to focus directionally, and `ctrl-b ?` for in-workspace help. Killing the active pane with `ctrl-b x` or quitting with `ctrl-b q` requires a second press. The initial workspace supports two panes.
 
 Agents discover stable pane IDs and can inspect or drive a pane without changing human focus:
 

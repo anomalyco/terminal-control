@@ -70,10 +70,10 @@ Run enters a visible Terminal Control workspace. With no arguments it starts $SH
 directory under the default name `workspace`. Supply a command after -- to replace the first shell,
 or NAME to expose a stable explicit control socket.
 
-Use ctrl-b % to split right, ctrl-b h/l to focus, ctrl-b ? for help, and ctrl-b ctrl-b to send a
-literal ctrl-b. Destructive ctrl-b x and ctrl-b q actions require a second press. Agents can inspect
-the composed workspace or a specific pane, list stable pane ids, and send input without stealing
-human focus.
+Use ctrl-b % to split left/right, ctrl-b \" to split top/bottom, ctrl-b h/j/k/l to focus, ctrl-b ?
+for help, and ctrl-b ctrl-b to send a literal ctrl-b. Destructive ctrl-b x and ctrl-b q actions
+require a second press. Agents can inspect the composed workspace or a specific pane, list stable
+pane ids, and send input without stealing human focus.
 
 Examples:
   termctrl run

@@ -15,7 +15,8 @@ use crate::terminal_core::InputModes;
 
 pub type PaneId = u32;
 
-const DIVIDER: &str = "│";
+const VERTICAL_DIVIDER: &str = "│";
+const HORIZONTAL_DIVIDER: &str = "─";
 const PREFIX: u8 = 0x02;
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
@@ -33,11 +34,48 @@ pub(crate) struct Workspace {
     launch: SessionLaunch,
     stopped: bool,
     paste: Option<(PaneId, bool)>,
+    split: SplitLayout,
+    constrained: bool,
 }
 
 struct Pane {
     id: PaneId,
     session: Session,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SplitLayout {
+    #[default]
+    SideBySide,
+    Stacked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Direction {
+    fn target(self) -> (SplitLayout, usize) {
+        match self {
+            Self::Left => (SplitLayout::SideBySide, 0),
+            Self::Right => (SplitLayout::SideBySide, 1),
+            Self::Up => (SplitLayout::Stacked, 0),
+            Self::Down => (SplitLayout::Stacked, 1),
+        }
+    }
+
+    fn unavailable(self) -> &'static str {
+        match self {
+            Self::Left => "no pane to the left",
+            Self::Right => "no pane to the right",
+            Self::Up => "no pane above",
+            Self::Down => "no pane below",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -54,6 +92,7 @@ pub struct PaneStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PaneRect {
     x: u16,
+    y: u16,
     cols: u16,
     rows: u16,
 }
@@ -84,6 +123,8 @@ impl Workspace {
             launch,
             stopped: false,
             paste: None,
+            split: SplitLayout::default(),
+            constrained: false,
         })
     }
 
@@ -149,14 +190,14 @@ impl Workspace {
         Ok(removed)
     }
 
-    pub(crate) fn split_right(&mut self) -> Result<()> {
+    fn split(&mut self, split: SplitLayout) -> Result<()> {
         if self.panes.is_empty() {
             bail!("workspace has no pane to split");
         }
         if self.panes.len() >= 2 {
             bail!("the initial workspace supports at most two panes");
         }
-        let rects = layout(self.cols, self.rows, 2)?;
+        let rects = layout(self.cols, self.rows, 2, split)?;
         let mut options = self.options.clone();
         options.cols = rects[1].cols;
         options.rows = rects[1].rows;
@@ -171,20 +212,18 @@ impl Workspace {
             id: self.next_id,
             session,
         });
+        self.split = split;
         self.next_id += 1;
         self.focus(1)?;
         Ok(())
     }
 
-    pub(crate) fn focus_left(&mut self) -> Result<bool> {
-        self.focus(0)
-    }
-
-    pub(crate) fn focus_right(&mut self) -> Result<bool> {
-        if self.panes.len() < 2 {
+    fn focus_direction(&mut self, direction: Direction) -> Result<bool> {
+        let (split, target) = direction.target();
+        if self.split != split || target >= self.panes.len() {
             return Ok(false);
         }
-        self.focus(1)
+        self.focus(target)
     }
 
     pub(crate) fn close_active(&mut self) -> Result<()> {
@@ -300,26 +339,65 @@ impl Workspace {
         {
             return Ok(());
         }
-        if self.panes.len() == 2 && cols < 3 {
-            return Ok(());
-        }
-        let rects = layout(cols, rows, self.panes.len())?;
+        let constrained = self.panes.len() == 2
+            && match self.split {
+                SplitLayout::SideBySide => cols < 3,
+                SplitLayout::Stacked => rows < 3,
+            };
         self.cols = cols;
         self.rows = rows;
         self.options.cols = cols;
         self.options.rows = rows;
         self.options.cell_width = cell_width;
         self.options.cell_height = cell_height;
+        self.constrained = constrained;
+        if constrained {
+            return Ok(());
+        }
+        let rects = layout(cols, rows, self.panes.len(), self.split)?;
         self.apply_rects(&rects)
     }
 
     pub(crate) fn frame(&mut self) -> Result<Frame> {
-        let rects = layout(self.cols, self.rows, self.panes.len())?;
+        if self.constrained {
+            return self.constrained_frame();
+        }
+        let rects = layout(self.cols, self.rows, self.panes.len(), self.split)?;
         let mut frames = Vec::with_capacity(self.panes.len());
         for pane in &mut self.panes {
             frames.push(pane.session.current_frame()?);
         }
-        Ok(compose(self.cols, self.rows, &rects, &frames, self.active))
+        Ok(compose(
+            self.cols,
+            self.rows,
+            &rects,
+            &frames,
+            self.active,
+            self.split,
+        ))
+    }
+
+    fn constrained_frame(&mut self) -> Result<Frame> {
+        let index = self.resolve_pane(None)?;
+        let mut frame = self.panes[index].session.current_frame()?;
+        frame.cols = self.cols;
+        frame.rows = self.rows;
+        frame.cells.retain(|cell| {
+            cell.x < frame.cols
+                && cell.y < frame.rows
+                && cell.x.saturating_add(cell.width) <= frame.cols
+        });
+        frame.cursor = frame
+            .cursor
+            .filter(|cursor| cursor.x < frame.cols && cursor.y < frame.rows);
+        add_overlay(
+            &mut frame,
+            match self.split {
+                SplitLayout::SideBySide => "split needs 3 cols",
+                SplitLayout::Stacked => "split needs 3 rows",
+            },
+        );
+        Ok(frame)
     }
 
     pub(crate) fn shot(&mut self, pane: Option<PaneId>) -> Result<Shot> {
@@ -513,7 +591,8 @@ impl Workspace {
     }
 
     fn apply_layout(&mut self) -> Result<()> {
-        let rects = layout(self.cols, self.rows, self.panes.len())?;
+        let rects = layout(self.cols, self.rows, self.panes.len(), self.split)?;
+        self.constrained = false;
         self.apply_rects(&rects)
     }
 
@@ -573,31 +652,63 @@ fn shell_command() -> Vec<String> {
     vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned())]
 }
 
-fn layout(cols: u16, rows: u16, panes: usize) -> Result<Vec<PaneRect>> {
+fn layout(cols: u16, rows: u16, panes: usize, split: SplitLayout) -> Result<Vec<PaneRect>> {
     match panes {
         0 => Ok(Vec::new()),
-        1 => Ok(vec![PaneRect { x: 0, cols, rows }]),
-        2 if cols >= 3 => {
+        1 => Ok(vec![PaneRect {
+            x: 0,
+            y: 0,
+            cols,
+            rows,
+        }]),
+        2 if split == SplitLayout::SideBySide && cols >= 3 => {
             let left = (cols - 1) / 2;
             Ok(vec![
                 PaneRect {
                     x: 0,
+                    y: 0,
                     cols: left,
                     rows,
                 },
                 PaneRect {
                     x: left + 1,
+                    y: 0,
                     cols: cols - left - 1,
                     rows,
                 },
             ])
         }
-        2 => bail!("workspace is too narrow to split"),
+        2 if split == SplitLayout::Stacked && rows >= 3 => {
+            let top = (rows - 1) / 2;
+            Ok(vec![
+                PaneRect {
+                    x: 0,
+                    y: 0,
+                    cols,
+                    rows: top,
+                },
+                PaneRect {
+                    x: 0,
+                    y: top + 1,
+                    cols,
+                    rows: rows - top - 1,
+                },
+            ])
+        }
+        2 if split == SplitLayout::SideBySide => bail!("workspace is too narrow to split"),
+        2 => bail!("workspace is too short to split"),
         _ => bail!("the initial workspace supports at most two panes"),
     }
 }
 
-fn compose(cols: u16, rows: u16, rects: &[PaneRect], frames: &[Frame], active: usize) -> Frame {
+fn compose(
+    cols: u16,
+    rows: u16,
+    rects: &[PaneRect],
+    frames: &[Frame],
+    active: usize,
+    split: SplitLayout,
+) -> Frame {
     let foreground = frames
         .get(active)
         .map_or(DEFAULT_FOREGROUND, |frame| frame.foreground);
@@ -610,7 +721,7 @@ fn compose(cols: u16, rows: u16, rects: &[PaneRect], frames: &[Frame], active: u
             for y in 0..rect.rows {
                 cells.push(Cell {
                     x: rect.x,
-                    y,
+                    y: rect.y + y,
                     text: String::new(),
                     width: rect.cols,
                     foreground: frame.foreground,
@@ -628,34 +739,46 @@ fn compose(cols: u16, rows: u16, rects: &[PaneRect], frames: &[Frame], active: u
             }
             let mut cell = cell.clone();
             cell.x += rect.x;
+            cell.y += rect.y;
             cells.push(cell);
         }
     }
     if rects.len() == 2 {
-        for y in 0..rows {
-            cells.push(Cell {
-                x: rects[0].cols,
-                y,
-                text: if y == 0 {
-                    if active == 0 { "◀" } else { "▶" }.to_owned()
-                } else {
-                    DIVIDER.to_owned()
-                },
-                width: 1,
-                foreground,
-                background,
-                attributes: if y == 0 {
-                    Attributes {
-                        bold: true,
-                        ..Attributes::default()
-                    }
-                } else {
-                    Attributes {
-                        faint: true,
-                        ..Attributes::default()
-                    }
-                },
-            });
+        match split {
+            SplitLayout::SideBySide => {
+                for y in 0..rows {
+                    cells.push(Cell {
+                        x: rects[0].cols,
+                        y,
+                        text: if y == 0 {
+                            if active == 0 { "◀" } else { "▶" }.to_owned()
+                        } else {
+                            VERTICAL_DIVIDER.to_owned()
+                        },
+                        width: 1,
+                        foreground,
+                        background,
+                        attributes: divider_attributes(y == 0),
+                    });
+                }
+            }
+            SplitLayout::Stacked => {
+                for x in 0..cols {
+                    cells.push(Cell {
+                        x,
+                        y: rects[0].rows,
+                        text: if x == 0 {
+                            if active == 0 { "▲" } else { "▼" }.to_owned()
+                        } else {
+                            HORIZONTAL_DIVIDER.to_owned()
+                        },
+                        width: 1,
+                        foreground,
+                        background,
+                        attributes: divider_attributes(x == 0),
+                    });
+                }
+            }
         }
     }
     let cursor = rects
@@ -665,7 +788,7 @@ fn compose(cols: u16, rows: u16, rects: &[PaneRect], frames: &[Frame], active: u
         .and_then(|(rect, cursor)| {
             (cursor.x < rect.cols && cursor.y < rect.rows).then(|| Cursor {
                 x: rect.x + cursor.x,
-                y: cursor.y,
+                y: rect.y + cursor.y,
                 color: cursor.color,
                 blinking: cursor.blinking,
             })
@@ -681,15 +804,28 @@ fn compose(cols: u16, rows: u16, rects: &[PaneRect], frames: &[Frame], active: u
     }
 }
 
+fn divider_attributes(active: bool) -> Attributes {
+    if active {
+        Attributes {
+            bold: true,
+            ..Attributes::default()
+        }
+    } else {
+        Attributes {
+            faint: true,
+            ..Attributes::default()
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum InputAction {
     Send(Vec<u8>),
     PasteStart,
     PasteData(Vec<u8>),
     PasteEnd,
-    SplitRight,
-    FocusLeft,
-    FocusRight,
+    Split(SplitLayout),
+    Focus(Direction),
     CloseActive,
     Quit,
     Help,
@@ -774,9 +910,12 @@ impl PrefixDecoder {
             if self.waiting {
                 flush_plain(&mut actions, &mut plain);
                 let action = match byte {
-                    b'%' => InputAction::SplitRight,
-                    b'h' => InputAction::FocusLeft,
-                    b'l' => InputAction::FocusRight,
+                    b'%' => InputAction::Split(SplitLayout::SideBySide),
+                    b'"' => InputAction::Split(SplitLayout::Stacked),
+                    b'h' => InputAction::Focus(Direction::Left),
+                    b'l' => InputAction::Focus(Direction::Right),
+                    b'k' => InputAction::Focus(Direction::Up),
+                    b'j' => InputAction::Focus(Direction::Down),
                     b'x' => InputAction::CloseActive,
                     b'q' => InputAction::Quit,
                     b'?' => InputAction::Help,
@@ -999,9 +1138,9 @@ impl WorkspaceTerminal {
                             break;
                         }
                     }
-                    InputAction::SplitRight => {
+                    InputAction::Split(split) => {
                         self.ui.clear_armed();
-                        match workspace.split_right() {
+                        match workspace.split(split) {
                             Ok(()) => self.ui.notice(
                                 format!("pane {} active", workspace.active_id().unwrap_or(0)),
                                 Duration::from_millis(1_200),
@@ -1013,28 +1152,16 @@ impl WorkspaceTerminal {
                             }
                         }
                     }
-                    InputAction::FocusLeft => {
+                    InputAction::Focus(direction) => {
                         self.ui.clear_armed();
-                        if workspace.focus_left()? {
+                        if workspace.focus_direction(direction)? {
                             self.ui.notice(
                                 format!("pane {} active", workspace.active_id().unwrap_or(0)),
                                 Duration::from_millis(1_000),
                             );
                         } else {
                             self.ui
-                                .notice("no pane to the left", Duration::from_millis(1_000));
-                        }
-                    }
-                    InputAction::FocusRight => {
-                        self.ui.clear_armed();
-                        if workspace.focus_right()? {
-                            self.ui.notice(
-                                format!("pane {} active", workspace.active_id().unwrap_or(0)),
-                                Duration::from_millis(1_000),
-                            );
-                        } else {
-                            self.ui
-                                .notice("no pane to the right", Duration::from_millis(1_000));
+                                .notice(direction.unavailable(), Duration::from_millis(1_000));
                         }
                     }
                     InputAction::CloseActive => {
@@ -1061,7 +1188,7 @@ impl WorkspaceTerminal {
                     InputAction::Help => {
                         self.ui.clear_armed();
                         self.ui.notice(
-                            "^B % split  h/l focus  x kill pane  q kill all  ^B send prefix",
+                            "^B % side  \" stack  h/j/k/l focus  x pane  q all  ^B literal",
                             Duration::from_secs(4),
                         );
                     }
@@ -1508,15 +1635,17 @@ mod tests {
     #[test]
     fn two_pane_layout_reserves_one_divider_column() {
         assert_eq!(
-            layout(80, 24, 2).unwrap(),
+            layout(80, 24, 2, SplitLayout::SideBySide).unwrap(),
             [
                 PaneRect {
                     x: 0,
+                    y: 0,
                     cols: 39,
                     rows: 24
                 },
                 PaneRect {
                     x: 40,
+                    y: 0,
                     cols: 40,
                     rows: 24
                 }
@@ -1526,7 +1655,7 @@ mod tests {
 
     #[test]
     fn composition_offsets_right_cells_and_active_cursor() {
-        let rects = layout(11, 3, 2).unwrap();
+        let rects = layout(11, 3, 2, SplitLayout::SideBySide).unwrap();
         let composed = compose(
             11,
             3,
@@ -1536,6 +1665,7 @@ mod tests {
                 frame(5, 3, "R", Some((2, 2))),
             ],
             1,
+            SplitLayout::SideBySide,
         );
 
         assert!(
@@ -1546,6 +1676,73 @@ mod tests {
         );
         assert_eq!(composed.cursor.as_ref().unwrap().x, 8);
         assert_eq!(composed.text(), "L    ▶R\n     │\n     │");
+    }
+
+    #[test]
+    fn stacked_layout_reserves_one_divider_row_and_offsets_the_bottom_pane() {
+        let rects = layout(8, 5, 2, SplitLayout::Stacked).unwrap();
+        assert_eq!(
+            rects,
+            [
+                PaneRect {
+                    x: 0,
+                    y: 0,
+                    cols: 8,
+                    rows: 2,
+                },
+                PaneRect {
+                    x: 0,
+                    y: 3,
+                    cols: 8,
+                    rows: 2,
+                },
+            ]
+        );
+        let composed = compose(
+            8,
+            5,
+            &rects,
+            &[
+                frame(8, 2, "T", Some((1, 1))),
+                frame(8, 2, "B", Some((2, 1))),
+            ],
+            1,
+            SplitLayout::Stacked,
+        );
+
+        assert_eq!(composed.cursor.as_ref().unwrap().y, 4);
+        assert_eq!(composed.text(), "T\n\n▼───────\nB");
+    }
+
+    #[test]
+    fn stacked_layout_offsets_bottom_background_spans_and_rejects_short_screens() {
+        assert_eq!(
+            layout(8, 2, 2, SplitLayout::Stacked)
+                .unwrap_err()
+                .to_string(),
+            "workspace is too short to split"
+        );
+        assert_eq!(
+            layout(2, 8, 2, SplitLayout::SideBySide)
+                .unwrap_err()
+                .to_string(),
+            "workspace is too narrow to split"
+        );
+
+        let rects = layout(8, 5, 2, SplitLayout::Stacked).unwrap();
+        let top = frame(8, 2, "T", None);
+        let mut bottom = frame(8, 2, "B", None);
+        bottom.background = crate::frame::Color { r: 1, g: 2, b: 3 };
+        let composed = compose(8, 5, &rects, &[top, bottom], 0, SplitLayout::Stacked);
+
+        assert!(composed.cells.iter().any(|cell| {
+            cell.y == 3
+                && cell.width == 8
+                && cell.background == crate::frame::Color { r: 1, g: 2, b: 3 }
+        }));
+        assert!(!composed.cells.iter().any(|cell| {
+            cell.y < 3 && cell.background == crate::frame::Color { r: 1, g: 2, b: 3 }
+        }));
     }
 
     #[test]
@@ -1617,7 +1814,22 @@ mod tests {
         let mut decoder = PrefixDecoder::default();
 
         assert!(decoder.push(&[PREFIX]).is_empty());
-        assert_eq!(decoder.push(b"%"), [InputAction::SplitRight]);
+        assert_eq!(
+            decoder.push(b"%"),
+            [InputAction::Split(SplitLayout::SideBySide)]
+        );
+        assert_eq!(
+            decoder.push(&[PREFIX, b'"']),
+            [InputAction::Split(SplitLayout::Stacked)]
+        );
+        assert_eq!(
+            decoder.push(&[PREFIX, b'j']),
+            [InputAction::Focus(Direction::Down)]
+        );
+        assert_eq!(
+            decoder.push(&[PREFIX, b'k']),
+            [InputAction::Focus(Direction::Up)]
+        );
         assert_eq!(decoder.push(&[PREFIX, b'z']), [InputAction::Unknown(b'z')]);
         assert_eq!(
             decoder.push(&[PREFIX, PREFIX]),
@@ -1639,7 +1851,10 @@ mod tests {
                 InputAction::PasteEnd
             ]
         );
-        assert_eq!(decoder.push(b"\x02%"), [InputAction::SplitRight]);
+        assert_eq!(
+            decoder.push(b"\x02%"),
+            [InputAction::Split(SplitLayout::SideBySide)]
+        );
     }
 
     #[test]
@@ -1752,7 +1967,7 @@ mod tests {
             "-c".to_owned(),
             "printf RIGHT; cat".to_owned(),
         ];
-        workspace.split_right().unwrap();
+        workspace.split(SplitLayout::SideBySide).unwrap();
         workspace.send(Some(1), b"AGENT\n").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1771,7 +1986,10 @@ mod tests {
         assert_eq!(workspace.panes().unwrap().len(), 2);
         assert!(!workspace.shot(None).unwrap().ansi.is_empty());
         workspace.resize(2, 4, 9, 18).unwrap();
-        assert_eq!(workspace.status().unwrap().cols, 21);
+        assert_eq!(workspace.status().unwrap().cols, 2);
+        assert_eq!(workspace.frame().unwrap().cols, 2);
+        workspace.resize(21, 4, 9, 18).unwrap();
+        assert!(workspace.frame().unwrap().text().contains("LEFT"));
         workspace.send(Some(1), &[0x04]).unwrap();
         let error = workspace
             .wait_for_text(Some(1), "never", Duration::from_secs(2), |workspace| {
@@ -1782,6 +2000,86 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("pane 1 ended"));
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_workspace_stacks_panes_and_focuses_vertically() {
+        let options = Options {
+            cols: 21,
+            rows: 7,
+            ..Options::default()
+        };
+        let mut workspace = Workspace::start(
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf TOP; cat".to_owned(),
+            ],
+            None,
+            None,
+            &options,
+        )
+        .unwrap();
+        workspace.shell = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf BOTTOM; cat".to_owned(),
+        ];
+        workspace.split(SplitLayout::Stacked).unwrap();
+        workspace.send(Some(1), b"AGENT\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let frame = loop {
+            workspace.pump().unwrap();
+            let frame = workspace.frame().unwrap();
+            let text = frame.text();
+            if text.contains("TOP") && text.contains("BOTTOM") && text.contains("AGENT") {
+                break frame;
+            }
+            assert!(Instant::now() < deadline, "workspace output did not arrive");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        assert!(frame.text().contains("▼────────────────────"));
+        assert_eq!(workspace.active_id(), Some(1));
+        assert!(workspace.focus_direction(Direction::Up).unwrap());
+        assert_eq!(workspace.active_id(), Some(0));
+        assert!(workspace.focus_direction(Direction::Down).unwrap());
+        assert_eq!(workspace.active_id(), Some(1));
+        assert_eq!(
+            workspace
+                .panes()
+                .unwrap()
+                .into_iter()
+                .map(|pane| (pane.cols, pane.rows))
+                .collect::<Vec<_>>(),
+            [(21, 3), (21, 3)]
+        );
+        workspace.resize(21, 9, 9, 18).unwrap();
+        assert_eq!(
+            workspace
+                .panes()
+                .unwrap()
+                .into_iter()
+                .map(|pane| (pane.cols, pane.rows))
+                .collect::<Vec<_>>(),
+            [(21, 4), (21, 4)]
+        );
+        workspace.resize(21, 2, 9, 18).unwrap();
+        assert_eq!(workspace.status().unwrap().rows, 2);
+        let constrained = workspace.frame().unwrap();
+        assert_eq!(constrained.rows, 2);
+        assert!(constrained.text().contains("split needs 3 rows"));
+        workspace.resize(21, 9, 9, 18).unwrap();
+        let restored = workspace.frame().unwrap().text();
+        assert!(restored.contains("TOP"));
+        assert!(restored.contains("BOTTOM"));
+        workspace.close_active().unwrap();
+        let panes = workspace.panes().unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!((panes[0].cols, panes[0].rows), (21, 9));
         workspace.stop();
     }
 
@@ -1875,7 +2173,7 @@ mod tests {
             "-c".to_owned(),
             "printf TARGET-FINAL".to_owned(),
         ];
-        workspace.split_right().unwrap();
+        workspace.split(SplitLayout::SideBySide).unwrap();
 
         let shot = workspace
             .capture(

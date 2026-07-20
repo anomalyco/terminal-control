@@ -19,10 +19,10 @@ Keep an application alive when interaction or repeated inspection is required:
 
 ```bash
 termctrl start app -- my-terminal-app
-termctrl wait app "Ready" --timeout 5000
+termctrl wait app "Ready"
 termctrl show app
 termctrl send app text:help enter
-termctrl wait app "Commands" --timeout 5000
+termctrl wait app "Commands"
 termctrl show app
 termctrl stop app
 ```
@@ -39,10 +39,10 @@ termctrl panes workspace --json
 termctrl send workspace --pane 1 text:opencode2 enter
 ```
 
-With no arguments, `run` starts `$SHELL` in the `workspace` session. Use `ctrl-b %` to split right,
-`ctrl-b h/l` to focus, and `ctrl-b ?` for help. Killing a pane with `ctrl-b x` or quitting with
-`ctrl-b q` requires a second press. A supplied command still uses its executable basename when
-`NAME` is omitted.
+With no arguments, `run` starts `$SHELL` in the `workspace` session. Use `ctrl-b %` for left/right
+panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l` to focus directionally, and `ctrl-b ?` for
+help. Killing a pane with `ctrl-b x` or quitting with `ctrl-b q` requires a second press. A supplied
+command still uses its executable basename when `NAME` is omitted.
 
 Attached workspaces follow their visible terminal and reject `termctrl resize`. `run --record` records
 the initial pane only; wrap `run` in an outer named session when a composed workspace recording is
@@ -60,6 +60,9 @@ Do not treat logs as the visible state of an alternate-screen TUI.
 Named-session screen reads are immediate by default. Do not pass `--settle-ms 0` or
 `--deadline-ms 0`; omit both options. Set them only to intentional nonzero values when a specific
 transition needs quiet-output settling.
+
+`wait` defaults to a five-second maximum and returns as soon as its text appears. Do not pass
+`--timeout 5000`; omit it. Set `--timeout` only when intentionally choosing a different limit.
 
 ## Drive Input Precisely
 
@@ -80,7 +83,7 @@ Use the OpenTUI host handshake for applications such as OpenCode:
 
 ```bash
 termctrl start app --host opentui --cols 112 --rows 34 -- opencode
-termctrl wait app "/connect" --timeout 5000
+termctrl wait app "/connect"
 termctrl show app
 ```
 
@@ -98,7 +101,7 @@ Record demos only when the user wants a retained timeline or video. Add markers 
 
 ```bash
 termctrl start app --record artifacts/run.termctrl -- my-terminal-app
-termctrl wait app "Ready" --timeout 5000
+termctrl wait app "Ready"
 termctrl mark app ready
 termctrl send app text:demo enter
 termctrl wait app "Done" --timeout 60000

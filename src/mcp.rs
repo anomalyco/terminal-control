@@ -70,6 +70,9 @@ struct InteractRequest {
     #[schemars(description = "Optional visible text to await after sending input")]
     wait_for: Option<String>,
     #[serde(default = "default_timeout_ms")]
+    #[schemars(
+        description = "Maximum wait for waitFor text. Defaults to 5000; omit unless intentionally overriding, and never send an explicit 5000"
+    )]
     timeout_ms: u64,
     #[serde(default)]
     #[schemars(
@@ -597,6 +600,24 @@ mod tests {
                 assert!(!required.iter().any(|value| value == field));
             }
         }
+
+        let interact = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "interact")
+            .unwrap();
+        let schema = serde_json::to_value(&interact.input_schema).unwrap();
+        let timeout = &schema["properties"]["timeoutMs"];
+        assert_eq!(timeout["default"], 5_000);
+        let description = timeout["description"].as_str().unwrap();
+        assert!(description.contains("omit"));
+        assert!(description.contains("never send an explicit 5000"));
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "timeoutMs")
+        );
     }
 
     #[test]

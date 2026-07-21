@@ -43,6 +43,14 @@ MCP screen reads and interactions return the current frame immediately. Use `wai
 when a specific transition must complete. `save_screen` writes a PNG of the composed workspace, one
 named window, or one stable pane.
 
+| MCP task | Tools |
+| --- | --- |
+| Discover | `list_sessions`, `get_session_status`, `get_workspace_context`, `list_windows`, `list_panes` |
+| Observe and drive | `get_screen`, `save_screen`, `send_input`, `interact`, `resize_session` |
+| Arrange | `create_workspace_window`, `select_workspace_window`, `rename_workspace_window`, `move_workspace_window`, `set_workspace_tab_position`, `set_workspace_layout` |
+| Control panes | `focus_workspace_pane`, `move_workspace_pane`, `resize_workspace_pane`, `toggle_workspace_zoom` |
+| End processes | `close_workspace_pane`, `close_workspace_window`, `stop_session` |
+
 Then ask for terminal work in ordinary language:
 
 ```text
@@ -148,13 +156,19 @@ The workspace daemon owns named windows and their panes independently from any t
 The persistent tab strip shows the selected window, pane count, zoom, and unread activity: `+`
 output, `!` bell, and `x` a pane exit while its window remains. It defaults to the bottom; use
 `run NAME --tab-position top` at creation or `tab-position NAME top|bottom` at runtime. Click a tab
-to select it or drag it to reorder. Use `ctrl-b p` for the command
-palette, `ctrl-b l` for the last window, `ctrl-b n` for the next window, `ctrl-b 0-9` to select,
-`ctrl-b </>` to reorder, and `ctrl-b t` to move the strip. Use `ctrl-b %` for left/right panes,
-`ctrl-b "` for top/bottom panes, arrow keys, `ctrl-b h/j/k`, or a mouse click to focus,
-`ctrl-b H/J/K/L` to resize by five cells, `ctrl-b z` to toggle pane zoom, `ctrl-b q` to show stable
-pane IDs, `ctrl-b d` to detach, and `ctrl-b ?` for help. `ctrl-b x` closes a pane, `ctrl-b &` closes
-the current window, and `ctrl-b Q` closes the workspace; each requires `y` confirmation.
+to select it or drag it to reorder. Human shortcuts use the `ctrl-b` prefix:
+
+| Shortcut after `ctrl-b` | Action |
+| --- | --- |
+| `p` | Open the command palette |
+| `c`, `w` | Create a window; list windows |
+| `n`, `l`, `0-9` | Select next, last, or indexed window |
+| `<`, `>`, `t` | Reorder the window; move the tab strip |
+| `%`, `"` | Split left/right or top/bottom |
+| Arrow keys or `h/j/k` | Focus a pane |
+| `H/J/K/L`, `z`, `q` | Resize, zoom, or show stable pane IDs |
+| `d`, `?` | Detach or show help |
+| `x`, `&`, `Q` | Close a pane, window, or workspace after confirmation |
 
 Mouse events over a pane use pane-local coordinates and continue to mouse-aware applications. A
 primary click also focuses that pane; divider clicks are ignored.
@@ -281,7 +295,7 @@ See [docs/typescript-client.md](docs/typescript-client.md) for artifacts, record
 - [docs/rust-library.md](docs/rust-library.md) — embed the shot engine and sessions in Rust, plus versioned JSON schemas.
 - [docs/driver-protocol.md](docs/driver-protocol.md) — the `termctrl driver` JSON Lines protocol for external tooling.
 - [docs/typescript-client.md](docs/typescript-client.md) — the npm test client in full.
-- [docs/releasing.md](docs/releasing.md) — maintainer release process for the npm packages.
+- [docs/releasing.md](docs/releasing.md) — aligned crates.io, npm, and GitHub release process.
 
 ## Notes
 

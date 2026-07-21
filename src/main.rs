@@ -71,10 +71,10 @@ Run creates or reattaches a visible Terminal Control workspace. With no argument
 default name `workspace`. Supply a command after -- to replace the first shell when creating, or
 NAME to expose a stable explicit control socket. If NAME already exists, no command may be supplied.
 
-Each workspace starts with a `main` window. Use ctrl-b p for the command palette, ctrl-b l for the
-last window, ctrl-b n for the next window, and 0-9 to select by index. Use ctrl-b </> or tab dragging
-to reorder, and ctrl-b t to move tabs. Use ctrl-b % to split left/right, ctrl-b
-\" to split top/bottom, arrow keys or h/j/k to focus, ctrl-b H/J/K/L to resize, ctrl-b z to zoom,
+Each workspace starts with a `main` window. Use ctrl-b p for the command palette, ctrl-b c/w to
+create/list windows, ctrl-b l for the last window, ctrl-b n for next, and ctrl-b 0-9 to select by
+index. Use ctrl-b </> or tab dragging to reorder, and ctrl-b t to move tabs. Use ctrl-b % to split
+left/right, ctrl-b \" to split top/bottom, ctrl-b plus arrow keys or h/j/k to focus, ctrl-b H/J/K/L to resize, ctrl-b z to zoom,
 ctrl-b q to show pane ids, ctrl-b d to detach, ctrl-b ? for help, and ctrl-b ctrl-b to send a literal ctrl-b. Destructive ctrl-b x (pane), ctrl-b
 & (window), and ctrl-b Q (workspace) actions require y/n confirmation. Agents can target hidden
 windows without changing human selection. Foreground workspaces inherit the outer terminal colors.
@@ -1321,7 +1321,6 @@ fn status(args: StatusArgs) -> Result<()> {
 }
 
 fn current(args: CurrentArgs) -> Result<()> {
-    let explicit_name = args.name.is_some();
     let workspace = std::env::var("TERMCTRL_WORKSPACE").ok();
     let session_name = std::env::var("TERMCTRL_SESSION").ok();
     if args.name.is_none() && workspace.is_none() {
@@ -1352,21 +1351,16 @@ fn current(args: CurrentArgs) -> Result<()> {
         }
         return Ok(());
     }
-    let name = args.name.or(workspace).context(
+    let name = args.name.or_else(|| workspace.clone()).context(
         "not running inside a Terminal Control workspace; provide NAME or set TERMCTRL_WORKSPACE",
     )?;
-    let pane = match args.pane {
-        Some(pane) => Some(pane),
-        None if explicit_name => None,
-        None => std::env::var("TERMCTRL_PANE_ID")
-            .ok()
-            .map(|value| {
-                value
-                    .parse::<u32>()
-                    .with_context(|| format!("invalid TERMCTRL_PANE_ID {value:?}"))
-            })
-            .transpose()?,
-    };
+    let inherited_pane = std::env::var("TERMCTRL_PANE_ID").ok();
+    let pane = resolve_current_pane(
+        args.pane,
+        &name,
+        workspace.as_deref(),
+        inherited_pane.as_deref(),
+    )?;
     let context = session::workspace_context(&name, pane)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&context)?);
@@ -1377,9 +1371,27 @@ fn current(args: CurrentArgs) -> Result<()> {
             context.window_index, context.window_id, context.window
         );
         println!("pane: {}", context.pane);
-        println!("tabs: {:?}", context.tab_position);
+        println!("tabs: {}", context.tab_position.as_str());
     }
     Ok(())
+}
+
+fn resolve_current_pane(
+    explicit: Option<u32>,
+    workspace: &str,
+    inherited_workspace: Option<&str>,
+    inherited_pane: Option<&str>,
+) -> Result<Option<u32>> {
+    if explicit.is_some() || inherited_workspace != Some(workspace) {
+        return Ok(explicit);
+    }
+    inherited_pane
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .with_context(|| format!("invalid TERMCTRL_PANE_ID {value:?}"))
+        })
+        .transpose()
 }
 
 fn list(args: ListArgs) -> Result<()> {
@@ -1570,7 +1582,7 @@ fn print_windows(windows: &[session::WindowStatus], json: bool) -> Result<()> {
         let activity = window
             .activity_kinds
             .iter()
-            .map(|kind| format!("{kind:?}").to_ascii_lowercase())
+            .map(|kind| kind.as_str())
             .collect::<Vec<_>>()
             .join(",");
         println!(
@@ -2071,6 +2083,23 @@ mod tests {
         assert!(
             Cli::try_parse_from(["termctrl", "wait", "demo", "ready", "--timeout", "5"]).is_ok()
         );
+    }
+
+    #[test]
+    fn current_context_uses_inherited_pane_only_for_the_same_workspace() {
+        assert_eq!(
+            resolve_current_pane(None, "workspace", Some("workspace"), Some("7")).unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            resolve_current_pane(None, "other", Some("workspace"), Some("7")).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_current_pane(Some(3), "other", Some("workspace"), Some("7")).unwrap(),
+            Some(3)
+        );
+        assert!(resolve_current_pane(None, "workspace", Some("workspace"), Some("bad")).is_err());
     }
 
     #[test]

@@ -45,6 +45,15 @@ pub enum TabPosition {
     Bottom,
 }
 
+impl TabPosition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum ActivityKind {
@@ -54,6 +63,14 @@ pub enum ActivityKind {
 }
 
 impl ActivityKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Output => "output",
+            Self::Bell => "bell",
+            Self::Exit => "exit",
+        }
+    }
+
     fn badge(self) -> char {
         match self {
             Self::Output => '+',
@@ -1230,7 +1247,7 @@ impl Workspace {
             }
         };
         if let Err(error) = source_result {
-            self.windows[source].panes.push(moved);
+            self.windows[source].panes.insert(source_pane, moved);
             self.windows[source].layout = old_source_layout;
             let _ = self.windows[source].apply_geometry(old_source_applied.geometry().clone());
             self.windows[source].applied = old_source_applied;
@@ -1257,7 +1274,7 @@ impl Workspace {
             self.windows[target].applied = old_target_applied;
             self.windows[target].zoomed = old_target_zoomed;
             self.windows[target].invalidate_frame();
-            self.windows[source].panes.push(moved);
+            self.windows[source].panes.insert(source_pane, moved);
             self.windows[source].layout = old_source_layout;
             let _ = self.windows[source].apply_geometry(old_source_applied.geometry().clone());
             self.windows[source].applied = old_source_applied;
@@ -2685,6 +2702,13 @@ fn aggregate_statuses(statuses: &[SessionStatus], active: usize) -> Result<Sessi
     status.has_visible_content = statuses.iter().any(|status| status.has_visible_content);
     status.recording = statuses.iter().any(|status| status.recording);
     status.logs_truncated = statuses.iter().any(|status| status.logs_truncated);
+    if statuses
+        .iter()
+        .any(|status| status.state == SessionState::Running)
+    {
+        status.state = SessionState::Running;
+        status.exit = None;
+    }
     Ok(status)
 }
 
@@ -4149,7 +4173,7 @@ impl WorkspaceTerminal {
                         };
                         workspace.set_tab_position(position);
                         self.ui.notice(
-                            format!("tabs moved to {position:?}").to_ascii_lowercase(),
+                            format!("tabs moved to {}", position.as_str()),
                             Duration::from_millis(1_000),
                         );
                     }
@@ -4769,6 +4793,65 @@ mod tests {
                 attributes: Attributes::default(),
             }],
         }
+    }
+
+    fn status(state: SessionState) -> SessionStatus {
+        SessionStatus {
+            state,
+            exit: (state == SessionState::Exited).then_some(crate::session::ProcessExit {
+                code: 0,
+                signal: None,
+                success: true,
+            }),
+            cols: 80,
+            rows: 24,
+            cell_width: 9,
+            cell_height: 18,
+            idle_for_ms: Some(10),
+            has_visible_content: false,
+            recording: false,
+            logs_truncated: false,
+            launch: SessionLaunch {
+                command: vec!["sh".to_owned()],
+                cwd: PathBuf::from("/tmp"),
+                record: None,
+                cols: 80,
+                rows: 24,
+                cell_width: 9,
+                cell_height: 18,
+                max_bytes: 1024,
+                opentui_host: false,
+                color: crate::shot::ColorMode::Auto,
+            },
+        }
+    }
+
+    #[test]
+    fn aggregate_status_remains_running_while_any_pane_runs() {
+        let aggregate = aggregate_statuses(
+            &[status(SessionState::Exited), status(SessionState::Running)],
+            0,
+        )
+        .unwrap();
+        assert_eq!(aggregate.state, SessionState::Running);
+        assert!(aggregate.exit.is_none());
+
+        let aggregate = aggregate_statuses(
+            &[status(SessionState::Exited), status(SessionState::Exited)],
+            0,
+        )
+        .unwrap();
+        assert_eq!(aggregate.state, SessionState::Exited);
+        assert!(aggregate.exit.is_some());
+    }
+
+    #[test]
+    fn workspace_domain_values_have_explicit_external_names() {
+        assert_eq!(TabPosition::Top.as_str(), "top");
+        assert_eq!(TabPosition::Bottom.as_str(), "bottom");
+        assert_eq!(ActivityKind::Output.as_str(), "output");
+        assert_eq!(ActivityKind::Bell.as_str(), "bell");
+        assert_eq!(ActivityKind::Exit.as_str(), "exit");
     }
 
     #[test]
@@ -6222,11 +6305,23 @@ mod tests {
         assert_eq!(workspace.active_window_name(), Some("tests"));
 
         ui.open_palette();
+        let mut decoder = PrefixDecoder::default();
+        assert!(decoder.push(b"\x1b").is_empty());
+        let actions = decoder.push(b"[B");
+        let [InputAction::Send(arrow)] = actions.as_slice() else {
+            panic!("fragmented arrow was not normalized into one input action");
+        };
+        assert_eq!(arrow, b"\x1b[B");
+        let (action, remainder) = ui.palette_input(&workspace, arrow);
+        assert!(action.is_none());
+        assert!(remainder.is_empty());
+        assert_eq!(ui.palette.as_ref().unwrap().selected, 1);
+
         let lines = ui.palette_lines(&workspace).unwrap();
         let mut frame = frame(80, 12, "content", Some((0, 0)));
         add_palette_overlay(&mut frame, &lines, TabPosition::Bottom);
         assert!(frame.text().contains("COMMAND PALETTE"));
-        assert!(frame.text().contains("> window"));
+        assert!(frame.text().contains("> pane"));
         assert!(frame.cursor.is_none());
         workspace.stop();
     }

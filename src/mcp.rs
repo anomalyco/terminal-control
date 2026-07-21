@@ -861,9 +861,9 @@ fn save_screen(request: SaveScreenRequest) -> Result<ScreenArtifact, String> {
 }
 
 fn capture_target(name: String, target: session::TerminalTarget) -> Result<Screen, String> {
-    let shot = session::show_target(&name, target, Duration::ZERO, Duration::ZERO)
-        .map_err(format_error)?;
-    let status = session::status(&name).map_err(format_error)?;
+    let (shot, status) =
+        session::show_target_with_status(&name, target, Duration::ZERO, Duration::ZERO)
+            .map_err(format_error)?;
     Ok(Screen {
         name,
         text: shot.frame.text(),
@@ -909,7 +909,7 @@ fn window_list(windows: Vec<session::WindowStatus>) -> WindowList {
                 activity_kinds: window
                     .activity_kinds
                     .into_iter()
-                    .map(|kind| format!("{kind:?}").to_ascii_lowercase())
+                    .map(|kind| kind.as_str().to_owned())
                     .collect(),
                 cols: window.cols,
                 rows: window.rows,
@@ -928,7 +928,7 @@ fn workspace_context(context: session::WorkspaceContext) -> WorkspaceContext {
         pane: context.pane,
         window_active: context.window_active,
         pane_active: context.pane_active,
-        tab_position: format!("{:?}", context.tab_position).to_ascii_lowercase(),
+        tab_position: context.tab_position.as_str().to_owned(),
     }
 }
 

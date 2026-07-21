@@ -1,4 +1,4 @@
-import { chmod, cp, mkdir, mkdtemp, rm } from "node:fs/promises"
+import { chmod, cp, mkdir, mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { spawnSync } from "node:child_process"
@@ -27,13 +27,21 @@ export function nativePackage(target) {
 }
 
 export async function packNativePackage(target, binary, output) {
-  nativePackage(target)
+  const native = nativePackage(target)
+  const packageDirectory = join(repository, "packages", target)
+  const manifest = JSON.parse(await readFile(join(packageDirectory, "package.json"), "utf8"))
+  const binaryVersion = run(binary, ["--version"], repository).trim().split(/\s+/).at(-1)
+  if (binaryVersion !== manifest.version) {
+    throw new Error(
+      `${native.name}@${manifest.version} cannot package termctrl ${binaryVersion ?? "with no version"}`,
+    )
+  }
   const staging = await mkdtemp(join(tmpdir(), `termctrl-${target}-package-`))
   try {
     await mkdir(join(staging, "bin"), { recursive: true })
     await mkdir(output, { recursive: true })
-    await cp(join(repository, "packages", target, "package.json"), join(staging, "package.json"))
-    await cp(join(repository, "packages", target, "README.md"), join(staging, "README.md"))
+    await cp(join(packageDirectory, "package.json"), join(staging, "package.json"))
+    await cp(join(packageDirectory, "README.md"), join(staging, "README.md"))
     await cp(join(repository, "LICENSE"), join(staging, "LICENSE"))
     await cp(
       join(repository, "THIRD_PARTY_LICENSES.md"),
@@ -41,7 +49,6 @@ export async function packNativePackage(target, binary, output) {
     )
     await cp(binary, join(staging, "bin", "termctrl"))
     await chmod(join(staging, "bin", "termctrl"), 0o755)
-    run(join(staging, "bin", "termctrl"), ["--version"], staging)
     return pack(staging, output)
   } finally {
     await rm(staging, { recursive: true, force: true })

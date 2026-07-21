@@ -57,9 +57,10 @@ termctrl zoom-pane workspace --pane 1
 With no arguments, `run` starts `$SHELL` in the `workspace/main` window. The persistent tab strip
 shows selection, pane count, zoom, and output (`+`), bell (`!`), or surviving-window pane exit (`x`)
 activity. Use `tab-position NAME top|bottom` to move it live. Use `ctrl-b p` for the command palette,
-`ctrl-b l` for the last window, `ctrl-b n` for next, `ctrl-b </>` or tab dragging to reorder, and
-`ctrl-b t` to move tabs. Use `ctrl-b %` and
-`ctrl-b "` to split, arrows, `ctrl-b h/j/k`, or a mouse click to focus, `ctrl-b H/J/K/L` to resize,
+`ctrl-b c/w` to create/list windows, `ctrl-b l` for the last window, `ctrl-b n` for next,
+`ctrl-b </>` or tab dragging to reorder, and `ctrl-b t` to move tabs. Use `ctrl-b %` and
+`ctrl-b "` to split; use `ctrl-b` plus arrows or `h/j/k`, or a mouse click, to focus. Use
+`ctrl-b H/J/K/L` to resize,
 `ctrl-b z` to toggle zoom, `ctrl-b d` to detach,
 `ctrl-b q` to show stable pane IDs, and `ctrl-b ?` for help. `ctrl-b x` closes a pane, `ctrl-b &`
 closes the current window, and `ctrl-b Q` closes the workspace after `y` confirmation.
@@ -153,7 +154,8 @@ Treat `.termctrl` recordings, ANSI transcripts, screen artifacts, command argume
 - Run `termctrl status app` to inspect state and launch settings.
 - Run `termctrl list` for running sessions, or `termctrl list --all` to include retained exited and
   stale entries. Preview cleanup with `termctrl prune --dry-run`, then run `termctrl prune`.
-- MCP agents can use `list_sessions` for command/cwd discovery and `get_session_status({ name })` for complete structured status without parsing CLI output.
-- MCP agents can use `save_screen` with an optional `window` or `pane` to persist a PNG without shelling out.
+- MCP agents should use semantic workspace tools for context, windows, panes, layout, focus, movement,
+  resize, zoom, and close operations instead of sending human prefix shortcuts. Use `get_screen` or
+  `interact` for visible state and `save_screen` only for a retained PNG.
 - If a session socket path is too long, set `TERMCTRL_RUNTIME_DIR` to a short private directory under `/tmp` before starting sessions.
 - If `termctrl` is unavailable, install Terminal Control with `cargo install terminal-control` or ask the user which installed binary to use.

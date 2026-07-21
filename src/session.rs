@@ -997,6 +997,115 @@ enum Request {
     Stop,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProtocolCapability {
+    Pane,
+    Attachment,
+    Window,
+    LayoutCommand,
+    WorkspaceControl,
+}
+
+impl ProtocolCapability {
+    const fn version(self) -> u8 {
+        match self {
+            Self::Pane => CONTROL_PROTOCOL_VERSION,
+            Self::Attachment => ATTACH_PROTOCOL_VERSION,
+            Self::Window => WINDOW_PROTOCOL_VERSION,
+            Self::LayoutCommand => LAYOUT_COMMAND_PROTOCOL_VERSION,
+            Self::WorkspaceControl => WORKSPACE_CONTROL_PROTOCOL_VERSION,
+        }
+    }
+
+    const fn restart_error(self) -> &'static str {
+        match self {
+            Self::Pane => {
+                "running session predates pane layout control; restart it with the current termctrl"
+            }
+            Self::Attachment => {
+                "running workspace predates terminal reattachment; restart it with the current termctrl"
+            }
+            Self::Window => {
+                "running workspace predates named windows; restart it with the current termctrl"
+            }
+            Self::LayoutCommand => {
+                "running workspace predates pane startup commands; restart it with the current termctrl"
+            }
+            Self::WorkspaceControl => {
+                "running workspace predates runtime workspace controls; restart it with the current termctrl"
+            }
+        }
+    }
+
+    fn require(self, response: &Response) -> Result<()> {
+        if response.protocol_version < self.version() {
+            bail!(self.restart_error());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RequestRequirements {
+    capability: Option<ProtocolCapability>,
+    hold_name_lock: bool,
+}
+
+impl Request {
+    fn requirements(&self) -> RequestRequirements {
+        let capability = match self {
+            Self::Layout { command, .. } | Self::WindowLayout { command, .. }
+                if !command.is_empty() =>
+            {
+                ProtocolCapability::LayoutCommand
+            }
+            Self::WorkspaceContext { .. }
+            | Self::SetTabPosition { .. }
+            | Self::MoveWindow { .. } => ProtocolCapability::WorkspaceControl,
+            Self::Windows
+            | Self::CreateWindow { .. }
+            | Self::SelectWindow { .. }
+            | Self::RenameWindow { .. }
+            | Self::CloseWindow { .. }
+            | Self::WindowPanes { .. }
+            | Self::WindowLayout { .. }
+            | Self::ShowWindow { .. }
+            | Self::SendWindow { .. }
+            | Self::WaitWindow { .. }
+            | Self::LogsWindow { .. }
+            | Self::MovePane { .. }
+            | Self::ResizePane { .. }
+            | Self::ToggleZoom { .. } => ProtocolCapability::Window,
+            Self::Wait { pane: Some(_), .. }
+            | Self::Send { pane: Some(_), .. }
+            | Self::Show { pane: Some(_), .. }
+            | Self::Panes
+            | Self::Layout { .. }
+            | Self::FocusPane { .. }
+            | Self::ClosePane { .. } => ProtocolCapability::Pane,
+            Self::Attach { .. } | Self::ResizeAttachment { .. } => ProtocolCapability::Attachment,
+            Self::Ping
+            | Self::Status
+            | Self::Wait { pane: None, .. }
+            | Self::Send { pane: None, .. }
+            | Self::Show { pane: None, .. }
+            | Self::Logs { .. }
+            | Self::Resize { .. }
+            | Self::Mark { .. }
+            | Self::Stop => {
+                return RequestRequirements {
+                    capability: None,
+                    hold_name_lock: false,
+                };
+            }
+        };
+        RequestRequirements {
+            capability: Some(capability),
+            hold_name_lock: capability == ProtocolCapability::LayoutCommand,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Response {
     #[serde(default)]
@@ -1219,6 +1328,32 @@ pub(crate) fn show_target(
     settle: Duration,
     deadline: Duration,
 ) -> Result<Shot> {
+    show_target_response(name, target, settle, deadline)?
+        .captured
+        .ok_or_else(|| anyhow::anyhow!("session did not return a visible screen"))
+}
+
+pub(crate) fn show_target_with_status(
+    name: &str,
+    target: TerminalTarget,
+    settle: Duration,
+    deadline: Duration,
+) -> Result<(Shot, SessionStatus)> {
+    let response = show_target_response(name, target, settle, deadline)?;
+    Ok((
+        response
+            .captured
+            .context("session did not return a visible screen")?,
+        response.status.context("session did not return status")?,
+    ))
+}
+
+fn show_target_response(
+    name: &str,
+    target: TerminalTarget,
+    settle: Duration,
+    deadline: Duration,
+) -> Result<Response> {
     let operation = match target {
         TerminalTarget::Selected => Request::Show {
             settle_ms: settle.as_millis() as u64,
@@ -1236,9 +1371,7 @@ pub(crate) fn show_target(
             deadline_ms: deadline.as_millis() as u64,
         },
     };
-    request(name, operation)?
-        .captured
-        .ok_or_else(|| anyhow::anyhow!("session did not return a visible screen"))
+    request(name, operation)
 }
 
 #[doc(hidden)]
@@ -1384,31 +1517,6 @@ fn window_response(response: Response) -> Result<Vec<crate::workspace::WindowSta
         .ok_or_else(|| anyhow::anyhow!("session did not return windows"))
 }
 
-fn require_window_protocol(response: &Response) -> Result<()> {
-    if response.protocol_version < WINDOW_PROTOCOL_VERSION {
-        bail!("running workspace predates named windows; restart it with the current termctrl");
-    }
-    Ok(())
-}
-
-fn require_layout_command_protocol(response: &Response) -> Result<()> {
-    if response.protocol_version < LAYOUT_COMMAND_PROTOCOL_VERSION {
-        bail!(
-            "running workspace predates pane startup commands; restart it with the current termctrl"
-        );
-    }
-    Ok(())
-}
-
-fn require_workspace_control_protocol(response: &Response) -> Result<()> {
-    if response.protocol_version < WORKSPACE_CONTROL_PROTOCOL_VERSION {
-        bail!(
-            "running workspace predates runtime workspace controls; restart it with the current termctrl"
-        );
-    }
-    Ok(())
-}
-
 #[doc(hidden)]
 pub fn create_workspace_window(
     workspace: &str,
@@ -1454,13 +1562,6 @@ fn pane_response(response: Response) -> Result<Vec<crate::workspace::PaneStatus>
     response
         .panes
         .ok_or_else(|| anyhow::anyhow!("session did not return panes"))
-}
-
-fn require_pane_protocol(response: &Response) -> Result<()> {
-    if response.protocol_version < CONTROL_PROTOCOL_VERSION {
-        bail!("running session predates pane layout control; restart it with the current termctrl");
-    }
-    Ok(())
 }
 
 #[doc(hidden)]
@@ -1614,61 +1715,14 @@ pub fn infer_name(command: &[String]) -> Result<String> {
 
 fn request(name: &str, operation: Request) -> Result<Response> {
     validate_name(name)?;
-    let requires_layout_command = match &operation {
-        Request::Layout { command, .. } | Request::WindowLayout { command, .. } => {
-            !command.is_empty()
-        }
-        _ => false,
-    };
-    let requires_pane_protocol = matches!(
-        operation,
-        Request::Panes
-            | Request::Layout { .. }
-            | Request::FocusPane { .. }
-            | Request::ClosePane { .. }
-    );
-    let requires_window_protocol = matches!(
-        operation,
-        Request::Windows
-            | Request::WorkspaceContext { .. }
-            | Request::SetTabPosition { .. }
-            | Request::MoveWindow { .. }
-            | Request::CreateWindow { .. }
-            | Request::SelectWindow { .. }
-            | Request::RenameWindow { .. }
-            | Request::CloseWindow { .. }
-            | Request::WindowPanes { .. }
-            | Request::WindowLayout { .. }
-            | Request::ShowWindow { .. }
-            | Request::SendWindow { .. }
-            | Request::WaitWindow { .. }
-            | Request::LogsWindow { .. }
-            | Request::MovePane { .. }
-            | Request::ResizePane { .. }
-            | Request::ToggleZoom { .. }
-    );
-    let requires_workspace_control = matches!(
-        operation,
-        Request::WorkspaceContext { .. }
-            | Request::SetTabPosition { .. }
-            | Request::MoveWindow { .. }
-    );
-    let response = if requires_layout_command {
+    let requirements = operation.requirements();
+    let response = if requirements.hold_name_lock {
         implementation::request_layout_command(name, &operation)?
     } else {
         implementation::request(socket_path(name)?, &operation)?
     };
-    if requires_pane_protocol {
-        require_pane_protocol(&response)?;
-    }
-    if requires_window_protocol {
-        require_window_protocol(&response)?;
-    }
-    if requires_layout_command {
-        require_layout_command_protocol(&response)?;
-    }
-    if requires_workspace_control {
-        require_workspace_control_protocol(&response)?;
+    if let Some(capability) = requirements.capability {
+        capability.require(&response)?;
     }
     if let Some(error) = response.error {
         bail!(error);
@@ -1714,9 +1768,8 @@ mod implementation {
     use anyhow::{Context, Result, bail};
 
     use super::{
-        ATTACH_PROTOCOL_VERSION, ATTACHED_TERMINAL_ERROR, LAYOUT_COMMAND_PROTOCOL_VERSION,
-        NamedSessionStatus, PruneKind, Request, Response, Session, SessionState, TabPosition,
-        UnavailableReason,
+        ATTACHED_TERMINAL_ERROR, NamedSessionStatus, ProtocolCapability, PruneKind, Request,
+        Response, Session, SessionState, TabPosition, UnavailableReason,
     };
     use crate::shot::{self, Options};
     use crate::workspace::{Workspace, WorkspaceAttachmentOptions, WorkspaceTerminal};
@@ -2024,17 +2077,20 @@ mod implementation {
         name: &str,
         operation: &Request,
     ) -> Result<Response> {
+        let requirements = operation.requirements();
+        if !requirements.hold_name_lock {
+            bail!("request does not require the session name lock");
+        }
         let _lock = StartLock::acquire(&runtime.join(format!("{name}.lock")))?;
         let socket = runtime.join(format!("{name}.sock"));
         let response = request(socket.clone(), &Request::Ping)?;
         if let Some(error) = response.error {
             bail!(error);
         }
-        if response.protocol_version < LAYOUT_COMMAND_PROTOCOL_VERSION {
-            bail!(
-                "running workspace predates pane startup commands; restart it with the current termctrl"
-            );
-        }
+        requirements
+            .capability
+            .context("locked request has no protocol capability")?
+            .require(&response)?;
         request(socket, operation)
     }
 
@@ -2203,11 +2259,7 @@ mod implementation {
                     theme,
                 },
             )?;
-            if response.protocol_version < ATTACH_PROTOCOL_VERSION {
-                bail!(
-                    "running workspace predates terminal reattachment; restart it with the current termctrl"
-                );
-            }
+            ProtocolCapability::Attachment.require(&response)?;
             if let Some(error) = response.error {
                 return Err(super::attachment_rejection(name, &error));
             }
@@ -2679,10 +2731,7 @@ mod implementation {
             .arg("--max-bytes")
             .arg(options.max_bytes.to_string())
             .arg("--tab-position")
-            .arg(match tab_position {
-                TabPosition::Top => "top",
-                TabPosition::Bottom => "bottom",
-            });
+            .arg(tab_position.as_str());
         if options.opentui_host {
             daemon.arg("--opentui-host");
         }
@@ -2921,6 +2970,7 @@ mod implementation {
                         )?
                         .shot,
                 );
+                response.status = Some(session.status()?);
             }
             Request::Logs { ansi } => response.logs = Some(session.logs(ansi)?),
             Request::Resize {
@@ -3030,6 +3080,7 @@ mod implementation {
                     Duration::from_millis(deadline_ms),
                     |workspace| terminal.tick(workspace),
                 )?);
+                response.status = Some(workspace.status()?);
             }
             Request::Logs { ansi } => response.logs = Some(workspace.active_logs(ansi)?),
             Request::Resize { .. } => {
@@ -3096,6 +3147,7 @@ mod implementation {
                     Duration::from_millis(deadline_ms),
                     |workspace| terminal.tick(workspace),
                 )?);
+                response.status = Some(workspace.status()?);
             }
             Request::SendWindow {
                 name,
@@ -3293,6 +3345,41 @@ mod implementation {
             drop(held);
             assert!(StartLock::acquire(&path).is_ok());
             let _ = fs::remove_file(path);
+        }
+
+        #[test]
+        fn workspace_show_returns_capture_and_status_atomically() {
+            let command = [
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf READY; cat".to_owned(),
+            ];
+            let mut workspace = Workspace::start_named_with_theme(
+                "atomic-show",
+                &command,
+                None,
+                None,
+                &Options::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                TabPosition::Bottom,
+            )
+            .unwrap();
+            let mut terminal = WorkspaceTerminal::detached();
+
+            let response = respond_workspace(
+                &mut workspace,
+                Request::Show {
+                    settle_ms: 0,
+                    deadline_ms: 0,
+                    pane: None,
+                },
+                &mut terminal,
+            )
+            .unwrap();
+
+            assert!(response.captured.is_some());
+            assert!(response.status.is_some());
+            workspace.stop();
         }
 
         #[test]
@@ -3509,25 +3596,29 @@ mod tests {
         .unwrap();
         assert!(window.activity_kinds.is_empty());
         assert!(
-            require_pane_protocol(&response)
+            ProtocolCapability::Pane
+                .require(&response)
                 .unwrap_err()
                 .to_string()
                 .contains("restart it with the current termctrl")
         );
         assert!(
-            require_window_protocol(&response)
+            ProtocolCapability::Window
+                .require(&response)
                 .unwrap_err()
                 .to_string()
                 .contains("predates named windows")
         );
         assert!(
-            require_layout_command_protocol(&response)
+            ProtocolCapability::LayoutCommand
+                .require(&response)
                 .unwrap_err()
                 .to_string()
                 .contains("predates pane startup commands")
         );
         assert!(
-            require_workspace_control_protocol(&response)
+            ProtocolCapability::WorkspaceControl
+                .require(&response)
                 .unwrap_err()
                 .to_string()
                 .contains("predates runtime workspace controls")
@@ -3536,10 +3627,73 @@ mod tests {
             protocol_version: LAYOUT_COMMAND_PROTOCOL_VERSION,
             ..Response::default()
         };
-        require_window_protocol(&version_four).unwrap();
-        require_layout_command_protocol(&version_four).unwrap();
-        assert!(require_workspace_control_protocol(&version_four).is_err());
+        ProtocolCapability::Window.require(&version_four).unwrap();
+        ProtocolCapability::LayoutCommand
+            .require(&version_four)
+            .unwrap();
+        assert!(
+            ProtocolCapability::WorkspaceControl
+                .require(&version_four)
+                .is_err()
+        );
         assert_eq!(Response::default().protocol_version, 5);
+    }
+
+    #[test]
+    fn workspace_request_requirements_are_local_to_each_request() {
+        let cases = [
+            (Request::Panes, Some(ProtocolCapability::Pane), false),
+            (
+                Request::Show {
+                    settle_ms: 0,
+                    deadline_ms: 0,
+                    pane: Some(3),
+                },
+                Some(ProtocolCapability::Pane),
+                false,
+            ),
+            (
+                Request::Attach {
+                    id: 1,
+                    socket: PathBuf::from("/tmp/attach.sock"),
+                    cols: 80,
+                    rows: 24,
+                    cell_width: 9,
+                    cell_height: 18,
+                    theme: TerminalTheme::default(),
+                },
+                Some(ProtocolCapability::Attachment),
+                false,
+            ),
+            (Request::Windows, Some(ProtocolCapability::Window), false),
+            (
+                Request::Layout {
+                    columns: 2,
+                    rows: 1,
+                    command: vec!["nvim".to_owned()],
+                },
+                Some(ProtocolCapability::LayoutCommand),
+                true,
+            ),
+            (
+                Request::SetTabPosition {
+                    position: TabPosition::Top,
+                },
+                Some(ProtocolCapability::WorkspaceControl),
+                false,
+            ),
+            (Request::Status, None, false),
+        ];
+
+        for (request, capability, hold_name_lock) in cases {
+            assert_eq!(
+                request.requirements(),
+                RequestRequirements {
+                    capability,
+                    hold_name_lock,
+                }
+            );
+        }
     }
 
     #[test]

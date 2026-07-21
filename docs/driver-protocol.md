@@ -8,7 +8,20 @@ termctrl driver
 
 The driver writes a `hello` message with protocol and Terminal Control versions, then accepts typed operations: `launch`, `status`, `send`, `waitForText`, `waitForIdle`, `waitForExit`, `capture`, `logs`, `recording`, `resize`, `stop`, and `shutdown`. It is intended for clients such as the TypeScript test client, while the shell-facing flat commands remain convenient for individual workflows.
 
-## Example Exchange
+Each request has a numeric `id`, a `method`, optional `params`, and a `sessionId` for every method
+except `launch` and `shutdown`. Each line receives exactly one response or error with the same `id`:
+
+```json
+{"type":"response","id":1,"result":{"sessionId":"app"}}
+{"type":"error","id":2,"error":{"code":"REQUEST_FAILED","message":"session app has exited"}}
+```
+
+Malformed JSON or request shapes use `INVALID_REQUEST`; input read failures use `READ_ERROR` with a
+null `id`; valid operations that fail use `REQUEST_FAILED`. Adding backward-compatible optional
+fields does not change the protocol version. Breaking request, response, or lifecycle semantics must
+increment `protocolVersion`; clients reject unsupported versions rather than guessing compatibility.
+
+## Example Requests
 
 ```json
 {"type":"hello","protocolVersion":1,"terminalControlVersion":"<installed-version>"}

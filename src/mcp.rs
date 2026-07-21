@@ -26,6 +26,11 @@ struct SessionName {
 struct ScreenRequest {
     name: String,
     #[serde(default)]
+    #[schemars(
+        description = "Optional stable workspace window name; cannot be combined with pane"
+    )]
+    window: Option<String>,
+    #[serde(default)]
     #[schemars(description = "Optional workspace pane id; omit for the composed workspace")]
     pane: Option<u32>,
     #[serde(default)]
@@ -45,6 +50,11 @@ struct ScreenRequest {
 struct SendRequest {
     name: String,
     #[serde(default)]
+    #[schemars(
+        description = "Optional stable workspace window name; cannot be combined with pane"
+    )]
+    window: Option<String>,
+    #[serde(default)]
     #[schemars(description = "Optional workspace pane id; omit for the active pane")]
     pane: Option<u32>,
     #[schemars(description = "Ordered typed terminal input")]
@@ -57,6 +67,11 @@ struct SendRequest {
 #[serde(rename_all = "camelCase")]
 struct InteractRequest {
     name: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional stable workspace window name; cannot be combined with pane"
+    )]
+    window: Option<String>,
     #[serde(default)]
     #[schemars(
         description = "Optional workspace pane id; omit to target the active pane and return the composed workspace"
@@ -131,6 +146,11 @@ struct ResizeRequest {
 struct LayoutRequest {
     #[schemars(description = "Named Terminal Control workspace")]
     name: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional stable workspace window name; omit for the selected window"
+    )]
+    window: Option<String>,
     #[schemars(description = "Grid columns, either 1 or 2")]
     columns: u16,
     #[schemars(description = "Grid rows, either 1 or 2")]
@@ -144,6 +164,96 @@ struct PaneRequest {
     name: String,
     #[schemars(description = "Stable workspace pane id")]
     pane: u32,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct WindowScopeRequest {
+    name: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional stable workspace window name; omit for the selected window"
+    )]
+    window: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct WindowRequest {
+    #[schemars(description = "Named Terminal Control workspace")]
+    name: String,
+    #[schemars(description = "Exact stable workspace window name")]
+    window: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct CreateWindowRequest {
+    #[schemars(description = "Named Terminal Control workspace")]
+    name: String,
+    #[serde(default)]
+    #[schemars(description = "Optional unique window name; defaults to window-N")]
+    window: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Optional command for the first pane; defaults to $SHELL")]
+    command: Vec<String>,
+    #[serde(default)]
+    #[schemars(description = "Optional working directory; defaults to the workspace directory")]
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct RenameWindowRequest {
+    name: String,
+    window: String,
+    new_name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct MovePaneRequest {
+    name: String,
+    pane: u32,
+    window: String,
+    #[serde(default)]
+    #[schemars(description = "Stack below the target pane instead of splitting to its right")]
+    vertical: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum PaneResizeDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl From<PaneResizeDirection> for session::PaneDirection {
+    fn from(direction: PaneResizeDirection) -> Self {
+        match direction {
+            PaneResizeDirection::Left => Self::Left,
+            PaneResizeDirection::Right => Self::Right,
+            PaneResizeDirection::Up => Self::Up,
+            PaneResizeDirection::Down => Self::Down,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ResizePaneRequest {
+    name: String,
+    pane: u32,
+    direction: PaneResizeDirection,
+    #[serde(default = "default_resize_cells")]
+    #[schemars(default = "default_resize_cells")]
+    cells: u16,
+}
+
+fn default_resize_cells() -> u16 {
+    1
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -170,6 +280,7 @@ struct SessionList {
 struct PaneSummary {
     id: u32,
     active: bool,
+    visible: bool,
     state: String,
     x: u16,
     y: u16,
@@ -183,6 +294,24 @@ struct PaneSummary {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct PaneList {
     panes: Vec<PaneSummary>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct WindowSummary {
+    index: usize,
+    name: String,
+    active: bool,
+    pane_count: usize,
+    active_pane: Option<u32>,
+    zoomed_pane: Option<u32>,
+    cols: u16,
+    rows: u16,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct WindowList {
+    windows: Vec<WindowSummary>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -266,11 +395,143 @@ impl TerminalControl {
     #[tool(description = "List stable panes in a named Terminal Control workspace")]
     async fn list_panes(
         &self,
-        Parameters(SessionName { name }): Parameters<SessionName>,
+        Parameters(request): Parameters<WindowScopeRequest>,
     ) -> Result<Json<PaneList>, String> {
         blocking(move || {
-            let panes = session::panes(&name).map_err(format_error)?;
+            let panes =
+                session::panes_in_window(&request.name, request.window).map_err(format_error)?;
             Ok(Json(pane_list(panes)))
+        })
+        .await
+    }
+
+    #[tool(description = "List stable named windows in a Terminal Control workspace")]
+    async fn list_windows(
+        &self,
+        Parameters(SessionName { name }): Parameters<SessionName>,
+    ) -> Result<Json<WindowList>, String> {
+        blocking(move || {
+            session::windows(&name)
+                .map(window_list)
+                .map(Json)
+                .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(description = "Create and select a workspace window with one shell or command pane")]
+    async fn create_workspace_window(
+        &self,
+        Parameters(request): Parameters<CreateWindowRequest>,
+    ) -> Result<Json<WindowList>, String> {
+        blocking(move || {
+            session::create_workspace_window(
+                &request.name,
+                request.window,
+                request.command,
+                request.cwd.map(Into::into),
+            )
+            .map(window_list)
+            .map(Json)
+            .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(description = "Select one named workspace window for the attached terminal")]
+    async fn select_workspace_window(
+        &self,
+        Parameters(request): Parameters<WindowRequest>,
+    ) -> Result<Json<WindowList>, String> {
+        blocking(move || {
+            session::select_workspace_window(&request.name, request.window)
+                .map(window_list)
+                .map(Json)
+                .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(description = "Rename one stable workspace window without changing its panes")]
+    async fn rename_workspace_window(
+        &self,
+        Parameters(request): Parameters<RenameWindowRequest>,
+    ) -> Result<Json<WindowList>, String> {
+        blocking(move || {
+            session::rename_workspace_window(&request.name, request.window, request.new_name)
+                .map(window_list)
+                .map(Json)
+                .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Terminate one named workspace window and all its panes. Closing the final window ends the workspace"
+    )]
+    async fn close_workspace_window(
+        &self,
+        Parameters(request): Parameters<WindowRequest>,
+    ) -> Result<Json<WindowList>, String> {
+        blocking(move || {
+            session::close_workspace_window(&request.name, request.window)
+                .map(window_list)
+                .map(Json)
+                .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Move one running pane into another named window without restarting its process"
+    )]
+    async fn move_workspace_pane(
+        &self,
+        Parameters(request): Parameters<MovePaneRequest>,
+    ) -> Result<Json<WindowList>, String> {
+        blocking(move || {
+            session::move_workspace_pane(
+                &request.name,
+                request.pane,
+                request.window,
+                request.vertical,
+            )
+            .map(window_list)
+            .map(Json)
+            .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(description = "Grow one workspace pane toward a neighboring boundary")]
+    async fn resize_workspace_pane(
+        &self,
+        Parameters(request): Parameters<ResizePaneRequest>,
+    ) -> Result<Json<PaneList>, String> {
+        blocking(move || {
+            session::resize_workspace_pane(
+                &request.name,
+                request.pane,
+                request.direction.into(),
+                request.cells,
+            )
+            .map(pane_list)
+            .map(Json)
+            .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(description = "Toggle one workspace pane between split and full-window presentation")]
+    async fn toggle_workspace_zoom(
+        &self,
+        Parameters(request): Parameters<PaneRequest>,
+    ) -> Result<Json<PaneList>, String> {
+        blocking(move || {
+            session::toggle_workspace_zoom(&request.name, request.pane)
+                .map(pane_list)
+                .map(Json)
+                .map_err(format_error)
         })
         .await
     }
@@ -283,10 +544,15 @@ impl TerminalControl {
         Parameters(request): Parameters<LayoutRequest>,
     ) -> Result<Json<PaneList>, String> {
         blocking(move || {
-            session::set_workspace_layout(&request.name, request.columns, request.rows)
-                .map(pane_list)
-                .map(Json)
-                .map_err(format_error)
+            session::set_workspace_layout_in_window(
+                &request.name,
+                request.window,
+                request.columns,
+                request.rows,
+            )
+            .map(pane_list)
+            .map(Json)
+            .map_err(format_error)
         })
         .await
     }
@@ -337,10 +603,13 @@ impl TerminalControl {
         Parameters(request): Parameters<SendRequest>,
     ) -> Result<String, String> {
         blocking(move || {
-            session::send_to(
+            let target =
+                session::terminal_target(request.window, request.pane).map_err(format_error)?;
+            let input = encode_input(request.input)?;
+            session::send_to_target(
                 &request.name,
-                request.pane,
-                encode_input(request.input)?,
+                target,
+                input,
                 Duration::from_millis(request.pace_ms),
             )
             .map_err(format_error)?;
@@ -357,28 +626,26 @@ impl TerminalControl {
         Parameters(request): Parameters<InteractRequest>,
     ) -> Result<Json<Screen>, String> {
         blocking(move || {
-            session::send_to(
+            let target =
+                session::terminal_target(request.window, request.pane).map_err(format_error)?;
+            let input = encode_input(request.input)?;
+            session::send_to_target(
                 &request.name,
-                request.pane,
-                encode_input(request.input)?,
+                target.clone(),
+                input,
                 Duration::from_millis(request.pace_ms),
             )
             .map_err(format_error)?;
             if let Some(text) = request.wait_for {
-                session::wait_for(
+                session::wait_for_target(
                     &request.name,
-                    request.pane,
+                    target.clone(),
                     text,
                     Duration::from_millis(request.timeout_ms),
                 )
                 .map_err(format_error)?;
             }
-            capture(ScreenRequest {
-                name: request.name,
-                pane: request.pane,
-                settle_ms: request.settle_ms,
-                deadline_ms: request.deadline_ms,
-            })
+            capture_target(request.name, target, request.settle_ms, request.deadline_ms)
         })
         .await
         .map(Json)
@@ -427,16 +694,26 @@ pub async fn serve() -> anyhow::Result<()> {
 }
 
 fn capture(request: ScreenRequest) -> Result<Screen, String> {
-    let shot = session::show_pane(
-        &request.name,
-        request.pane,
-        Duration::from_millis(request.settle_ms),
-        Duration::from_millis(request.deadline_ms),
+    let target = session::terminal_target(request.window, request.pane).map_err(format_error)?;
+    capture_target(request.name, target, request.settle_ms, request.deadline_ms)
+}
+
+fn capture_target(
+    name: String,
+    target: session::TerminalTarget,
+    settle_ms: u64,
+    deadline_ms: u64,
+) -> Result<Screen, String> {
+    let shot = session::show_target(
+        &name,
+        target,
+        Duration::from_millis(settle_ms),
+        Duration::from_millis(deadline_ms),
     )
     .map_err(format_error)?;
-    let status = session::status(&request.name).map_err(format_error)?;
+    let status = session::status(&name).map_err(format_error)?;
     Ok(Screen {
-        name: request.name,
+        name,
         text: shot.frame.text(),
         state: state(status.state).to_owned(),
         cols: shot.frame.cols,
@@ -451,6 +728,7 @@ fn pane_list(panes: Vec<session::PaneStatus>) -> PaneList {
             .map(|pane| PaneSummary {
                 id: pane.id,
                 active: pane.active,
+                visible: pane.visible,
                 state: state(pane.state).to_owned(),
                 x: pane.x,
                 y: pane.y,
@@ -459,6 +737,24 @@ fn pane_list(panes: Vec<session::PaneStatus>) -> PaneList {
                 title: pane.title,
                 command: pane.command,
                 cwd: path_string(&pane.cwd),
+            })
+            .collect(),
+    }
+}
+
+fn window_list(windows: Vec<session::WindowStatus>) -> WindowList {
+    WindowList {
+        windows: windows
+            .into_iter()
+            .map(|window| WindowSummary {
+                index: window.index,
+                name: window.name,
+                active: window.active,
+                pane_count: window.pane_count,
+                active_pane: window.active_pane,
+                zoomed_pane: window.zoomed_pane,
+                cols: window.cols,
+                rows: window.rows,
             })
             .collect(),
     }
@@ -578,6 +874,7 @@ mod tests {
         .unwrap();
         let interact: InteractRequest = serde_json::from_value(serde_json::json!({
             "name": "editor",
+            "window": "tests",
             "input": []
         }))
         .unwrap();
@@ -586,6 +883,8 @@ mod tests {
         assert_eq!(screen.deadline_ms, 0);
         assert_eq!(interact.settle_ms, 0);
         assert_eq!(interact.deadline_ms, 0);
+        assert_eq!(interact.window.as_deref(), Some("tests"));
+        assert!(session::terminal_target(Some("tests".to_owned()), Some(3)).is_err());
     }
 
     #[test]
@@ -600,16 +899,24 @@ mod tests {
             names,
             [
                 "close_workspace_pane",
+                "close_workspace_window",
+                "create_workspace_window",
                 "focus_workspace_pane",
                 "get_screen",
                 "get_session_status",
                 "interact",
                 "list_panes",
                 "list_sessions",
+                "list_windows",
+                "move_workspace_pane",
+                "rename_workspace_window",
                 "resize_session",
+                "resize_workspace_pane",
+                "select_workspace_window",
                 "send_input",
                 "set_workspace_layout",
                 "stop_session",
+                "toggle_workspace_zoom",
             ]
         );
         assert!(tools.iter().all(|tool| {
@@ -634,9 +941,14 @@ mod tests {
             .iter()
             .find(|tool| tool.name.as_ref() == "list_panes")
             .unwrap();
+        let windows = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "list_windows")
+            .unwrap();
         let list_schema = serde_json::to_value(list.output_schema.as_ref().unwrap()).unwrap();
         let status_schema = serde_json::to_value(status.output_schema.as_ref().unwrap()).unwrap();
         let pane_schema = serde_json::to_value(panes.output_schema.as_ref().unwrap()).unwrap();
+        let window_schema = serde_json::to_value(windows.output_schema.as_ref().unwrap()).unwrap();
 
         let summary_properties = &list_schema["$defs"]["SessionSummary"]["properties"];
         assert!(summary_properties.get("command").is_some());
@@ -663,9 +975,22 @@ mod tests {
         }
         let properties = &pane_schema["$defs"]["PaneSummary"]["properties"];
         for field in [
-            "id", "active", "state", "x", "y", "cols", "rows", "title", "command", "cwd",
+            "id", "active", "visible", "state", "x", "y", "cols", "rows", "title", "command", "cwd",
         ] {
             assert!(properties.get(field).is_some(), "missing pane {field}");
+        }
+        let properties = &window_schema["$defs"]["WindowSummary"]["properties"];
+        for field in [
+            "index",
+            "name",
+            "active",
+            "paneCount",
+            "activePane",
+            "zoomedPane",
+            "cols",
+            "rows",
+        ] {
+            assert!(properties.get(field).is_some(), "missing window {field}");
         }
     }
 

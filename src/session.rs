@@ -14,13 +14,15 @@ use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 
-pub use crate::workspace::PaneStatus;
+pub use crate::workspace::{Direction as PaneDirection, PaneStatus, WindowStatus};
 
 const OUTPUT_QUEUE: usize = 64;
 const OUTPUT_BATCH: usize = OUTPUT_QUEUE;
 const OUTPUT_CHUNK: usize = 1024;
 const CONTROL_PROTOCOL_VERSION: u8 = 1;
 const ATTACH_PROTOCOL_VERSION: u8 = 2;
+const WINDOW_PROTOCOL_VERSION: u8 = 3;
+const CURRENT_PROTOCOL_VERSION: u8 = WINDOW_PROTOCOL_VERSION;
 
 struct Output {
     at_ms: u64,
@@ -47,6 +49,8 @@ pub struct Session {
     output_closed: bool,
     stopped: bool,
     exit: Option<ProcessExit>,
+    exit_drain_started: Option<Instant>,
+    exit_ready: bool,
     last_output: Option<Instant>,
     recording: Option<recording::Writer>,
     cols: u16,
@@ -258,6 +262,8 @@ impl Session {
             output_closed: false,
             stopped: false,
             exit: None,
+            exit_drain_started: None,
+            exit_ready: false,
             last_output: None,
             recording,
             cols: options.cols,
@@ -321,6 +327,9 @@ impl Session {
     }
 
     fn write_input(&mut self, input: &[u8]) -> Result<()> {
+        if self.exit.is_some() || self.stopped {
+            bail!("session command has exited");
+        }
         self.host.send(input)?;
         if let Some(recording) = &mut self.recording {
             recording.input(InputOrigin::Client, input)?;
@@ -427,8 +436,9 @@ impl Session {
     /// Inspect session lifecycle, geometry, and whether a visible frame is available.
     pub fn status(&mut self) -> Result<SessionStatus> {
         self.consume_batch()?;
+        self.has_exited()?;
         Ok(SessionStatus {
-            state: if self.has_exited()? || self.stopped {
+            state: if self.exit.is_some() || self.stopped {
                 SessionState::Exited
             } else {
                 SessionState::Running
@@ -518,12 +528,16 @@ impl Session {
         self.terminal.frame()
     }
 
+    pub(crate) fn frame_revision(&self) -> u64 {
+        self.terminal.revision()
+    }
+
     pub(crate) fn is_exited(&mut self) -> Result<bool> {
         self.has_exited()
     }
 
     pub(crate) fn exit_observed(&self) -> bool {
-        self.exit.is_some()
+        self.exit_ready
     }
 
     pub(crate) fn idle_for(&self, started: Instant) -> Duration {
@@ -585,15 +599,41 @@ impl Session {
     }
 
     fn has_exited(&mut self) -> Result<bool> {
-        if self.exit.is_some() {
-            return Ok(true);
-        }
-        if let Some(status) = self.child.try_wait().context("poll session command")? {
+        if self.exit.is_none()
+            && let Some(status) = self.child.try_wait().context("poll session command")?
+        {
             self.exit = Some(status.into());
-            self.finish_exited_output()?;
+            self.exit_drain_started = Some(Instant::now());
+        }
+        if self.exit.is_none() {
+            return Ok(false);
+        }
+        self.consume_batch()?;
+        if self.output_closed {
+            #[cfg(unix)]
+            if let Some(process_group) = self.process_group.take() {
+                unsafe {
+                    libc::kill(-process_group, libc::SIGKILL);
+                }
+            }
+            self.exit_ready = true;
             return Ok(true);
         }
-        Ok(false)
+        let elapsed = self
+            .exit_drain_started
+            .map_or(Duration::ZERO, |at| at.elapsed());
+        #[cfg(unix)]
+        if elapsed >= Duration::from_millis(50)
+            && let Some(process_group) = self.process_group.take()
+        {
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+        }
+        if elapsed >= Duration::from_secs(1) {
+            self.exit_ready = true;
+        }
+        Ok(self.exit_ready)
     }
 
     fn terminate(&mut self) {
@@ -658,6 +698,7 @@ impl Session {
         }
         self.output_closed = true;
         self.stopped = true;
+        self.exit_ready = self.exit.is_some();
     }
 
     fn finish_exited_output(&mut self) -> Result<()> {
@@ -699,6 +740,7 @@ impl Session {
         if self.output_closed {
             self.process_group.take();
         }
+        self.exit_ready = true;
         Ok(())
     }
 
@@ -805,6 +847,62 @@ enum Request {
     Mark {
         name: String,
     },
+    Windows,
+    CreateWindow {
+        name: Option<String>,
+        command: Vec<String>,
+        cwd: Option<PathBuf>,
+    },
+    SelectWindow {
+        name: String,
+    },
+    RenameWindow {
+        name: String,
+        new_name: String,
+    },
+    CloseWindow {
+        name: String,
+    },
+    WindowPanes {
+        name: String,
+    },
+    WindowLayout {
+        name: String,
+        columns: u16,
+        rows: u16,
+    },
+    ShowWindow {
+        name: String,
+        settle_ms: u64,
+        deadline_ms: u64,
+    },
+    SendWindow {
+        name: String,
+        input: Vec<Vec<u8>>,
+        pace_ms: u64,
+    },
+    WaitWindow {
+        name: String,
+        text: String,
+        timeout_ms: u64,
+    },
+    LogsWindow {
+        name: String,
+        ansi: bool,
+    },
+    MovePane {
+        pane: crate::workspace::PaneId,
+        window: String,
+        vertical: bool,
+    },
+    ResizePane {
+        pane: crate::workspace::PaneId,
+        direction: PaneDirection,
+        cells: u16,
+    },
+    ToggleZoom {
+        pane: crate::workspace::PaneId,
+    },
     Panes,
     Layout {
         columns: u16,
@@ -845,17 +943,20 @@ struct Response {
     logs: Option<Vec<u8>>,
     #[serde(default)]
     panes: Option<Vec<crate::workspace::PaneStatus>>,
+    #[serde(default)]
+    windows: Option<Vec<crate::workspace::WindowStatus>>,
 }
 
 impl Default for Response {
     fn default() -> Self {
         Self {
-            protocol_version: ATTACH_PROTOCOL_VERSION,
+            protocol_version: CURRENT_PROTOCOL_VERSION,
             error: None,
             captured: None,
             status: None,
             logs: None,
             panes: None,
+            windows: None,
         }
     }
 }
@@ -895,7 +996,28 @@ pub fn restart(
 
 #[doc(hidden)]
 pub fn wait(name: &str, text: String, timeout: Duration) -> Result<()> {
-    wait_for(name, None, text, timeout)
+    wait_for_target(name, TerminalTarget::Selected, text, timeout)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum TerminalTarget {
+    Selected,
+    Window(String),
+    Pane(crate::workspace::PaneId),
+}
+
+pub(crate) fn terminal_target(
+    window: Option<String>,
+    pane: Option<crate::workspace::PaneId>,
+) -> Result<TerminalTarget> {
+    match (window, pane) {
+        (Some(_), Some(_)) => {
+            bail!("window and pane cannot be combined; pane ids are already globally stable")
+        }
+        (Some(window), None) => Ok(TerminalTarget::Window(window)),
+        (None, Some(pane)) => Ok(TerminalTarget::Pane(pane)),
+        (None, None) => Ok(TerminalTarget::Selected),
+    }
 }
 
 #[doc(hidden)]
@@ -905,15 +1027,46 @@ pub fn wait_for(
     text: String,
     timeout: Duration,
 ) -> Result<()> {
-    request(
-        name,
-        Request::Wait {
+    let target = pane.map_or(TerminalTarget::Selected, TerminalTarget::Pane);
+    wait_for_target(name, target, text, timeout)
+}
+
+pub(crate) fn wait_for_target(
+    name: &str,
+    target: TerminalTarget,
+    text: String,
+    timeout: Duration,
+) -> Result<()> {
+    let operation = match target {
+        TerminalTarget::Selected => Request::Wait {
             text,
             timeout_ms: timeout.as_millis() as u64,
-            pane,
+            pane: None,
         },
-    )?;
+        TerminalTarget::Pane(pane) => Request::Wait {
+            text,
+            timeout_ms: timeout.as_millis() as u64,
+            pane: Some(pane),
+        },
+        TerminalTarget::Window(name) => Request::WaitWindow {
+            name,
+            text,
+            timeout_ms: timeout.as_millis() as u64,
+        },
+    };
+    request(name, operation)?;
     Ok(())
+}
+
+#[doc(hidden)]
+pub fn wait_for_in(
+    name: &str,
+    window: Option<String>,
+    pane: Option<crate::workspace::PaneId>,
+    text: String,
+    timeout: Duration,
+) -> Result<()> {
+    wait_for_target(name, terminal_target(window, pane)?, text, timeout)
 }
 
 #[doc(hidden)]
@@ -925,7 +1078,7 @@ pub fn status(name: &str) -> Result<SessionStatus> {
 
 #[doc(hidden)]
 pub fn send(name: &str, input: Vec<Vec<u8>>, pace: Duration) -> Result<()> {
-    send_to(name, None, input, pace)
+    send_to_target(name, TerminalTarget::Selected, input, pace)
 }
 
 #[doc(hidden)]
@@ -935,20 +1088,51 @@ pub fn send_to(
     input: Vec<Vec<u8>>,
     pace: Duration,
 ) -> Result<()> {
-    request(
-        name,
-        Request::Send {
+    let target = pane.map_or(TerminalTarget::Selected, TerminalTarget::Pane);
+    send_to_target(name, target, input, pace)
+}
+
+pub(crate) fn send_to_target(
+    name: &str,
+    target: TerminalTarget,
+    input: Vec<Vec<u8>>,
+    pace: Duration,
+) -> Result<()> {
+    let operation = match target {
+        TerminalTarget::Selected => Request::Send {
             input,
             pace_ms: pace.as_millis() as u64,
-            pane,
+            pane: None,
         },
-    )?;
+        TerminalTarget::Pane(pane) => Request::Send {
+            input,
+            pace_ms: pace.as_millis() as u64,
+            pane: Some(pane),
+        },
+        TerminalTarget::Window(name) => Request::SendWindow {
+            name,
+            input,
+            pace_ms: pace.as_millis() as u64,
+        },
+    };
+    request(name, operation)?;
     Ok(())
 }
 
 #[doc(hidden)]
+pub fn send_to_in(
+    name: &str,
+    window: Option<String>,
+    pane: Option<crate::workspace::PaneId>,
+    input: Vec<Vec<u8>>,
+    pace: Duration,
+) -> Result<()> {
+    send_to_target(name, terminal_target(window, pane)?, input, pace)
+}
+
+#[doc(hidden)]
 pub fn show(name: &str, settle: Duration, deadline: Duration) -> Result<Shot> {
-    show_pane(name, None, settle, deadline)
+    show_target(name, TerminalTarget::Selected, settle, deadline)
 }
 
 #[doc(hidden)]
@@ -958,21 +1142,191 @@ pub fn show_pane(
     settle: Duration,
     deadline: Duration,
 ) -> Result<Shot> {
-    request(
-        name,
-        Request::Show {
+    let target = pane.map_or(TerminalTarget::Selected, TerminalTarget::Pane);
+    show_target(name, target, settle, deadline)
+}
+
+pub(crate) fn show_target(
+    name: &str,
+    target: TerminalTarget,
+    settle: Duration,
+    deadline: Duration,
+) -> Result<Shot> {
+    let operation = match target {
+        TerminalTarget::Selected => Request::Show {
             settle_ms: settle.as_millis() as u64,
             deadline_ms: deadline.as_millis() as u64,
-            pane,
+            pane: None,
         },
-    )?
-    .captured
-    .ok_or_else(|| anyhow::anyhow!("session did not return a visible screen"))
+        TerminalTarget::Pane(pane) => Request::Show {
+            settle_ms: settle.as_millis() as u64,
+            deadline_ms: deadline.as_millis() as u64,
+            pane: Some(pane),
+        },
+        TerminalTarget::Window(name) => Request::ShowWindow {
+            name,
+            settle_ms: settle.as_millis() as u64,
+            deadline_ms: deadline.as_millis() as u64,
+        },
+    };
+    request(name, operation)?
+        .captured
+        .ok_or_else(|| anyhow::anyhow!("session did not return a visible screen"))
+}
+
+#[doc(hidden)]
+pub fn show_in(
+    name: &str,
+    window: Option<String>,
+    pane: Option<crate::workspace::PaneId>,
+    settle: Duration,
+    deadline: Duration,
+) -> Result<Shot> {
+    show_target(name, terminal_target(window, pane)?, settle, deadline)
 }
 
 #[doc(hidden)]
 pub fn panes(name: &str) -> Result<Vec<crate::workspace::PaneStatus>> {
     pane_response(request(name, Request::Panes)?)
+}
+
+#[doc(hidden)]
+pub fn windows(name: &str) -> Result<Vec<crate::workspace::WindowStatus>> {
+    window_response(request(name, Request::Windows)?)
+}
+
+#[doc(hidden)]
+pub fn panes_in_window(
+    workspace: &str,
+    window: Option<String>,
+) -> Result<Vec<crate::workspace::PaneStatus>> {
+    match window {
+        Some(name) => pane_response(request(workspace, Request::WindowPanes { name })?),
+        None => panes(workspace),
+    }
+}
+
+#[doc(hidden)]
+pub fn set_workspace_layout_in_window(
+    workspace: &str,
+    window: Option<String>,
+    columns: u16,
+    rows: u16,
+) -> Result<Vec<crate::workspace::PaneStatus>> {
+    match window {
+        Some(name) => pane_response(request(
+            workspace,
+            Request::WindowLayout {
+                name,
+                columns,
+                rows,
+            },
+        )?),
+        None => set_workspace_layout(workspace, columns, rows),
+    }
+}
+
+#[doc(hidden)]
+pub fn logs_window(workspace: &str, window: String, ansi: bool) -> Result<Vec<u8>> {
+    request(workspace, Request::LogsWindow { name: window, ansi })?
+        .logs
+        .ok_or_else(|| anyhow::anyhow!("session did not return logs"))
+}
+
+#[doc(hidden)]
+pub fn move_workspace_pane(
+    workspace: &str,
+    pane: crate::workspace::PaneId,
+    window: String,
+    vertical: bool,
+) -> Result<Vec<crate::workspace::WindowStatus>> {
+    window_response(request(
+        workspace,
+        Request::MovePane {
+            pane,
+            window,
+            vertical,
+        },
+    )?)
+}
+
+#[doc(hidden)]
+pub fn resize_workspace_pane(
+    workspace: &str,
+    pane: crate::workspace::PaneId,
+    direction: PaneDirection,
+    cells: u16,
+) -> Result<Vec<crate::workspace::PaneStatus>> {
+    pane_response(request(
+        workspace,
+        Request::ResizePane {
+            pane,
+            direction,
+            cells,
+        },
+    )?)
+}
+
+#[doc(hidden)]
+pub fn toggle_workspace_zoom(
+    workspace: &str,
+    pane: crate::workspace::PaneId,
+) -> Result<Vec<crate::workspace::PaneStatus>> {
+    pane_response(request(workspace, Request::ToggleZoom { pane })?)
+}
+
+fn window_response(response: Response) -> Result<Vec<crate::workspace::WindowStatus>> {
+    response
+        .windows
+        .ok_or_else(|| anyhow::anyhow!("session did not return windows"))
+}
+
+fn require_window_protocol(response: &Response) -> Result<()> {
+    if response.protocol_version < WINDOW_PROTOCOL_VERSION {
+        bail!("running workspace predates named windows; restart it with the current termctrl");
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn create_workspace_window(
+    workspace: &str,
+    name: Option<String>,
+    command: Vec<String>,
+    cwd: Option<PathBuf>,
+) -> Result<Vec<crate::workspace::WindowStatus>> {
+    window_response(request(
+        workspace,
+        Request::CreateWindow { name, command, cwd },
+    )?)
+}
+
+#[doc(hidden)]
+pub fn select_workspace_window(
+    workspace: &str,
+    name: String,
+) -> Result<Vec<crate::workspace::WindowStatus>> {
+    window_response(request(workspace, Request::SelectWindow { name })?)
+}
+
+#[doc(hidden)]
+pub fn rename_workspace_window(
+    workspace: &str,
+    name: String,
+    new_name: String,
+) -> Result<Vec<crate::workspace::WindowStatus>> {
+    window_response(request(
+        workspace,
+        Request::RenameWindow { name, new_name },
+    )?)
+}
+
+#[doc(hidden)]
+pub fn close_workspace_window(
+    workspace: &str,
+    name: String,
+) -> Result<Vec<crate::workspace::WindowStatus>> {
+    window_response(request(workspace, Request::CloseWindow { name })?)
 }
 
 fn pane_response(response: Response) -> Result<Vec<crate::workspace::PaneStatus>> {
@@ -1128,9 +1482,29 @@ fn request(name: &str, request: Request) -> Result<Response> {
             | Request::FocusPane { .. }
             | Request::ClosePane { .. }
     );
+    let requires_window_protocol = matches!(
+        request,
+        Request::Windows
+            | Request::CreateWindow { .. }
+            | Request::SelectWindow { .. }
+            | Request::RenameWindow { .. }
+            | Request::CloseWindow { .. }
+            | Request::WindowPanes { .. }
+            | Request::WindowLayout { .. }
+            | Request::ShowWindow { .. }
+            | Request::SendWindow { .. }
+            | Request::WaitWindow { .. }
+            | Request::LogsWindow { .. }
+            | Request::MovePane { .. }
+            | Request::ResizePane { .. }
+            | Request::ToggleZoom { .. }
+    );
     let response = implementation::request(socket_path(name)?, &request)?;
     if requires_pane_protocol {
         require_pane_protocol(&response)?;
+    }
+    if requires_window_protocol {
+        require_window_protocol(&response)?;
     }
     if let Some(error) = response.error {
         bail!(error);
@@ -1138,12 +1512,15 @@ fn request(name: &str, request: Request) -> Result<Response> {
     Ok(response)
 }
 
+pub(crate) fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_' | '.'))
-    {
+    if !valid_name(name) {
         bail!("session names may contain only ASCII letters, digits, '.', '-', and '_'");
     }
     Ok(())
@@ -1158,7 +1535,8 @@ mod implementation {
     use std::fs;
     use std::fs::OpenOptions;
     use std::io::{ErrorKind, Read, Write};
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::os::unix::process::CommandExt;
@@ -1181,13 +1559,17 @@ mod implementation {
     const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
     const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_CONTROL_DURATION_MS: u64 = 10 * 60 * 1000;
+    const ATTACHED_WORKSPACE_POLL: Duration = Duration::from_millis(16);
     const DETACHED_WORKSPACE_POLL: Duration = Duration::from_millis(50);
     const DETACHED_WORKSPACE_ACTIVE: Duration = Duration::from_millis(500);
     static NEXT_ATTACHMENT_ID: AtomicU64 = AtomicU64::new(1);
 
     struct StartLock(fs::File);
 
-    struct AttachmentWriter(UnixStream);
+    struct AttachmentWriter {
+        stream: UnixStream,
+        cleanup: Option<Box<dyn FnOnce() + Send>>,
+    }
 
     struct AttachmentEndpoint {
         id: u64,
@@ -1247,17 +1629,20 @@ mod implementation {
 
     impl Write for AttachmentWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.write(bytes)
+            self.stream.write(bytes)
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            self.0.flush()
+            self.stream.flush()
         }
     }
 
     impl Drop for AttachmentWriter {
         fn drop(&mut self) {
-            let _ = self.0.shutdown(std::net::Shutdown::Write);
+            let _ = self.stream.shutdown(std::net::Shutdown::Write);
+            if let Some(cleanup) = self.cleanup.take() {
+                cleanup();
+            }
         }
     }
 
@@ -1453,10 +1838,26 @@ mod implementation {
     }
 
     pub fn request(socket: PathBuf, request: &Request) -> Result<Response> {
+        request_with_timeout(socket, request, None)
+    }
+
+    fn request_with_timeout(
+        socket: PathBuf,
+        request: &Request,
+        timeout: Option<Duration>,
+    ) -> Result<Response> {
         ensure_socket_path(&socket)?;
-        let mut stream = UnixStream::connect(&socket).with_context(|| {
-            format!("connect to session at {}; is it running?", socket.display())
-        })?;
+        let mut stream = match timeout {
+            Some(timeout) => connect_with_timeout(&socket, timeout),
+            None => UnixStream::connect(&socket),
+        }
+        .with_context(|| format!("connect to session at {}; is it running?", socket.display()))?;
+        stream
+            .set_read_timeout(timeout)
+            .context("bound session response")?;
+        stream
+            .set_write_timeout(timeout)
+            .context("bound session request")?;
         let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut stream);
         serde_json::to_writer(&mut writer, request).context("write session request")?;
         writer.flush().context("flush session request")?;
@@ -1466,6 +1867,113 @@ mod implementation {
             .context("finish session request")?;
         serde_json::from_reader(std::io::BufReader::with_capacity(64 * 1024, stream))
             .context("read session response")
+    }
+
+    fn connect_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+        let path = path.as_os_str().as_bytes();
+        if path.contains(&0) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "Unix socket path contains a null byte",
+            ));
+        }
+        let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+        if path.len() >= address.sun_path.len() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "Unix socket path is too long",
+            ));
+        }
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (target, byte) in address.sun_path.iter_mut().zip(path.iter().copied()) {
+            *target = byte as libc::c_char;
+        }
+        let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1;
+        #[cfg(any(
+            target_os = "aix",
+            target_os = "freebsd",
+            target_os = "haiku",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        {
+            address.sun_len = u8::try_from(address_len).unwrap_or(u8::MAX);
+        }
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let connected = unsafe {
+            libc::connect(
+                fd.as_raw_fd(),
+                (&raw const address).cast(),
+                address_len as libc::socklen_t,
+            )
+        };
+        if connected < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINPROGRESS) {
+                return Err(error);
+            }
+            let deadline = Instant::now() + timeout;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "timed out connecting to Unix socket",
+                    ));
+                }
+                let mut poll = libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+                let ready = unsafe { libc::poll(&mut poll, 1, timeout_ms.max(1)) };
+                if ready > 0 {
+                    break;
+                }
+                if ready == 0 {
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "timed out connecting to Unix socket",
+                    ));
+                }
+                if std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            let mut socket_error = 0;
+            let mut error_len = std::mem::size_of_val(&socket_error) as libc::socklen_t;
+            if unsafe {
+                libc::getsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    (&raw mut socket_error).cast(),
+                    &mut error_len,
+                )
+            } < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if socket_error != 0 {
+                return Err(std::io::Error::from_raw_os_error(socket_error));
+            }
+        }
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(UnixStream::from(fd))
     }
 
     pub fn attach(socket: PathBuf, name: &str, options: &Options) -> Result<()> {
@@ -1481,16 +1989,6 @@ mod implementation {
         };
         ensure_socket_path(&socket)?;
         require_attachment_terminal()?;
-        let response = request(socket.clone(), &Request::Ping)?;
-        if response.protocol_version < ATTACH_PROTOCOL_VERSION {
-            bail!(
-                "running workspace predates terminal reattachment; restart it with the current termctrl"
-            );
-        }
-        if let Some(error) = response.error {
-            bail!(error);
-        }
-        mark("ping");
         let raw = RawMode::enter()?;
         let (theme, retained_input) = crate::terminal_theme::discover();
         mark("theme");
@@ -1531,6 +2029,7 @@ mod implementation {
             let resize_flag = Arc::clone(&resize_running);
             let resize_socket = socket.clone();
             let mut last_size = (options.cols, options.rows);
+            let mut retry_after = Instant::now();
             let cell_width = options.cell_width;
             let cell_height = options.cell_height;
             let resize = thread::spawn(move || {
@@ -1539,8 +2038,9 @@ mod implementation {
                         && cols > 0
                         && rows > 0
                         && (cols, rows) != last_size
+                        && Instant::now() >= retry_after
                     {
-                        let resized = request(
+                        match request_with_timeout(
                             resize_socket.clone(),
                             &Request::ResizeAttachment {
                                 id: endpoint.id,
@@ -1549,10 +2049,15 @@ mod implementation {
                                 cell_width,
                                 cell_height,
                             },
-                        )
-                        .is_ok_and(|response| response.error.is_none());
-                        if resized {
-                            last_size = (cols, rows);
+                            Some(Duration::from_millis(250)),
+                        ) {
+                            Ok(response) if response.error.is_none() => {
+                                last_size = (cols, rows);
+                            }
+                            Ok(_) => break,
+                            Err(_) => {
+                                retry_after = Instant::now() + Duration::from_secs(1);
+                            }
                         }
                     }
                     thread::sleep(Duration::from_millis(50));
@@ -1778,7 +2283,9 @@ mod implementation {
                 if !running || terminal.finished() {
                     break;
                 }
-                if terminal.is_attached() || Instant::now() < active_until {
+                if terminal.is_attached() {
+                    thread::sleep(ATTACHED_WORKSPACE_POLL);
+                } else if Instant::now() < active_until {
                     thread::sleep(Duration::from_millis(5));
                 } else {
                     wait_for_workspace_request(&listener, DETACHED_WORKSPACE_POLL)?;
@@ -2140,11 +2647,26 @@ mod implementation {
                 )?;
             }
             Request::Mark { name } => session.mark(&name)?,
+            Request::Windows
+            | Request::CreateWindow { .. }
+            | Request::SelectWindow { .. }
+            | Request::RenameWindow { .. }
+            | Request::CloseWindow { .. }
+            | Request::WindowPanes { .. }
+            | Request::WindowLayout { .. }
+            | Request::ShowWindow { .. }
+            | Request::SendWindow { .. }
+            | Request::WaitWindow { .. }
+            | Request::LogsWindow { .. }
+            | Request::MovePane { .. } => {
+                bail!("only workspaces support named windows")
+            }
             Request::Panes => {
                 let status = session.status()?;
                 response.panes = Some(vec![crate::workspace::PaneStatus {
                     id: 0,
                     active: true,
+                    visible: true,
                     state: status.state,
                     x: 0,
                     y: 0,
@@ -2158,6 +2680,8 @@ mod implementation {
             Request::Layout { .. }
             | Request::FocusPane { .. }
             | Request::ClosePane { .. }
+            | Request::ResizePane { .. }
+            | Request::ToggleZoom { .. }
             | Request::Attach { .. }
             | Request::ResizeAttachment { .. } => {
                 bail!("only attached workspaces support pane layout control")
@@ -2218,14 +2742,108 @@ mod implementation {
                 bail!("visible workspace dimensions are owned by the attached terminal")
             }
             Request::Mark { name } => workspace.mark_recording(&name)?,
-            Request::Panes => response.panes = Some(workspace.panes()?),
+            Request::Windows => response.windows = Some(workspace.windows()),
+            Request::CreateWindow { name, command, cwd } => {
+                terminal.tick(workspace)?;
+                workspace.create_window(name.as_deref(), &command, cwd.as_deref())?;
+                response.windows = Some(workspace.windows());
+            }
+            Request::SelectWindow { name } => {
+                terminal.tick(workspace)?;
+                workspace.select_window(&name)?;
+                response.windows = Some(workspace.windows());
+            }
+            Request::RenameWindow { name, new_name } => {
+                workspace.rename_window(&name, &new_name)?;
+                response.windows = Some(workspace.windows());
+            }
+            Request::CloseWindow { name } => {
+                terminal.tick(workspace)?;
+                workspace.close_window(&name)?;
+                response.windows = Some(workspace.windows());
+            }
+            Request::WindowPanes { name } => {
+                response.panes = Some(workspace.panes_in(Some(&name))?);
+            }
+            Request::WindowLayout {
+                name,
+                columns,
+                rows,
+            } => {
+                terminal.tick(workspace)?;
+                response.panes = Some(workspace.set_grid_in(Some(&name), columns, rows)?);
+            }
+            Request::ShowWindow {
+                name,
+                settle_ms,
+                deadline_ms,
+            } => {
+                require_control_duration("capture deadline", deadline_ms)?;
+                response.captured = Some(workspace.capture_window(
+                    &name,
+                    Duration::from_millis(settle_ms),
+                    Duration::from_millis(deadline_ms),
+                    |workspace| terminal.tick(workspace),
+                )?);
+            }
+            Request::SendWindow {
+                name,
+                input,
+                pace_ms,
+            } => {
+                let duration = pace_ms.saturating_mul(input.len().saturating_sub(1) as u64);
+                require_control_duration("paced input", duration)?;
+                workspace.send_all_in(
+                    &name,
+                    &input,
+                    Duration::from_millis(pace_ms),
+                    |workspace| terminal.tick(workspace),
+                )?;
+            }
+            Request::WaitWindow {
+                name,
+                text,
+                timeout_ms,
+            } => {
+                require_control_duration("wait timeout", timeout_ms)?;
+                workspace.wait_for_text_in(
+                    &name,
+                    &text,
+                    Duration::from_millis(timeout_ms),
+                    |workspace| terminal.tick(workspace),
+                )?;
+            }
+            Request::LogsWindow { name, ansi } => {
+                response.logs = Some(workspace.logs_in(&name, ansi)?);
+            }
+            Request::MovePane {
+                pane,
+                window,
+                vertical,
+            } => {
+                terminal.tick(workspace)?;
+                workspace.move_pane(pane, &window, vertical)?;
+                response.windows = Some(workspace.windows());
+            }
+            Request::ResizePane {
+                pane,
+                direction,
+                cells,
+            } => {
+                terminal.tick(workspace)?;
+                response.panes = Some(workspace.resize_pane(pane, direction, cells)?);
+            }
+            Request::ToggleZoom { pane } => {
+                terminal.tick(workspace)?;
+                response.panes = Some(workspace.toggle_zoom_pane(pane)?);
+            }
+            Request::Panes => response.panes = Some(workspace.panes_in(None)?),
             Request::Layout { columns, rows } => {
                 terminal.tick(workspace)?;
                 if workspace.is_empty() {
                     bail!("workspace has ended");
                 }
-                workspace.set_grid(columns, rows)?;
-                response.panes = Some(workspace.panes()?);
+                response.panes = Some(workspace.set_grid_in(None, columns, rows)?);
             }
             Request::FocusPane { pane } => {
                 terminal.tick(workspace)?;
@@ -2233,7 +2851,7 @@ mod implementation {
                     bail!("workspace has ended");
                 }
                 workspace.focus_pane(pane)?;
-                response.panes = Some(workspace.panes()?);
+                response.panes = Some(workspace.panes_in(None)?);
             }
             Request::ClosePane { pane } => {
                 terminal.tick(workspace)?;
@@ -2241,7 +2859,7 @@ mod implementation {
                     bail!("workspace has ended");
                 }
                 workspace.close_pane(pane)?;
-                response.panes = Some(workspace.panes()?);
+                response.panes = Some(workspace.panes_in(None)?);
             }
             Request::Attach {
                 id,
@@ -2280,8 +2898,11 @@ mod implementation {
                 let mut reader = stream
                     .try_clone()
                     .context("clone workspace attachment reader")?;
+                let shutdown = stream
+                    .try_clone()
+                    .context("clone workspace attachment shutdown handle")?;
                 let (send, receive) = std::sync::mpsc::sync_channel(64);
-                thread::spawn(move || {
+                let reader = thread::spawn(move || {
                     let mut bytes = [0_u8; 1024];
                     loop {
                         match reader.read(&mut bytes) {
@@ -2296,10 +2917,17 @@ mod implementation {
                         }
                     }
                 });
+                let cleanup = Box::new(move || {
+                    let _ = shutdown.shutdown(std::net::Shutdown::Both);
+                    let _ = reader.join();
+                });
                 terminal.attach(
                     workspace,
                     receive,
-                    Box::new(AttachmentWriter(stream)),
+                    Box::new(AttachmentWriter {
+                        stream,
+                        cleanup: Some(cleanup),
+                    }),
                     WorkspaceAttachmentOptions {
                         id,
                         cols,
@@ -2441,8 +3069,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.protocol_version, 0);
+        assert!(response.windows.is_none());
         let pane = &response.panes.as_ref().unwrap()[0];
         assert_eq!((pane.x, pane.y), (0, 0));
+        assert!(pane.visible);
         assert!(pane.title.is_empty());
         assert!(
             require_pane_protocol(&response)
@@ -2450,6 +3080,13 @@ mod tests {
                 .to_string()
                 .contains("restart it with the current termctrl")
         );
+        assert!(
+            require_window_protocol(&response)
+                .unwrap_err()
+                .to_string()
+                .contains("predates named windows")
+        );
+        assert_eq!(Response::default().protocol_version, 3);
     }
 
     #[test]
@@ -2461,6 +3098,41 @@ mod tests {
             },
             Request::FocusPane { pane: 3 },
             Request::ClosePane { pane: 2 },
+            Request::Windows,
+            Request::CreateWindow {
+                name: Some("editor".to_owned()),
+                command: vec!["nvim".to_owned()],
+                cwd: Some(PathBuf::from("/tmp/project")),
+            },
+            Request::SelectWindow {
+                name: "editor".to_owned(),
+            },
+            Request::RenameWindow {
+                name: "editor".to_owned(),
+                new_name: "code".to_owned(),
+            },
+            Request::WindowPanes {
+                name: "code".to_owned(),
+            },
+            Request::WindowLayout {
+                name: "code".to_owned(),
+                columns: 2,
+                rows: 1,
+            },
+            Request::CloseWindow {
+                name: "code".to_owned(),
+            },
+            Request::MovePane {
+                pane: 3,
+                window: "code".to_owned(),
+                vertical: false,
+            },
+            Request::ResizePane {
+                pane: 3,
+                direction: PaneDirection::Left,
+                cells: 5,
+            },
+            Request::ToggleZoom { pane: 3 },
             Request::Attach {
                 id: 7,
                 socket: PathBuf::from("/tmp/attach.sock"),
@@ -2859,6 +3531,35 @@ mod tests {
 
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         let _ = std::fs::remove_file(pid_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_exit_reports_exited_and_rejects_further_input() {
+        let mut session = Session::start(
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "sleep 30 & exit 0".to_owned(),
+            ],
+            None,
+            None,
+            &Options::default(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            let status = session.status().unwrap();
+            if status.exit.is_some() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "parent process did not exit");
+            thread::sleep(Duration::from_millis(5));
+        };
+
+        assert_eq!(status.state, SessionState::Exited);
+        assert!(session.send(b"should-not-arrive").is_err());
+        session.stop().unwrap();
     }
 
     #[cfg(unix)]

@@ -8,6 +8,7 @@ use crate::frame::{Color, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, indexed_color}
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const REPLY_DRAIN: Duration = Duration::from_millis(25);
+const MAX_QUERY_INPUT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct TerminalTheme {
@@ -86,7 +87,7 @@ fn query() -> Option<(TerminalTheme, Vec<u8>)> {
 
         let deadline = Instant::now() + QUERY_TIMEOUT;
         let mut reply_barrier = None;
-        let mut received = Vec::new();
+        let mut received = Vec::with_capacity(4096);
         loop {
             let read_deadline = reply_barrier
                 .map(|barrier| std::cmp::min(deadline, barrier + REPLY_DRAIN))
@@ -94,10 +95,15 @@ fn query() -> Option<(TerminalTheme, Vec<u8>)> {
             if Instant::now() >= read_deadline || !stdin_ready(read_deadline) {
                 break;
             }
+            let remaining = MAX_QUERY_INPUT_BYTES.saturating_sub(received.len());
+            if remaining == 0 {
+                break;
+            }
             let mut bytes = [0_u8; 4096];
+            let read_length = remaining.min(bytes.len());
             let length = loop {
                 let length = unsafe {
-                    libc::read(libc::STDIN_FILENO, bytes.as_mut_ptr().cast(), bytes.len())
+                    libc::read(libc::STDIN_FILENO, bytes.as_mut_ptr().cast(), read_length)
                 };
                 if length >= 0
                     || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted

@@ -37,29 +37,34 @@ termctrl run -- /usr/bin/nvim
 termctrl run editor -- nvim
 termctrl run editor
 termctrl attach editor
+termctrl windows workspace --json
+termctrl new-window workspace editor -- nvim
+termctrl show workspace --window editor
 termctrl panes workspace --json
 termctrl layout workspace --grid 2x2
 termctrl send workspace --pane 1 text:opencode2 enter
 termctrl focus workspace --pane 1
 termctrl close-pane workspace --pane 1
+termctrl resize-pane workspace --pane 1 --direction left --cells 5
+termctrl zoom-pane workspace --pane 1
 ```
 
-With no arguments, `run` starts `$SHELL` in the `workspace` session. Use `ctrl-b %` for left/right
-panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l`, arrow keys, or a mouse click to focus, `ctrl-b d` to
-detach, `ctrl-b q` to show stable pane IDs, and `ctrl-b ?` for help. Killing a pane with `ctrl-b x`
-or quitting with `ctrl-b &` requires `y` confirmation. A supplied
-command still uses its executable basename when `NAME` is omitted. Splits can build up to four
-panes.
+With no arguments, `run` starts `$SHELL` in the `workspace/main` window. Use `ctrl-b c` to create a
+window, `ctrl-b n/p` or `ctrl-b 0-9` to select one, and `ctrl-b w` to list them. Use `ctrl-b %` and
+`ctrl-b "` to split, `ctrl-b h/j/k/l`, arrows, or a mouse click to focus, `ctrl-b H/J/K/L` to resize,
+`ctrl-b z` to toggle zoom, `ctrl-b d` to detach,
+`ctrl-b q` to show stable pane IDs, and `ctrl-b ?` for help. `ctrl-b x` closes a pane, `ctrl-b &`
+closes the current window, and `ctrl-b Q` closes the workspace after `y` confirmation.
 
 `run NAME` creates when absent and reattaches when the workspace already exists. `attach NAME`
-requires an existing workspace. Closing the terminal detaches without killing panes; `ctrl-b &`
-followed by `y`, or `termctrl stop NAME`, ends the workspace. Only one human terminal may be attached, while
-agent pane controls remain available when detached.
+requires an existing workspace. Closing the terminal detaches without killing panes; `ctrl-b Q`
+followed by `y`, or `termctrl stop NAME`, ends the workspace. Only one human terminal may be attached,
+while agent controls remain available when detached.
 
-Pane IDs are stable identities; do not infer identity from list order, position, or application-owned
-titles. `layout --grid 2x2` opens missing shell panes without changing human focus. It never kills
-surplus panes, so close exact IDs first when shrinking. Pane-targeted `send`, `show`, and `wait` do
-not change focus; use `focus --pane ID` only when intentionally moving human focus.
+Discover windows before panes. Window names are exact stable selectors; numeric indexes may shift.
+Pane IDs are globally stable across windows; do not infer identity from geometry or titles.
+Window-targeted `show`, `send`, `wait`, `logs`, `panes`, and `layout` do not change human selection.
+Only `select-window` and `focus --pane ID` intentionally move the visible human context.
 
 Workspaces follow their current human terminal and reject `termctrl resize`. `run --record` records
 the initial pane only; wrap `run` in an outer named session when a composed workspace recording is

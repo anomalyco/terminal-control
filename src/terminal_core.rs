@@ -36,6 +36,7 @@ pub(crate) struct TerminalCore {
     bells: Rc<CounterCell<u64>>,
     cursor_style: CursorVisualStyle,
     cached_frame: Option<Frame>,
+    revision: u64,
 }
 
 impl TerminalCore {
@@ -80,10 +81,14 @@ impl TerminalCore {
             bells,
             cursor_style: CursorVisualStyle::Block,
             cached_frame: None,
+            revision: 0,
         })
     }
 
     pub(crate) fn apply_output(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if !bytes.is_empty() {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.terminal.vt_write(bytes);
         std::mem::take(&mut self.responses.borrow_mut())
     }
@@ -91,6 +96,7 @@ impl TerminalCore {
     pub(crate) fn set_theme(&mut self, theme: TerminalTheme) -> Result<()> {
         apply_theme(&mut self.terminal, theme)?;
         self.cached_frame = None;
+        self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -103,7 +109,10 @@ impl TerminalCore {
     ) -> Result<()> {
         self.terminal
             .resize(cols, rows, u32::from(cell_width), u32::from(cell_height))
-            .context("resize Ghostty terminal")
+            .context("resize Ghostty terminal")?;
+        self.cached_frame = None;
+        self.revision = self.revision.wrapping_add(1);
+        Ok(())
     }
 
     pub(crate) fn text(&mut self) -> Result<String> {
@@ -145,6 +154,10 @@ impl TerminalCore {
 
     pub(crate) fn cursor_style(&self) -> CursorVisualStyle {
         self.cursor_style
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub(crate) fn frame(&mut self) -> Result<Frame> {

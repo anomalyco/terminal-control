@@ -139,9 +139,9 @@ termctrl run editor
 termctrl attach editor
 ```
 
-The workspace daemon owns panes independently from any terminal. Closing an attached terminal detaches without killing panes; `ctrl-b &` followed by `y`, `termctrl stop NAME`, or closing the final pane ends the workspace. One human terminal may be attached at a time, while agent controls remain available whether attached or detached. A new attachment adopts its terminal size and theme and performs a full repaint.
+The workspace daemon owns named windows and their panes independently from any terminal. Every workspace starts with a `main` window. Closing an attached terminal detaches without killing anything; `ctrl-b Q` followed by `y`, `termctrl stop NAME`, or closing the final window ends the workspace. One human terminal may be attached at a time, while agent controls remain available whether attached or detached. A new attachment adopts its terminal size and theme and performs a full repaint.
 
-Use `ctrl-b %` for left/right panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l`, arrow keys, or a mouse click to focus, `ctrl-b q` to show stable pane IDs, `ctrl-b d` to detach, and `ctrl-b ?` for in-workspace help. Splitting either half of a two-pane workspace builds up to a four-pane layout. Killing the active pane with `ctrl-b x` or quitting with `ctrl-b &` requires `y` confirmation.
+Use `ctrl-b c` to create a window, `ctrl-b n/p` or `ctrl-b 0-9` to select one, and `ctrl-b w` to list them. Use `ctrl-b %` for left/right panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l`, arrow keys, or a mouse click to focus, `ctrl-b H/J/K/L` to resize by five cells, `ctrl-b z` to toggle pane zoom, `ctrl-b q` to show stable pane IDs, `ctrl-b d` to detach, and `ctrl-b ?` for help. `ctrl-b x` closes a pane, `ctrl-b &` closes the current window, and `ctrl-b Q` closes the workspace; each requires `y` confirmation.
 
 Mouse events over a pane use pane-local coordinates and continue to mouse-aware applications. A
 primary click also focuses that pane; divider clicks are ignored.
@@ -149,6 +149,18 @@ primary click also focuses that pane; divider clicks are ignored.
 Agents discover stable pane IDs and geometry, declaratively grow a layout, and inspect or drive a pane without changing human focus:
 
 ```bash
+termctrl windows workspace --json
+termctrl new-window workspace editor --cwd ~/src/project -- nvim
+termctrl show workspace --window editor
+termctrl send workspace --window editor text::help enter
+termctrl panes workspace --window editor --json
+termctrl layout workspace --window editor --grid 2x2
+termctrl select-window workspace editor
+termctrl rename-window workspace editor code
+termctrl close-window workspace code
+termctrl move-pane workspace --pane 3 --window editor
+termctrl resize-pane workspace --pane 3 --direction left --cells 5
+termctrl zoom-pane workspace --pane 3
 termctrl panes workspace --json
 termctrl layout workspace --grid 2x2
 termctrl show workspace
@@ -158,7 +170,7 @@ termctrl focus workspace --pane 1
 termctrl close-pane workspace --pane 1
 ```
 
-Layout growth opens missing `$SHELL` panes in row-major order while preserving existing pane IDs and human focus. Layout shrinkage never kills a process implicitly; close exact pane IDs first. Only `focus` changes human focus. Pane titles are application-owned terminal titles, not stable identities.
+Window names are stable exact selectors; their numeric indexes are presentation order and may shift after a close. Pane IDs are globally unique across every window. `move-pane` preserves the process, screen, logs, recording, and stable ID while inserting it beside the destination's active pane. Pane resize moves the nearest boundary in the requested direction; zoom is reversible presentation state and does not remove hidden panes. Window-targeted reads, input, waits, logs, pane discovery, layouts, and moves do not select that window. Only `select-window`, a human shortcut, `focus --pane ID`, or `zoom-pane` changes the visible window. Layout shrinkage never kills a process implicitly; close exact pane IDs first. Pane titles remain application-owned and are not identities.
 
 Without a command or name, the workspace is named `workspace`. When a command is supplied without `NAME`, its executable basename remains the inferred name.
 

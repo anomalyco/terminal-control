@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -16,6 +16,10 @@ use crate::terminal_core::InputModes;
 use crate::terminal_theme::TerminalTheme;
 
 pub type PaneId = u32;
+pub type WindowId = u32;
+type PaneRevisions = Vec<(PaneId, u64)>;
+
+const DEFAULT_WINDOW_NAME: &str = "main";
 
 const VERTICAL_DIVIDER: &str = "│";
 const HORIZONTAL_DIVIDER: &str = "─";
@@ -24,21 +28,55 @@ const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 const SGR_MOUSE_PREFIX: &[u8] = b"\x1b[<";
 const PASTE_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_SGR_MOUSE_BYTES: usize = 64;
+const MAX_ATTACHMENT_INPUTS_PER_TICK: usize = 64;
+const MAX_ATTACHMENT_INPUT_BYTES_PER_TICK: usize = 64 * 1024;
+const MAX_ATTACHMENT_ACTIONS_PER_TICK: usize = 1024;
+const MAX_WORKSPACE_PANES: usize = 64;
 
 pub(crate) struct Workspace {
+    windows: Vec<Window>,
+    active_window: WindowId,
+    next_window_id: WindowId,
+    next_pane_id: PaneId,
+    launch: SessionLaunch,
+}
+
+pub(crate) struct Window {
+    id: WindowId,
+    name: String,
     panes: Vec<Pane>,
     active: Option<PaneId>,
     layout: Option<LayoutNode>,
     applied: AppliedLayout,
-    next_id: PaneId,
     cols: u16,
     rows: u16,
     cwd: PathBuf,
     shell: Vec<String>,
     options: Options,
     theme: TerminalTheme,
-    launch: SessionLaunch,
     paste: Option<(PaneId, bool)>,
+    zoomed: Option<PaneId>,
+    cached_frame: Option<(PaneRevisions, Frame)>,
+    frame_generation: u64,
+}
+
+struct WindowIdentity {
+    id: WindowId,
+    name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WindowStatus {
+    pub index: usize,
+    pub name: String,
+    pub active: bool,
+    pub pane_count: usize,
+    pub active_pane: Option<PaneId>,
+    #[serde(default)]
+    pub zoomed_pane: Option<PaneId>,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 struct Pane {
@@ -57,6 +95,7 @@ enum LayoutNode {
     Leaf(PaneId),
     Split {
         axis: SplitAxis,
+        offset: i16,
         first: Box<LayoutNode>,
         second: Box<LayoutNode>,
     },
@@ -82,6 +121,7 @@ impl LayoutNode {
             Self::Leaf(id) if *id == target => {
                 *self = Self::Split {
                     axis,
+                    offset: 0,
                     first: Box::new(Self::Leaf(target)),
                     second: Box::new(Self::Leaf(pane)),
                 };
@@ -94,12 +134,50 @@ impl LayoutNode {
         }
     }
 
+    fn resize_leaf(&mut self, target: PaneId, direction: Direction, amount: i16) -> bool {
+        match self {
+            Self::Leaf(_) => false,
+            Self::Split {
+                axis,
+                offset,
+                first,
+                second,
+            } => {
+                if first.contains(target) {
+                    if first.resize_leaf(target, direction, amount) {
+                        return true;
+                    }
+                    if matches!(
+                        (*axis, direction),
+                        (SplitAxis::Columns, Direction::Right) | (SplitAxis::Rows, Direction::Down)
+                    ) {
+                        *offset = offset.saturating_add(amount);
+                        return true;
+                    }
+                } else if second.contains(target) {
+                    if second.resize_leaf(target, direction, amount) {
+                        return true;
+                    }
+                    if matches!(
+                        (*axis, direction),
+                        (SplitAxis::Columns, Direction::Left) | (SplitAxis::Rows, Direction::Up)
+                    ) {
+                        *offset = offset.saturating_sub(amount);
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
     fn remove_leaf(self, target: PaneId) -> (Option<Self>, bool) {
         match self {
             Self::Leaf(id) if id == target => (None, true),
             Self::Leaf(_) => (Some(self), false),
             Self::Split {
                 axis,
+                offset,
                 first,
                 second,
             } => {
@@ -108,6 +186,7 @@ impl LayoutNode {
                     let tree = match first {
                         Some(first) => Some(Self::Split {
                             axis,
+                            offset,
                             first: Box::new(first),
                             second,
                         }),
@@ -119,6 +198,7 @@ impl LayoutNode {
                     let tree = match second {
                         Some(second) => Some(Self::Split {
                             axis,
+                            offset,
                             first,
                             second: Box::new(second),
                         }),
@@ -129,6 +209,7 @@ impl LayoutNode {
                     (
                         Some(Self::Split {
                             axis,
+                            offset,
                             first,
                             second,
                         }),
@@ -140,8 +221,9 @@ impl LayoutNode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Direction {
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
     Left,
     Right,
     Up,
@@ -149,6 +231,15 @@ enum Direction {
 }
 
 impl Direction {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
+
     fn unavailable(self) -> &'static str {
         match self {
             Self::Left => "no pane to the left",
@@ -208,6 +299,8 @@ fn directional_score(
 pub struct PaneStatus {
     pub id: PaneId,
     pub active: bool,
+    #[serde(default = "default_true")]
+    pub visible: bool,
     pub state: SessionState,
     #[serde(default)]
     pub x: u16,
@@ -219,6 +312,10 @@ pub struct PaneStatus {
     pub title: String,
     pub command: Vec<String>,
     pub cwd: PathBuf,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,20 +388,972 @@ impl Workspace {
         options: &Options,
         theme: TerminalTheme,
     ) -> Result<Self> {
+        let mut main = Window::start_with_theme(
+            WindowIdentity {
+                id: 0,
+                name: DEFAULT_WINDOW_NAME.to_owned(),
+            },
+            0,
+            command,
+            cwd,
+            record,
+            options,
+            theme,
+        )?;
+        let launch = main.panes[0].session.status()?.launch;
+        Ok(Self {
+            windows: vec![main],
+            active_window: 0,
+            next_window_id: 1,
+            next_pane_id: 1,
+            launch,
+        })
+    }
+
+    fn active_window_index(&self) -> Option<usize> {
+        self.windows
+            .iter()
+            .position(|window| window.id == self.active_window)
+    }
+
+    fn active_window_name(&self) -> Option<&str> {
+        self.active_window_index()
+            .map(|index| self.windows[index].name.as_str())
+    }
+
+    fn window_index(&self, name: &str) -> Result<usize> {
+        self.windows
+            .iter()
+            .position(|window| window.name == name)
+            .ok_or_else(|| anyhow::anyhow!("workspace has no window {name:?}"))
+    }
+
+    fn window_id(&self, name: &str) -> Result<WindowId> {
+        let index = self.window_index(name)?;
+        Ok(self.windows[index].id)
+    }
+
+    fn window_index_or_active(&self, name: Option<&str>) -> Result<usize> {
+        match name {
+            Some(name) => self.window_index(name),
+            None => self
+                .active_window_index()
+                .context("workspace has no active window"),
+        }
+    }
+
+    fn selected_window(&self) -> Result<&Window> {
+        let index = self.window_index_or_active(None)?;
+        Ok(&self.windows[index])
+    }
+
+    fn selected_window_mut(&mut self) -> Result<&mut Window> {
+        let index = self.window_index_or_active(None)?;
+        Ok(&mut self.windows[index])
+    }
+
+    fn pane_window_index(&self, pane: PaneId) -> Option<usize> {
+        self.windows
+            .iter()
+            .position(|window| window.pane_index(pane).is_some())
+    }
+
+    pub(crate) fn windows(&self) -> Vec<WindowStatus> {
+        self.windows
+            .iter()
+            .enumerate()
+            .map(|(index, window)| WindowStatus {
+                index,
+                name: window.name.clone(),
+                active: window.id == self.active_window,
+                pane_count: window.panes.len(),
+                active_pane: window.active,
+                zoomed_pane: window.zoomed,
+                cols: window.cols,
+                rows: window.rows,
+            })
+            .collect()
+    }
+
+    pub(crate) fn panes_in(&mut self, name: Option<&str>) -> Result<Vec<PaneStatus>> {
+        let index = self.window_index_or_active(name)?;
+        self.windows[index].panes()
+    }
+
+    pub(crate) fn set_grid_in(
+        &mut self,
+        name: Option<&str>,
+        columns: u16,
+        rows: u16,
+    ) -> Result<Vec<PaneStatus>> {
+        let index = self.window_index_or_active(name)?;
+        let current = self.pane_count();
+        let desired = usize::from(columns) * usize::from(rows);
+        let added = desired.saturating_sub(self.windows[index].panes.len());
+        if current.saturating_add(added) > MAX_WORKSPACE_PANES {
+            bail!("workspace supports at most {MAX_WORKSPACE_PANES} panes");
+        }
+        let first_new_id = self.next_pane_id;
+        let next_pane_id = first_new_id
+            .checked_add(u32::try_from(added).unwrap_or(u32::MAX))
+            .context("workspace exhausted stable pane ids")?;
+        self.windows[index].set_grid(columns, rows, first_new_id)?;
+        self.next_pane_id = next_pane_id;
+        self.windows[index].panes()
+    }
+
+    pub(crate) fn send_all_in(
+        &mut self,
+        name: &str,
+        input: &[Vec<u8>],
+        pace: Duration,
+        tick: impl FnMut(&mut Self) -> Result<bool>,
+    ) -> Result<()> {
+        let index = self.window_index(name)?;
+        let pane = self.windows[index]
+            .active
+            .context("window has no active pane")?;
+        self.send_all(Some(pane), input, pace, tick)
+    }
+
+    pub(crate) fn wait_for_text_in(
+        &mut self,
+        name: &str,
+        text: &str,
+        timeout: Duration,
+        tick: impl FnMut(&mut Self) -> Result<bool>,
+    ) -> Result<()> {
+        let index = self.window_index(name)?;
+        let pane = self.windows[index]
+            .active
+            .context("window has no active pane")?;
+        self.wait_for_text(Some(pane), text, timeout, tick)
+    }
+
+    pub(crate) fn capture_window(
+        &mut self,
+        name: &str,
+        settle: Duration,
+        deadline: Duration,
+        tick: impl FnMut(&mut Self) -> Result<bool>,
+    ) -> Result<Shot> {
+        let id = self.window_id(name)?;
+        self.capture_target(id, None, settle, deadline, tick)
+    }
+
+    pub(crate) fn logs_in(&mut self, name: &str, ansi: bool) -> Result<Vec<u8>> {
+        let index = self.window_index(name)?;
+        self.windows[index].active_logs(ansi)
+    }
+
+    pub(crate) fn create_window(
+        &mut self,
+        name: Option<&str>,
+        command: &[String],
+        cwd: Option<&Path>,
+    ) -> Result<WindowId> {
+        if self.pane_count() >= MAX_WORKSPACE_PANES {
+            bail!("workspace supports at most {MAX_WORKSPACE_PANES} panes");
+        }
+        let id = self.next_window_id;
+        let next_window_id = id
+            .checked_add(1)
+            .context("workspace exhausted stable window ids")?;
+        let name = name
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("window-{id}"));
+        validate_window_name(&name)?;
+        if self.windows.iter().any(|window| window.name == name) {
+            bail!("workspace already has a window named {name:?}");
+        }
+        let active = self.window_index_or_active(None)?;
+        let source_cwd = self.windows[active].cwd.clone();
+        let source_options = self.windows[active].options.clone();
+        let source_theme = self.windows[active].theme;
+        let pane_id = self.next_pane_id;
+        let next_pane_id = pane_id
+            .checked_add(1)
+            .context("workspace exhausted stable pane ids")?;
+        let window = Window::start_with_theme(
+            WindowIdentity { id, name },
+            pane_id,
+            command,
+            cwd.or(Some(source_cwd.as_path())),
+            None,
+            &source_options,
+            source_theme,
+        )?;
+        self.windows.push(window);
+        self.next_window_id = next_window_id;
+        self.next_pane_id = next_pane_id;
+        self.select_window_id(id)?;
+        Ok(id)
+    }
+
+    pub(crate) fn rename_window(&mut self, name: &str, new_name: &str) -> Result<()> {
+        if name == new_name {
+            self.window_index(name)?;
+            return Ok(());
+        }
+        validate_window_name(new_name)?;
+        if self.windows.iter().any(|window| window.name == new_name) {
+            bail!("workspace already has a window named {new_name:?}");
+        }
+        let index = self.window_index(name)?;
+        self.windows[index].name = new_name.to_owned();
+        Ok(())
+    }
+
+    pub(crate) fn select_window(&mut self, name: &str) -> Result<()> {
+        self.select_window_id(self.window_id(name)?)
+    }
+
+    fn select_window_index(&mut self, index: usize) -> Result<bool> {
+        let Some(window) = self.windows.get(index) else {
+            return Ok(false);
+        };
+        let id = window.id;
+        self.select_window_id(id)?;
+        Ok(true)
+    }
+
+    fn select_window_id(&mut self, id: WindowId) -> Result<()> {
+        if self.active_window == id {
+            return Ok(());
+        }
+        let next = self
+            .windows
+            .iter()
+            .position(|window| window.id == id)
+            .ok_or_else(|| anyhow::anyhow!("workspace has no window {id}"))?;
+        if let Some(current) = self.active_window_index() {
+            self.windows[current].cancel_paste();
+            let active = self.windows[current].active;
+            let _ = self.windows[current].send_focus(active, false);
+        }
+        self.active_window = id;
+        let active = self.windows[next].active;
+        let _ = self.windows[next].send_focus(active, true);
+        Ok(())
+    }
+
+    fn select_relative_window(&mut self, offset: isize) -> Result<bool> {
+        if self.windows.len() < 2 {
+            return Ok(false);
+        }
+        let current = self
+            .active_window_index()
+            .context("workspace has no active window")?;
+        let len = isize::try_from(self.windows.len()).unwrap_or(isize::MAX);
+        let next = (isize::try_from(current).unwrap_or(0) + offset).rem_euclid(len);
+        self.select_window_index(usize::try_from(next).unwrap_or(0))
+    }
+
+    pub(crate) fn close_window(&mut self, name: &str) -> Result<()> {
+        let index = self.window_index(name)?;
+        self.close_window_index(index)
+    }
+
+    fn close_window_index(&mut self, index: usize) -> Result<()> {
+        let closing_active = self.windows[index].id == self.active_window;
+        if closing_active {
+            let active = self.windows[index].active;
+            let _ = self.windows[index].send_focus(active, false);
+        }
+        self.windows.remove(index);
+        if self.windows.is_empty() {
+            return Ok(());
+        }
+        if closing_active {
+            let next = index.min(self.windows.len() - 1);
+            self.active_window = self.windows[next].id;
+            let active = self.windows[next].active;
+            let _ = self.windows[next].send_focus(active, true);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.windows.is_empty()
+    }
+
+    fn all_exits_observed(&self) -> bool {
+        !self.windows.is_empty()
+            && self
+                .windows
+                .iter()
+                .all(|window| window.all_exits_observed())
+    }
+
+    pub(crate) fn set_theme(&mut self, theme: TerminalTheme) -> Result<()> {
+        let Some(first) = self.windows.first() else {
+            return Ok(());
+        };
+        let previous = first.theme;
+        if previous == theme {
+            return Ok(());
+        }
+        for index in 0..self.windows.len() {
+            if let Err(error) = self.windows[index].set_theme(theme) {
+                for window in &mut self.windows[..index] {
+                    let _ = window.set_theme(previous);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pump(&mut self) -> Result<()> {
+        for window in &mut self.windows {
+            window.pump()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe_exits(&mut self) -> Result<bool> {
+        let mut exited = false;
+        for window in &mut self.windows {
+            exited |= window.observe_exits()?;
+        }
+        Ok(exited)
+    }
+
+    pub(crate) fn remove_observed_exits(&mut self) -> Result<bool> {
+        let mut removed = false;
+        for window in &mut self.windows {
+            removed |= window.remove_observed_exits(window.id == self.active_window)?;
+        }
+        let empty = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, window)| window.is_empty().then_some(index))
+            .collect::<Vec<_>>();
+        for index in empty.into_iter().rev() {
+            self.close_window_index(index)?;
+        }
+        Ok(removed)
+    }
+
+    pub(crate) fn send(&mut self, pane: Option<PaneId>, input: &[u8]) -> Result<()> {
+        match pane {
+            Some(pane) => {
+                let window = self
+                    .pane_window_index(pane)
+                    .ok_or_else(|| anyhow::anyhow!("workspace has no pane {pane}"))?;
+                self.windows[window].send(Some(pane), input)
+            }
+            None => self.selected_window_mut()?.send(None, input),
+        }
+    }
+
+    fn pane_count(&self) -> usize {
+        self.windows.iter().map(|window| window.panes.len()).sum()
+    }
+
+    fn split(&mut self, axis: SplitAxis) -> Result<()> {
+        if self.pane_count() >= MAX_WORKSPACE_PANES {
+            bail!("workspace supports at most {MAX_WORKSPACE_PANES} panes");
+        }
+        let pane = self.next_pane_id;
+        let next_pane_id = pane
+            .checked_add(1)
+            .context("workspace exhausted stable pane ids")?;
+        let result = self.selected_window_mut()?.split(axis, pane);
+        if result.is_ok() || self.pane_window_index(pane).is_some() {
+            self.next_pane_id = next_pane_id;
+        }
+        result
+    }
+
+    pub(crate) fn focus_pane(&mut self, pane: PaneId) -> Result<()> {
+        let window = self
+            .pane_window_index(pane)
+            .ok_or_else(|| anyhow::anyhow!("workspace has no pane {pane}"))?;
+        let window_id = self.windows[window].id;
+        self.select_window_id(window_id)?;
+        self.selected_window_mut()?.focus_pane(pane)
+    }
+
+    pub(crate) fn close_pane(&mut self, pane: PaneId) -> Result<()> {
+        let window = self
+            .pane_window_index(pane)
+            .ok_or_else(|| anyhow::anyhow!("workspace has no pane {pane}"))?;
+        let focused = self.windows[window].id == self.active_window;
+        self.windows[window].close_pane(pane, focused)?;
+        if self.windows[window].is_empty() {
+            self.close_window_index(window)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resize_pane(
+        &mut self,
+        pane: PaneId,
+        direction: Direction,
+        cells: u16,
+    ) -> Result<Vec<PaneStatus>> {
+        if cells == 0 {
+            bail!("pane resize must change at least one cell");
+        }
+        let window = self
+            .pane_window_index(pane)
+            .ok_or_else(|| anyhow::anyhow!("workspace has no pane {pane}"))?;
+        self.windows[window].resize_pane(pane, direction, cells)?;
+        self.windows[window].panes()
+    }
+
+    pub(crate) fn toggle_zoom_pane(&mut self, pane: PaneId) -> Result<Vec<PaneStatus>> {
+        let window = self
+            .pane_window_index(pane)
+            .ok_or_else(|| anyhow::anyhow!("workspace has no pane {pane}"))?;
+        self.windows[window].resolve_pane(Some(pane))?;
+        if self.windows[window].panes.len() < 2 {
+            bail!("window needs at least two panes to zoom");
+        }
+        self.windows[window].toggle_zoom(pane)?;
+        self.focus_pane(pane)?;
+        self.panes_in(None)
+    }
+
+    pub(crate) fn move_pane(
+        &mut self,
+        pane: PaneId,
+        target_window: &str,
+        vertical: bool,
+    ) -> Result<()> {
+        let source = self
+            .pane_window_index(pane)
+            .ok_or_else(|| anyhow::anyhow!("workspace has no pane {pane}"))?;
+        let target = self.window_index(target_window)?;
+        if source == target {
+            bail!("pane {pane} already belongs to window {target_window:?}");
+        }
+        let target_pane = self.windows[target]
+            .active
+            .context("target window has no active pane")?;
+        let axis = if vertical {
+            SplitAxis::Rows
+        } else {
+            SplitAxis::Columns
+        };
+
+        let old_source_layout = self.windows[source].layout.clone();
+        let old_source_applied = self.windows[source].applied.clone();
+        let old_source_active = self.windows[source].active;
+        let old_source_zoomed = self.windows[source].zoomed;
+        let old_target_layout = self.windows[target].layout.clone();
+        let old_target_applied = self.windows[target].applied.clone();
+        let old_target_zoomed = self.windows[target].zoomed;
+
+        let (source_layout, removed) = old_source_layout
+            .clone()
+            .context("source window has no layout")?
+            .remove_leaf(pane);
+        if !removed {
+            bail!("source window layout has no pane {pane}");
+        }
+        let source_geometry = source_layout
+            .as_ref()
+            .map(|layout| geometry(layout, self.windows[source].cols, self.windows[source].rows))
+            .transpose()?;
+        let mut target_layout = old_target_layout
+            .clone()
+            .context("target window has no layout")?;
+        if !target_layout.split_leaf(target_pane, axis, pane) {
+            bail!("target window layout has no pane {target_pane}");
+        }
+        let target_geometry = geometry(
+            &target_layout,
+            self.windows[target].cols,
+            self.windows[target].rows,
+        )?;
+
+        self.windows[source].clear_zoom()?;
+        if let Err(error) = self.windows[target].clear_zoom() {
+            self.windows[source].zoomed = old_source_zoomed;
+            let _ = self.windows[source].refresh_layout();
+            return Err(error);
+        }
+
+        let source_pane = self.windows[source]
+            .pane_index(pane)
+            .context("source window has no pane")?;
+        if self.windows[source]
+            .paste
+            .is_some_and(|(target, _)| target == pane)
+        {
+            self.windows[source].cancel_paste();
+        }
+        if self.windows[source].id == self.active_window && old_source_active == Some(pane) {
+            let _ = self.windows[source].send_focus(Some(pane), false);
+        }
+        let moved = self.windows[source].panes.remove(source_pane);
+        self.windows[source].layout = source_layout;
+        self.windows[source].active = if old_source_active == Some(pane) {
+            self.windows[source].first_layout_pane()
+        } else {
+            old_source_active
+        };
+        let source_result = match source_geometry {
+            Some(geometry) => self.windows[source].apply_geometry(geometry),
+            None => {
+                self.windows[source].applied = AppliedLayout::Ready(WorkspaceGeometry {
+                    panes: Vec::new(),
+                    dividers: Vec::new(),
+                });
+                self.windows[source].invalidate_frame();
+                Ok(())
+            }
+        };
+        if let Err(error) = source_result {
+            self.windows[source].panes.push(moved);
+            self.windows[source].layout = old_source_layout;
+            let _ = self.windows[source].apply_geometry(old_source_applied.geometry().clone());
+            self.windows[source].applied = old_source_applied;
+            self.windows[source].active = old_source_active;
+            self.windows[source].zoomed = old_source_zoomed;
+            self.windows[source].invalidate_frame();
+            self.windows[target].zoomed = old_target_zoomed;
+            let _ = self.windows[target].refresh_layout();
+            if self.windows[source].id == self.active_window && old_source_active == Some(pane) {
+                let _ = self.windows[source].send_focus(Some(pane), true);
+            }
+            return Err(error);
+        }
+
+        self.windows[target].panes.push(moved);
+        self.windows[target].layout = Some(target_layout);
+        if let Err(error) = self.windows[target].apply_geometry(target_geometry) {
+            let moved = self.windows[target]
+                .panes
+                .pop()
+                .context("moved pane disappeared during rollback")?;
+            self.windows[target].layout = old_target_layout;
+            let _ = self.windows[target].apply_geometry(old_target_applied.geometry().clone());
+            self.windows[target].applied = old_target_applied;
+            self.windows[target].zoomed = old_target_zoomed;
+            self.windows[target].invalidate_frame();
+            self.windows[source].panes.push(moved);
+            self.windows[source].layout = old_source_layout;
+            let _ = self.windows[source].apply_geometry(old_source_applied.geometry().clone());
+            self.windows[source].applied = old_source_applied;
+            self.windows[source].active = old_source_active;
+            self.windows[source].zoomed = old_source_zoomed;
+            self.windows[source].invalidate_frame();
+            if self.windows[source].id == self.active_window && old_source_active == Some(pane) {
+                let _ = self.windows[source].send_focus(Some(pane), true);
+            }
+            return Err(error);
+        }
+
+        if self.windows[source].is_empty() {
+            self.close_window_index(source)?;
+        } else if self.windows[source].id == self.active_window && old_source_active == Some(pane) {
+            let active = self.windows[source].active;
+            let _ = self.windows[source].send_focus(active, true);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn send_all(
+        &mut self,
+        pane: Option<PaneId>,
+        input: &[Vec<u8>],
+        pace: Duration,
+        mut tick: impl FnMut(&mut Self) -> Result<bool>,
+    ) -> Result<()> {
+        let target = match pane {
+            Some(pane) => {
+                self.pane_window_index(pane)
+                    .ok_or_else(|| anyhow::anyhow!("workspace has no pane {pane}"))?;
+                pane
+            }
+            None => self
+                .selected_window()?
+                .active_id()
+                .context("workspace has no active pane")?,
+        };
+        for (index, bytes) in input.iter().enumerate() {
+            self.send(Some(target), bytes)?;
+            if index + 1 < input.len() {
+                if pace.is_zero() {
+                    if !tick(self)? {
+                        bail!("workspace ended while sending input");
+                    }
+                } else {
+                    let deadline = Instant::now() + pace;
+                    while Instant::now() < deadline {
+                        if !tick(self)? {
+                            bail!("workspace ended while sending input");
+                        }
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if !remaining.is_zero() {
+                            std::thread::sleep(Duration::from_millis(10).min(remaining));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn capture(
+        &mut self,
+        pane: Option<PaneId>,
+        settle: Duration,
+        deadline: Duration,
+        tick: impl FnMut(&mut Self) -> Result<bool>,
+    ) -> Result<Shot> {
+        let target_window = match pane {
+            Some(pane) => self
+                .pane_window_index(pane)
+                .map(|index| self.windows[index].id)
+                .ok_or_else(|| anyhow::anyhow!("workspace has no pane {pane}"))?,
+            None => self.active_window,
+        };
+        self.capture_target(target_window, pane, settle, deadline, tick)
+    }
+
+    fn capture_target(
+        &mut self,
+        target_window: WindowId,
+        pane: Option<PaneId>,
+        settle: Duration,
+        deadline: Duration,
+        mut tick: impl FnMut(&mut Self) -> Result<bool>,
+    ) -> Result<Shot> {
+        let started = Instant::now();
+        let deadline = started + deadline;
+        loop {
+            let running = tick(self)?;
+            let Some(window_index) = self
+                .windows
+                .iter()
+                .position(|window| window.id == target_window)
+            else {
+                bail!("window ended before capture completed");
+            };
+            if pane.is_none() && self.windows[window_index].all_exits_observed() {
+                return self.windows[window_index].shot(None);
+            }
+            if let Some(pane) = pane {
+                let pane_index = self.windows[window_index].resolve_pane(Some(pane))?;
+                if self.windows[window_index].panes[pane_index]
+                    .session
+                    .exit_observed()
+                {
+                    return self.windows[window_index].shot(Some(pane));
+                }
+            }
+            if !running {
+                return self.windows[window_index].shot(pane);
+            }
+            let idle = match pane {
+                Some(pane) => {
+                    let pane_index = self.windows[window_index].resolve_pane(Some(pane))?;
+                    self.windows[window_index].panes[pane_index]
+                        .session
+                        .idle_for(started)
+                }
+                None => self.windows[window_index]
+                    .panes
+                    .iter()
+                    .map(|pane| pane.session.idle_for(started))
+                    .min()
+                    .unwrap_or_else(|| started.elapsed()),
+            };
+            if settle.is_zero() || idle >= settle || Instant::now() >= deadline {
+                return self.windows[window_index].shot(pane);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    pub(crate) fn wait_for_text(
+        &mut self,
+        pane: Option<PaneId>,
+        text: &str,
+        timeout: Duration,
+        mut tick: impl FnMut(&mut Self) -> Result<bool>,
+    ) -> Result<()> {
+        let target = match pane {
+            Some(pane) => {
+                self.pane_window_index(pane)
+                    .ok_or_else(|| anyhow::anyhow!("workspace has no pane {pane}"))?;
+                pane
+            }
+            None => self
+                .selected_window()?
+                .active_id()
+                .context("workspace has no active pane")?,
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            let running = tick(self)?;
+            let Some(window_index) = self.pane_window_index(target) else {
+                bail!("pane {target} ended before visible terminal included {text:?}");
+            };
+            let pane_index = self.windows[window_index].resolve_pane(Some(target))?;
+            if self.windows[window_index].panes[pane_index]
+                .session
+                .current_frame()?
+                .text()
+                .contains(text)
+            {
+                return Ok(());
+            }
+            if !running
+                || self.windows[window_index].panes[pane_index]
+                    .session
+                    .exit_observed()
+            {
+                bail!("pane ended before visible terminal included {text:?}");
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for visible terminal text {text:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    pub(crate) fn resize(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+    ) -> Result<()> {
+        let Some(first) = self.windows.first() else {
+            return Ok(());
+        };
+        let previous = (
+            first.cols,
+            first.rows,
+            first.options.cell_width,
+            first.options.cell_height,
+        );
+        if previous == (cols, rows, cell_width, cell_height) {
+            return Ok(());
+        }
+        for index in 0..self.windows.len() {
+            if let Err(error) = self.windows[index].resize(cols, rows, cell_width, cell_height) {
+                for window in &mut self.windows[..=index] {
+                    let _ = window.resize(previous.0, previous.1, previous.2, previous.3);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn status(&mut self) -> Result<SessionStatus> {
+        let active = self
+            .active_window_index()
+            .context("workspace has no active window")?;
+        let mut statuses = Vec::with_capacity(self.windows.len());
+        for window in &mut self.windows {
+            statuses.push(window.status()?);
+        }
+        let mut status = aggregate_statuses(&statuses, active)?;
+        status.launch = self.launch.clone();
+        Ok(status)
+    }
+
+    pub(crate) fn take_bells(&self) -> u64 {
+        self.windows.iter().map(Window::take_bells).sum()
+    }
+
+    pub(crate) fn mark_recording(&mut self, name: &str) -> Result<()> {
+        for window in &mut self.windows {
+            if window.has_recording()? {
+                return window.mark_recording(name);
+            }
+        }
+        bail!("workspace is not recording")
+    }
+
+    pub(crate) fn stop(&mut self) {
+        for window in &mut self.windows {
+            window.stop();
+        }
+        self.windows.clear();
+    }
+
+    fn active_id(&self) -> Option<PaneId> {
+        self.selected_window().ok().and_then(Window::active_id)
+    }
+
+    pub(crate) fn active_logs(&mut self, ansi: bool) -> Result<Vec<u8>> {
+        self.selected_window_mut()?.active_logs(ansi)
+    }
+
+    #[cfg(test)]
+    fn panes(&mut self) -> Result<Vec<PaneStatus>> {
+        self.panes_in(None)
+    }
+
+    #[cfg(test)]
+    fn set_grid(&mut self, columns: u16, rows: u16) -> Result<()> {
+        self.set_grid_in(None, columns, rows).map(|_| ())
+    }
+
+    #[cfg(test)]
+    fn shot(&mut self, pane: Option<PaneId>) -> Result<Shot> {
+        self.selected_window_mut()?.shot(pane)
+    }
+
+    fn cancel_paste(&mut self) {
+        if let Ok(window) = self.selected_window_mut() {
+            window.cancel_paste();
+        }
+    }
+
+    #[cfg(test)]
+    fn frame(&mut self) -> Result<Frame> {
+        self.selected_window_mut()?.frame()
+    }
+
+    fn active_title(&self) -> Result<String> {
+        self.selected_window()?.active_title()
+    }
+
+    fn active_input_modes(&self) -> Result<InputModes> {
+        self.selected_window()?.active_input_modes()
+    }
+
+    fn send_active_if_open(&mut self, input: &[u8]) -> Result<bool> {
+        self.selected_window_mut()?.send_active_if_open(input)
+    }
+
+    fn begin_paste(&mut self) -> Result<bool> {
+        self.selected_window_mut()?.begin_paste()
+    }
+
+    fn send_paste(&mut self, input: &[u8]) -> Result<bool> {
+        self.selected_window_mut()?.send_paste(input)
+    }
+
+    fn end_paste(&mut self) -> Result<bool> {
+        self.selected_window_mut()?.end_paste()
+    }
+
+    fn focus_direction(&mut self, direction: Direction) -> Result<bool> {
+        self.selected_window_mut()?.focus_direction(direction)
+    }
+
+    fn resize_active(&mut self, direction: Direction, cells: u16) -> Result<()> {
+        let pane = self.active_id().context("workspace has no active pane")?;
+        self.selected_window_mut()?
+            .resize_pane(pane, direction, cells)
+    }
+
+    fn toggle_active_zoom(&mut self) -> Result<()> {
+        let pane = self.active_id().context("workspace has no active pane")?;
+        self.selected_window_mut()?.toggle_zoom(pane)
+    }
+
+    fn selected_pane_count(&self) -> usize {
+        self.selected_window()
+            .map_or(0, |window| window.panes.len())
+    }
+
+    fn selected_pane_ids(&self) -> Vec<PaneId> {
+        self.selected_window()
+            .map(|window| window.panes.iter().map(|pane| pane.id).collect())
+            .unwrap_or_default()
+    }
+
+    fn is_multi_pane(&self) -> bool {
+        self.selected_window().is_ok_and(Window::is_multi_pane)
+    }
+
+    fn pane_at(&self, x: u16, y: u16) -> Option<(PaneId, u16, u16)> {
+        self.selected_window().ok()?.pane_at(x, y)
+    }
+
+    fn pane_position(&self, pane: PaneId, x: u16, y: u16) -> Option<(PaneId, u16, u16)> {
+        self.selected_window().ok()?.pane_position(pane, x, y)
+    }
+
+    fn pane_input_modes(&self, pane: PaneId) -> Result<InputModes> {
+        self.selected_window()?.pane_input_modes(pane)
+    }
+
+    fn send_to_if_open(&mut self, pane: PaneId, input: &[u8]) -> Result<bool> {
+        self.selected_window_mut()?.send_to_if_open(pane, input)
+    }
+
+    fn active_cursor_style(&self) -> Result<libghostty_vt::render::CursorVisualStyle> {
+        Ok(self.selected_window()?.active_cursor_style())
+    }
+
+    fn active_presentation_revision(&self) -> Result<(WindowId, PaneId, u64)> {
+        let window = self.selected_window()?;
+        let pane = window.active.context("workspace has no active pane")?;
+        let index = window
+            .pane_index(pane)
+            .context("active pane is missing from its window")?;
+        Ok((
+            window.id,
+            pane,
+            window.panes[index].session.frame_revision(),
+        ))
+    }
+
+    fn active_frame_key(&self, revisions: &mut PaneRevisions) -> Result<(WindowId, u64)> {
+        let window = self.selected_window()?;
+        window.pane_revisions(revisions);
+        Ok((window.id, window.frame_generation))
+    }
+
+    fn frame_with_revisions(&mut self, revisions: &PaneRevisions) -> Result<Frame> {
+        self.selected_window_mut()?.frame_with_revisions(revisions)
+    }
+
+    #[cfg(test)]
+    fn set_selected_shell(&mut self, shell: Vec<String>) {
+        if let Ok(window) = self.selected_window_mut() {
+            window.shell = shell;
+        }
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl Window {
+    fn start_with_theme(
+        identity: WindowIdentity,
+        pane_id: PaneId,
+        command: &[String],
+        cwd: Option<&Path>,
+        record: Option<&Path>,
+        options: &Options,
+        theme: TerminalTheme,
+    ) -> Result<Self> {
         let cwd = cwd
             .map(Path::to_owned)
             .unwrap_or(std::env::current_dir().context("resolve workspace directory")?);
         let shell = shell_command();
         let command = if command.is_empty() { &shell } else { command };
-        let mut session = Session::start_with_theme(command, Some(&cwd), record, options, theme)?;
-        let launch = session.status()?.launch;
+        let session = Session::start_with_theme(command, Some(&cwd), record, options, theme)?;
         Ok(Self {
-            panes: vec![Pane { id: 0, session }],
-            active: Some(0),
-            layout: Some(LayoutNode::Leaf(0)),
+            id: identity.id,
+            name: identity.name,
+            panes: vec![Pane {
+                id: pane_id,
+                session,
+            }],
+            active: Some(pane_id),
+            layout: Some(LayoutNode::Leaf(pane_id)),
             applied: AppliedLayout::Ready(WorkspaceGeometry {
                 panes: vec![PlacedPane {
-                    id: 0,
+                    id: pane_id,
                     rect: PaneRect {
                         x: 0,
                         y: 0,
@@ -314,15 +1363,16 @@ impl Workspace {
                 }],
                 dividers: Vec::new(),
             }),
-            next_id: 1,
             cols: options.cols,
             rows: options.rows,
             cwd,
             shell,
             options: options.clone(),
             theme,
-            launch,
             paste: None,
+            zoomed: None,
+            cached_frame: None,
+            frame_generation: 0,
         })
     }
 
@@ -343,8 +1393,17 @@ impl Workspace {
     }
 
     pub(crate) fn set_theme(&mut self, theme: TerminalTheme) -> Result<()> {
-        for pane in &mut self.panes {
-            pane.session.set_theme(theme)?;
+        if self.theme == theme {
+            return Ok(());
+        }
+        let previous = self.theme;
+        for index in 0..self.panes.len() {
+            if let Err(error) = self.panes[index].session.set_theme(theme) {
+                for pane in &mut self.panes[..=index] {
+                    let _ = pane.session.set_theme(previous);
+                }
+                return Err(error);
+            }
         }
         self.theme = theme;
         Ok(())
@@ -365,7 +1424,7 @@ impl Workspace {
         Ok(exited)
     }
 
-    pub(crate) fn remove_observed_exits(&mut self) -> Result<bool> {
+    fn remove_observed_exits(&mut self, focused: bool) -> Result<bool> {
         let exited = self
             .panes
             .iter()
@@ -394,20 +1453,18 @@ impl Workspace {
         }
         if active_removed {
             self.active = self.first_layout_pane();
-            self.send_focus(self.active, true)?;
+            if focused {
+                self.send_focus(self.active, true)?;
+            }
         }
         self.refresh_layout()?;
         Ok(true)
     }
 
-    fn split(&mut self, axis: SplitAxis) -> Result<()> {
+    fn split(&mut self, axis: SplitAxis, new_id: PaneId) -> Result<()> {
         let active = self
             .active
             .ok_or_else(|| anyhow::anyhow!("workspace has no pane to split"))?;
-        if self.panes.len() >= 4 {
-            bail!("workspace supports at most four panes");
-        }
-        let new_id = self.next_id;
         let mut layout = self
             .layout
             .clone()
@@ -430,12 +1487,11 @@ impl Workspace {
             }
             return Err(error);
         }
-        self.next_id += 1;
         self.layout = Some(layout);
         self.focus_pane(new_id)
     }
 
-    pub(crate) fn set_grid(&mut self, columns: u16, rows: u16) -> Result<()> {
+    pub(crate) fn set_grid(&mut self, columns: u16, rows: u16, first_new_id: PaneId) -> Result<()> {
         if !(1..=2).contains(&columns) || !(1..=2).contains(&rows) {
             bail!("workspace grids support one or two columns and rows");
         }
@@ -449,7 +1505,11 @@ impl Workspace {
         let mut ids = self.panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
         ids.sort_unstable();
         while ids.len() < desired {
-            ids.push(self.next_id + u32::try_from(ids.len() - self.panes.len()).unwrap_or(0));
+            ids.push(
+                first_new_id
+                    .checked_add(u32::try_from(ids.len() - self.panes.len()).unwrap_or(0))
+                    .context("workspace exhausted stable pane ids")?,
+            );
         }
         let layout = grid_layout(&ids, columns, rows)?;
         if self.layout.as_ref() == Some(&layout) {
@@ -480,8 +1540,10 @@ impl Workspace {
             }
             return Err(error);
         }
-        self.next_id += u32::try_from(added_len).unwrap_or(0);
         self.layout = Some(layout);
+        if self.zoomed.is_some() {
+            self.refresh_layout()?;
+        }
         Ok(())
     }
 
@@ -511,12 +1573,84 @@ impl Workspace {
 
     pub(crate) fn focus_pane(&mut self, pane: PaneId) -> Result<()> {
         self.resolve_pane(Some(pane))?;
+        if self.zoomed.is_some_and(|zoomed| zoomed != pane) {
+            self.zoomed = None;
+            self.refresh_layout()?;
+        }
         if self.active == Some(pane) {
             return Ok(());
         }
-        self.send_focus(self.active, false)?;
+        let _ = self.send_focus(self.active, false);
         self.active = Some(pane);
-        self.send_focus(self.active, true)
+        self.invalidate_frame();
+        let _ = self.send_focus(self.active, true);
+        Ok(())
+    }
+
+    fn resize_pane(&mut self, pane: PaneId, direction: Direction, cells: u16) -> Result<()> {
+        self.resolve_pane(Some(pane))?;
+        if self.zoomed.is_some() {
+            bail!("unzoom the window before resizing panes");
+        }
+        let old_layout = self
+            .layout
+            .clone()
+            .context("workspace has no layout to resize")?;
+        let before = geometry(&old_layout, self.cols, self.rows)?;
+        let before_rect = before
+            .panes
+            .iter()
+            .find(|placed| placed.id == pane)
+            .map(|placed| placed.rect)
+            .context("pane has no layout rectangle")?;
+        let amount = i16::try_from(cells).context("pane resize exceeds supported cell count")?;
+        let mut layout = old_layout.clone();
+        if !layout.resize_leaf(pane, direction, amount) {
+            bail!("pane {pane} has no boundary to resize {}", direction.name());
+        }
+        let next = geometry(&layout, self.cols, self.rows)?;
+        let next_rect = next
+            .panes
+            .iter()
+            .find(|placed| placed.id == pane)
+            .map(|placed| placed.rect)
+            .context("pane has no resized layout rectangle")?;
+        if before_rect == next_rect {
+            bail!("pane {pane} cannot resize any farther {}", direction.name());
+        }
+        if let Err(error) = self.apply_geometry(next) {
+            self.layout = Some(old_layout);
+            return Err(error);
+        }
+        self.layout = Some(layout);
+        Ok(())
+    }
+
+    fn toggle_zoom(&mut self, pane: PaneId) -> Result<()> {
+        self.resolve_pane(Some(pane))?;
+        if self.panes.len() < 2 {
+            bail!("window needs at least two panes to zoom");
+        }
+        let previous = self.zoomed;
+        self.zoomed = (self.zoomed != Some(pane)).then_some(pane);
+        if let Err(error) = self.refresh_layout() {
+            self.zoomed = previous;
+            let _ = self.refresh_layout();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn clear_zoom(&mut self) -> Result<()> {
+        let previous = self.zoomed;
+        if self.zoomed.take().is_some()
+            && let Err(error) = self.refresh_layout()
+        {
+            self.zoomed = previous;
+            let _ = self.refresh_layout();
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn pane_at(&self, x: u16, y: u16) -> Option<(PaneId, u16, u16)> {
@@ -541,10 +1675,10 @@ impl Workspace {
         Some((pane, local_x, local_y))
     }
 
-    pub(crate) fn close_pane(&mut self, pane: PaneId) -> Result<()> {
+    fn close_pane(&mut self, pane: PaneId, focused: bool) -> Result<()> {
         let index = self.resolve_pane(Some(pane))?;
         let closing_active = self.active == Some(pane);
-        if closing_active {
+        if closing_active && focused {
             self.send_focus(Some(pane), false)?;
         }
         self.remove_layout_pane(pane);
@@ -566,7 +1700,7 @@ impl Workspace {
             self.active = self.first_layout_pane();
         }
         self.refresh_layout()?;
-        if closing_active {
+        if closing_active && focused {
             self.send_focus(self.active, true)?;
         }
         Ok(())
@@ -630,29 +1764,6 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn send_all(
-        &mut self,
-        pane: Option<PaneId>,
-        input: &[Vec<u8>],
-        pace: std::time::Duration,
-        mut tick: impl FnMut(&mut Self) -> Result<bool>,
-    ) -> Result<()> {
-        let target = self.panes[self.resolve_pane(pane)?].id;
-        for (index, bytes) in input.iter().enumerate() {
-            self.send(Some(target), bytes)?;
-            if index + 1 < input.len() {
-                if pace.is_zero() {
-                    if !tick(self)? {
-                        bail!("workspace ended while sending input");
-                    }
-                } else {
-                    self.wait_with_ticks(pace, &mut tick)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn resize(
         &mut self,
         cols: u16,
@@ -680,6 +1791,20 @@ impl Workspace {
         if self.applied.is_constrained() {
             return self.constrained_frame();
         }
+        let mut revisions = Vec::with_capacity(self.panes.len());
+        self.pane_revisions(&mut revisions);
+        self.frame_with_revisions(&revisions)
+    }
+
+    fn frame_with_revisions(&mut self, revisions: &PaneRevisions) -> Result<Frame> {
+        if self.applied.is_constrained() {
+            return self.constrained_frame();
+        }
+        if let Some((cached_revisions, frame)) = &self.cached_frame
+            && cached_revisions == revisions
+        {
+            return Ok(frame.clone());
+        }
         let mut frames = Vec::with_capacity(self.applied.geometry().panes.len());
         for placed in &self.applied.geometry().panes {
             let index = self
@@ -687,13 +1812,29 @@ impl Workspace {
                 .ok_or_else(|| anyhow::anyhow!("layout references missing pane {}", placed.id))?;
             frames.push((placed.id, self.panes[index].session.current_frame()?));
         }
-        Ok(compose_workspace(
+        let frame = compose_workspace(
             self.cols,
             self.rows,
             self.applied.geometry(),
             &frames,
             self.active,
-        ))
+        );
+        self.cached_frame = Some((revisions.clone(), frame.clone()));
+        Ok(frame)
+    }
+
+    fn pane_revisions(&self, revisions: &mut PaneRevisions) {
+        revisions.clear();
+        revisions.extend(
+            self.panes
+                .iter()
+                .map(|pane| (pane.id, pane.session.frame_revision())),
+        );
+    }
+
+    fn invalidate_frame(&mut self) {
+        self.cached_frame = None;
+        self.frame_generation = self.frame_generation.wrapping_add(1);
     }
 
     fn constrained_frame(&mut self) -> Result<Frame> {
@@ -723,54 +1864,15 @@ impl Workspace {
         Ok(Shot { frame, ansi })
     }
 
-    pub(crate) fn capture(
-        &mut self,
-        pane: Option<PaneId>,
-        settle: Duration,
-        deadline: Duration,
-        mut tick: impl FnMut(&mut Self) -> Result<bool>,
-    ) -> Result<Shot> {
-        let started = Instant::now();
-        let deadline = started + deadline;
-        loop {
-            let running = tick(self)?;
-            if let Some(pane) = pane {
-                let index = self.resolve_pane(Some(pane))?;
-                if self.panes[index].session.exit_observed() {
-                    return self.panes[index].session.snapshot();
-                }
-            }
-            if !running {
-                if self.is_empty() {
-                    bail!("workspace ended before capture completed");
-                }
-                return self.shot(pane);
-            }
-            let idle = match pane {
-                Some(pane) => {
-                    let index = self.resolve_pane(Some(pane))?;
-                    self.panes[index].session.idle_for(started)
-                }
-                None => {
-                    let mut idle = started.elapsed();
-                    for pane in &mut self.panes {
-                        let pane_idle = pane.session.idle_for(started);
-                        idle = idle.min(pane_idle);
-                    }
-                    idle
-                }
-            };
-            if settle.is_zero() || idle >= settle || Instant::now() >= deadline {
-                return self.shot(pane);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
     pub(crate) fn panes(&mut self) -> Result<Vec<PaneStatus>> {
         let mut statuses = Vec::with_capacity(self.panes.len());
+        let base = self
+            .layout
+            .as_ref()
+            .and_then(|layout| geometry(layout, self.cols, self.rows).ok());
         for pane in &mut self.panes {
             let status = pane.session.status()?;
+            let visible = self.zoomed.is_none_or(|zoomed| zoomed == pane.id);
             let rect = self
                 .applied
                 .geometry()
@@ -778,10 +1880,17 @@ impl Workspace {
                 .iter()
                 .find(|placed| placed.id == pane.id)
                 .map(|placed| placed.rect)
+                .or_else(|| {
+                    base.as_ref()?
+                        .panes
+                        .iter()
+                        .find_map(|placed| (placed.id == pane.id).then_some(placed.rect))
+                })
                 .context("pane has no applied layout rectangle")?;
             statuses.push(PaneStatus {
                 id: pane.id,
                 active: self.active == Some(pane.id),
+                visible,
                 state: status.state,
                 x: rect.x,
                 y: rect.y,
@@ -801,17 +1910,9 @@ impl Workspace {
         for pane in &mut self.panes {
             statuses.push(pane.session.status()?);
         }
-        let mut status = statuses[active].clone();
+        let mut status = aggregate_statuses(&statuses, active)?;
         status.cols = self.cols;
         status.rows = self.rows;
-        status.idle_for_ms = statuses
-            .iter()
-            .filter_map(|status| status.idle_for_ms)
-            .min();
-        status.has_visible_content = statuses.iter().any(|status| status.has_visible_content);
-        status.recording = statuses.iter().any(|status| status.recording);
-        status.logs_truncated = statuses.iter().any(|status| status.logs_truncated);
-        status.launch = self.launch.clone();
         Ok(status)
     }
 
@@ -846,57 +1947,6 @@ impl Workspace {
             })
     }
 
-    pub(crate) fn wait_for_text(
-        &mut self,
-        pane: Option<PaneId>,
-        text: &str,
-        timeout: std::time::Duration,
-        mut tick: impl FnMut(&mut Self) -> Result<bool>,
-    ) -> Result<()> {
-        let target = self.panes[self.resolve_pane(pane)?].id;
-        let deadline = Instant::now() + timeout;
-        loop {
-            let running = tick(self)?;
-            let index = match self.resolve_pane(Some(target)) {
-                Ok(index) => index,
-                Err(_) => bail!("pane {target} ended before visible terminal included {text:?}"),
-            };
-            if self.panes[index]
-                .session
-                .current_frame()?
-                .text()
-                .contains(text)
-            {
-                return Ok(());
-            }
-            if !running || self.panes[index].session.exit_observed() {
-                bail!("pane ended before visible terminal included {text:?}");
-            }
-            if Instant::now() >= deadline {
-                bail!("timed out waiting for visible terminal text {text:?}");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn wait_with_ticks(
-        &mut self,
-        duration: Duration,
-        tick: &mut impl FnMut(&mut Self) -> Result<bool>,
-    ) -> Result<()> {
-        let deadline = Instant::now() + duration;
-        while Instant::now() < deadline {
-            if !tick(self)? {
-                bail!("workspace ended while sending input");
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if !remaining.is_zero() {
-                std::thread::sleep(Duration::from_millis(10).min(remaining));
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn active_logs(&mut self, ansi: bool) -> Result<Vec<u8>> {
         let index = self.resolve_pane(None)?;
         self.panes[index].session.logs(ansi)
@@ -911,8 +1961,19 @@ impl Workspace {
         bail!("workspace is not recording")
     }
 
+    fn has_recording(&mut self) -> Result<bool> {
+        for pane in &mut self.panes {
+            if pane.session.status()?.recording {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn stop(&mut self) {
         self.paste = None;
+        self.zoomed = None;
+        self.invalidate_frame();
         for pane in &mut self.panes {
             let _ = pane.session.stop();
         }
@@ -931,12 +1992,18 @@ impl Workspace {
                 panes: Vec::new(),
                 dividers: Vec::new(),
             });
+            self.invalidate_frame();
             return Ok(());
         };
-        match geometry(layout, self.cols, self.rows) {
+        let display = self
+            .zoomed
+            .map(LayoutNode::Leaf)
+            .unwrap_or_else(|| layout.clone());
+        match geometry(&display, self.cols, self.rows) {
             Ok(geometry) => self.apply_geometry(geometry),
             Err(_) => {
                 self.applied = AppliedLayout::Constrained(self.applied.geometry().clone());
+                self.invalidate_frame();
                 Ok(())
             }
         }
@@ -968,6 +2035,7 @@ impl Workspace {
             }
         }
         self.applied = AppliedLayout::Ready(geometry);
+        self.invalidate_frame();
         Ok(())
     }
 
@@ -988,6 +2056,10 @@ impl Workspace {
     }
 
     fn remove_layout_pane(&mut self, pane: PaneId) {
+        self.invalidate_frame();
+        if self.zoomed == Some(pane) {
+            self.zoomed = None;
+        }
         if let Some(layout) = self.layout.take() {
             let (layout, removed) = layout.remove_leaf(pane);
             debug_assert!(removed, "pane collection and layout tree diverged");
@@ -1034,14 +2106,42 @@ impl Workspace {
     }
 }
 
-impl Drop for Workspace {
+impl Drop for Window {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
+fn aggregate_statuses(statuses: &[SessionStatus], active: usize) -> Result<SessionStatus> {
+    let mut status = statuses
+        .get(active)
+        .context("workspace has no active status")?
+        .clone();
+    status.idle_for_ms = statuses
+        .iter()
+        .filter_map(|status| status.idle_for_ms)
+        .min();
+    status.has_visible_content = statuses.iter().any(|status| status.has_visible_content);
+    status.recording = statuses.iter().any(|status| status.recording);
+    status.logs_truncated = statuses.iter().any(|status| status.logs_truncated);
+    Ok(status)
+}
+
 fn shell_command() -> Vec<String> {
     vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned())]
+}
+
+fn validate_window_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("window name cannot be empty");
+    }
+    if name.len() > 64 {
+        bail!("window name cannot exceed 64 bytes");
+    }
+    if !crate::session::valid_name(name) {
+        bail!("window name may contain only ASCII letters, digits, '.', '-', and '_'");
+    }
+    Ok(())
 }
 
 fn geometry(layout: &LayoutNode, cols: u16, rows: u16) -> Result<WorkspaceGeometry> {
@@ -1067,23 +2167,28 @@ fn grid_layout(panes: &[PaneId], columns: u16, rows: u16) -> Result<LayoutNode> 
         (1, 1, [pane]) => Ok(LayoutNode::Leaf(*pane)),
         (2, 1, [left, right]) => Ok(LayoutNode::Split {
             axis: SplitAxis::Columns,
+            offset: 0,
             first: Box::new(LayoutNode::Leaf(*left)),
             second: Box::new(LayoutNode::Leaf(*right)),
         }),
         (1, 2, [top, bottom]) => Ok(LayoutNode::Split {
             axis: SplitAxis::Rows,
+            offset: 0,
             first: Box::new(LayoutNode::Leaf(*top)),
             second: Box::new(LayoutNode::Leaf(*bottom)),
         }),
         (2, 2, [top_left, top_right, bottom_left, bottom_right]) => Ok(LayoutNode::Split {
             axis: SplitAxis::Rows,
+            offset: 0,
             first: Box::new(LayoutNode::Split {
                 axis: SplitAxis::Columns,
+                offset: 0,
                 first: Box::new(LayoutNode::Leaf(*top_left)),
                 second: Box::new(LayoutNode::Leaf(*top_right)),
             }),
             second: Box::new(LayoutNode::Split {
                 axis: SplitAxis::Columns,
+                offset: 0,
                 first: Box::new(LayoutNode::Leaf(*bottom_left)),
                 second: Box::new(LayoutNode::Leaf(*bottom_right)),
             }),
@@ -1101,12 +2206,16 @@ fn place_layout(
         LayoutNode::Leaf(id) => geometry.panes.push(PlacedPane { id: *id, rect }),
         LayoutNode::Split {
             axis,
+            offset,
             first,
             second,
         } => {
             let (first_rect, second_rect, divider) = match axis {
                 SplitAxis::Columns if rect.cols >= 3 => {
-                    let first_cols = (rect.cols - 1) / 2;
+                    let available = rect.cols - 1;
+                    let first_cols = (i32::from(available / 2) + i32::from(*offset))
+                        .clamp(1, i32::from(available - 1))
+                        as u16;
                     (
                         PaneRect {
                             cols: first_cols,
@@ -1126,7 +2235,10 @@ fn place_layout(
                     )
                 }
                 SplitAxis::Rows if rect.rows >= 3 => {
-                    let first_rows = (rect.rows - 1) / 2;
+                    let available = rect.rows - 1;
+                    let first_rows = (i32::from(available / 2) + i32::from(*offset))
+                        .clamp(1, i32::from(available - 1))
+                        as u16;
                     (
                         PaneRect {
                             rows: first_rows,
@@ -1317,6 +2429,8 @@ enum InputAction {
     PasteEnd,
     Split(SplitAxis),
     Focus(Direction),
+    Resize(Direction),
+    ToggleZoom,
     Mouse {
         input: Vec<u8>,
         position: Option<(u16, u16)>,
@@ -1326,6 +2440,12 @@ enum InputAction {
         capture_end: bool,
     },
     CloseActive,
+    NewWindow,
+    NextWindow,
+    PreviousWindow,
+    SelectWindow(usize),
+    WindowList,
+    CloseWindow,
     Detach,
     PaneNumbers,
     Quit,
@@ -1358,8 +2478,8 @@ impl PrefixDecoder {
     fn push(&mut self, bytes: &[u8]) -> Vec<InputAction> {
         let mut actions = Vec::new();
         let mut plain = Vec::new();
+        let pending_since = self.pending_since.take();
         let mut input = std::mem::take(&mut self.pending);
-        self.pending_since = None;
         input.extend_from_slice(bytes);
         let mut index = 0;
         while index < input.len() {
@@ -1386,7 +2506,7 @@ impl PrefixDecoder {
                 }
                 self.pending
                     .extend_from_slice(&remaining[remaining.len() - keep..]);
-                self.pending_since = Some(Instant::now());
+                self.pending_since = pending_since.or_else(|| Some(Instant::now()));
                 break;
             }
             let remaining = &input[index..];
@@ -1400,7 +2520,7 @@ impl PrefixDecoder {
                 }
                 if is_prefix_arrow_start(remaining) {
                     self.pending.extend_from_slice(remaining);
-                    self.pending_since = Some(Instant::now());
+                    self.pending_since = pending_since.or_else(|| Some(Instant::now()));
                     break;
                 }
             }
@@ -1414,13 +2534,23 @@ impl PrefixDecoder {
                     index += end + 1;
                     continue;
                 }
+                if remaining.len() > MAX_SGR_MOUSE_BYTES {
+                    flush_plain(&mut actions, &mut plain);
+                    if self.waiting {
+                        actions.push(InputAction::Send(vec![PREFIX]));
+                        self.waiting = false;
+                    }
+                    actions.push(InputAction::Send(remaining.to_vec()));
+                    index = input.len();
+                    continue;
+                }
                 self.pending.extend_from_slice(remaining);
-                self.pending_since = Some(Instant::now());
+                self.pending_since = pending_since.or_else(|| Some(Instant::now()));
                 break;
             }
             if SGR_MOUSE_PREFIX.starts_with(remaining) {
                 self.pending.extend_from_slice(remaining);
-                self.pending_since = Some(Instant::now());
+                self.pending_since = pending_since.or_else(|| Some(Instant::now()));
                 break;
             }
             if remaining.starts_with(PASTE_START) {
@@ -1436,7 +2566,7 @@ impl PrefixDecoder {
             }
             if PASTE_START.starts_with(remaining) {
                 self.pending.extend_from_slice(remaining);
-                self.pending_since = Some(Instant::now());
+                self.pending_since = pending_since.or_else(|| Some(Instant::now()));
                 break;
             }
             let byte = input[index];
@@ -1450,10 +2580,21 @@ impl PrefixDecoder {
                     b'l' => InputAction::Focus(Direction::Right),
                     b'k' => InputAction::Focus(Direction::Up),
                     b'j' => InputAction::Focus(Direction::Down),
+                    b'H' => InputAction::Resize(Direction::Left),
+                    b'L' => InputAction::Resize(Direction::Right),
+                    b'K' => InputAction::Resize(Direction::Up),
+                    b'J' => InputAction::Resize(Direction::Down),
+                    b'z' => InputAction::ToggleZoom,
                     b'x' => InputAction::CloseActive,
+                    b'c' => InputAction::NewWindow,
+                    b'n' => InputAction::NextWindow,
+                    b'p' => InputAction::PreviousWindow,
+                    b'0'..=b'9' => InputAction::SelectWindow(usize::from(byte - b'0')),
+                    b'w' => InputAction::WindowList,
                     b'd' => InputAction::Detach,
                     b'q' => InputAction::PaneNumbers,
-                    b'&' => InputAction::Quit,
+                    b'&' => InputAction::CloseWindow,
+                    b'Q' => InputAction::Quit,
                     b'?' => InputAction::Help,
                     0x1b => InputAction::Cancel,
                     PREFIX => InputAction::Send(vec![PREFIX]),
@@ -1603,6 +2744,7 @@ fn partial_marker_len(bytes: &[u8], marker: &[u8]) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ArmedAction {
     Close(PaneId),
+    CloseWindow(WindowId),
     Quit,
 }
 
@@ -1682,14 +2824,21 @@ impl WorkspaceUi {
 pub(crate) struct WorkspaceTerminal {
     attachment: Option<WorkspaceAttachment>,
     decoder: PrefixDecoder,
+    pending_actions: VecDeque<InputAction>,
     ui: WorkspaceUi,
     mouse_target: Option<PaneId>,
     pending_removal: bool,
     finished: bool,
+    presentation_revision: Option<(WindowId, PaneId, u64)>,
+    paint_window: Option<(WindowId, u64)>,
+    paint_revisions: PaneRevisions,
+    revision_scratch: PaneRevisions,
+    painted_overlay: Option<String>,
 }
 
 struct WorkspaceAttachment {
     id: u64,
+    // This receiver must drop before `screen`; its writer joins the socket reader on drop.
     input: Receiver<Vec<u8>>,
     screen: OuterScreen,
 }
@@ -1708,10 +2857,16 @@ impl WorkspaceTerminal {
         Self {
             attachment: None,
             decoder: PrefixDecoder::default(),
+            pending_actions: VecDeque::new(),
             ui: WorkspaceUi::new(),
             mouse_target: None,
             pending_removal: false,
             finished: false,
+            presentation_revision: None,
+            paint_window: None,
+            paint_revisions: Vec::new(),
+            revision_scratch: Vec::new(),
+            painted_overlay: None,
         }
     }
 
@@ -1729,20 +2884,40 @@ impl WorkspaceTerminal {
         if self.is_attached() {
             bail!("workspace already has an attached terminal");
         }
+        let screen = OuterScreen::enter(writer)?;
+        let previous = workspace.selected_window().map(|window| {
+            (
+                window.theme,
+                window.cols,
+                window.rows,
+                window.options.cell_width,
+                window.options.cell_height,
+            )
+        })?;
         workspace.set_theme(options.theme)?;
-        workspace.resize(
+        if let Err(error) = workspace.resize(
             options.cols,
             options.rows,
             options.cell_width,
             options.cell_height,
-        )?;
+        ) {
+            let _ = workspace.set_theme(previous.0);
+            let _ = workspace.resize(previous.1, previous.2, previous.3, previous.4);
+            return Err(error);
+        }
         self.decoder = PrefixDecoder::default();
+        self.pending_actions.clear();
         self.ui = WorkspaceUi::new();
         self.mouse_target = None;
+        self.presentation_revision = None;
+        self.paint_window = None;
+        self.paint_revisions.clear();
+        self.revision_scratch.clear();
+        self.painted_overlay = None;
         self.attachment = Some(WorkspaceAttachment {
             id: options.id,
             input,
-            screen: OuterScreen::enter(writer)?,
+            screen,
         });
         Ok(())
     }
@@ -1803,9 +2978,6 @@ impl WorkspaceTerminal {
             self.finished = true;
             return Ok(false);
         }
-        if exited && self.attachment.is_none() {
-            let _final_frame = workspace.frame()?;
-        }
         if exited {
             if workspace.all_exits_observed() {
                 self.finished = true;
@@ -1826,18 +2998,29 @@ impl WorkspaceTerminal {
         if bells > 0 {
             attachment.screen.bell()?;
         }
-        attachment.screen.sync_title(&workspace.active_title()?)?;
         if !exited {
-            let mut actions = Vec::new();
-            loop {
+            let mut input_bytes = 0;
+            for _ in 0..MAX_ATTACHMENT_INPUTS_PER_TICK {
+                if input_bytes >= MAX_ATTACHMENT_INPUT_BYTES_PER_TICK
+                    || self.pending_actions.len() >= MAX_ATTACHMENT_ACTIONS_PER_TICK
+                {
+                    break;
+                }
                 match attachment.input.try_recv() {
-                    Ok(input) => actions.extend(self.decoder.push(&input)),
+                    Ok(input) => {
+                        input_bytes = input_bytes.saturating_add(input.len());
+                        self.pending_actions.extend(self.decoder.push(&input));
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return Ok(false),
                 }
             }
-            actions.extend(self.decoder.flush_ambiguous(Duration::from_millis(25)));
-            for action in actions {
+            self.pending_actions
+                .extend(self.decoder.flush_ambiguous(Duration::from_millis(25)));
+            for _ in 0..MAX_ATTACHMENT_ACTIONS_PER_TICK {
+                let Some(action) = self.pending_actions.pop_front() else {
+                    break;
+                };
                 match action {
                     InputAction::Send(input) => {
                         if let Some(confirmation) = self.ui.confirmation(&input) {
@@ -1855,6 +3038,15 @@ impl WorkspaceTerminal {
                                                 Duration::from_millis(1_500),
                                             );
                                         }
+                                    }
+                                }
+                                Some(ArmedAction::CloseWindow(window)) => {
+                                    if let Some(index) = workspace
+                                        .windows
+                                        .iter()
+                                        .position(|candidate| candidate.id == window)
+                                    {
+                                        workspace.close_window_index(index)?;
                                     }
                                 }
                                 Some(ArmedAction::Quit) => workspace.stop(),
@@ -1916,6 +3108,33 @@ impl WorkspaceTerminal {
                                 .notice(direction.unavailable(), Duration::from_millis(1_000));
                         }
                     }
+                    InputAction::Resize(direction) => {
+                        self.ui.clear_armed();
+                        match workspace.resize_active(direction, 5) {
+                            Ok(()) => self.ui.notice(
+                                format!("pane resized {}", direction.name()),
+                                Duration::from_millis(1_000),
+                            ),
+                            Err(error) => {
+                                attachment.screen.bell()?;
+                                self.ui
+                                    .notice(error.to_string(), Duration::from_millis(1_500));
+                            }
+                        }
+                    }
+                    InputAction::ToggleZoom => {
+                        self.ui.clear_armed();
+                        match workspace.toggle_active_zoom() {
+                            Ok(()) => self
+                                .ui
+                                .notice("pane zoom toggled", Duration::from_millis(1_000)),
+                            Err(error) => {
+                                attachment.screen.bell()?;
+                                self.ui
+                                    .notice(error.to_string(), Duration::from_millis(1_500));
+                            }
+                        }
+                    }
                     InputAction::Mouse {
                         input,
                         position,
@@ -1961,21 +3180,98 @@ impl WorkspaceTerminal {
                     }
                     InputAction::CloseActive => {
                         let pane = workspace.active_id().unwrap_or(0);
-                        let prompt = if workspace.panes.len() == 1 {
+                        let prompt = if workspace.selected_pane_count() == 1 {
                             format!("kill final pane {pane} and end workspace? (y/n)")
                         } else {
                             format!("kill pane {pane}? (y/n)")
                         };
                         self.ui.arm(ArmedAction::Close(pane), &prompt);
                     }
+                    InputAction::NewWindow => {
+                        self.ui.clear_armed();
+                        match workspace.create_window(None, &[], None) {
+                            Ok(_) => self.ui.notice(
+                                format!(
+                                    "window {} active",
+                                    workspace.active_window_name().unwrap_or("?")
+                                ),
+                                Duration::from_millis(1_200),
+                            ),
+                            Err(error) => {
+                                attachment.screen.bell()?;
+                                self.ui
+                                    .notice(error.to_string(), Duration::from_millis(1_500));
+                            }
+                        }
+                    }
+                    InputAction::NextWindow => {
+                        self.ui.clear_armed();
+                        if workspace.select_relative_window(1)? {
+                            self.ui.notice(
+                                format!(
+                                    "window {} active",
+                                    workspace.active_window_name().unwrap_or("?")
+                                ),
+                                Duration::from_millis(1_000),
+                            );
+                        }
+                    }
+                    InputAction::PreviousWindow => {
+                        self.ui.clear_armed();
+                        if workspace.select_relative_window(-1)? {
+                            self.ui.notice(
+                                format!(
+                                    "window {} active",
+                                    workspace.active_window_name().unwrap_or("?")
+                                ),
+                                Duration::from_millis(1_000),
+                            );
+                        }
+                    }
+                    InputAction::SelectWindow(index) => {
+                        self.ui.clear_armed();
+                        if workspace.select_window_index(index)? {
+                            self.ui.notice(
+                                format!(
+                                    "window {} active",
+                                    workspace.active_window_name().unwrap_or("?")
+                                ),
+                                Duration::from_millis(1_000),
+                            );
+                        } else {
+                            attachment.screen.bell()?;
+                            self.ui
+                                .notice(format!("no window {index}"), Duration::from_millis(1_000));
+                        }
+                    }
+                    InputAction::WindowList => {
+                        self.ui.clear_armed();
+                        let windows = workspace
+                            .windows()
+                            .into_iter()
+                            .map(|window| {
+                                if window.active {
+                                    format!("[{}:{}]", window.index, window.name)
+                                } else {
+                                    format!("{}:{}", window.index, window.name)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("  ");
+                        self.ui.notice(windows, Duration::from_secs(4));
+                    }
+                    InputAction::CloseWindow => {
+                        let window = workspace.active_window;
+                        let name = workspace.active_window_name().unwrap_or("?");
+                        self.ui.arm(
+                            ArmedAction::CloseWindow(window),
+                            &format!("kill window {name:?} and all its panes? (y/n)"),
+                        );
+                    }
                     InputAction::Detach => return Ok(false),
                     InputAction::PaneNumbers => {
                         self.ui.clear_armed();
-                        let mut panes = workspace
-                            .panes
-                            .iter()
-                            .map(|pane| pane.id)
-                            .collect::<Vec<_>>();
+                        let mut panes = workspace.selected_pane_ids();
                         panes.sort_unstable();
                         let active = workspace.active_id();
                         let panes = panes
@@ -2001,7 +3297,7 @@ impl WorkspaceTerminal {
                     InputAction::Help => {
                         self.ui.clear_armed();
                         self.ui.notice(
-                            "^B % side  \" stack  h/j/k/l focus  q panes  x pane  d detach  & all",
+                            "^B c new  n/p windows  0-9 select  w list  %/\" split  H/J/K/L resize  z zoom  x pane  & window  d detach",
                             Duration::from_secs(4),
                         );
                     }
@@ -2029,18 +3325,38 @@ impl WorkspaceTerminal {
                 }
             }
         }
-        attachment
-            .screen
-            .sync_input_modes(workspace.active_input_modes()?)?;
-        let mut frame = workspace.frame()?;
-        attachment.screen.sync_cursor_style(
-            workspace.active_cursor_style(),
-            frame.cursor.as_ref().is_some_and(|cursor| cursor.blinking),
-        )?;
-        if let Some(overlay) = self.ui.overlay(self.decoder.waiting()) {
-            add_overlay(&mut frame, &overlay);
+        let overlay = self.ui.overlay(self.decoder.waiting());
+        let mut revisions = std::mem::take(&mut self.revision_scratch);
+        let paint_window = workspace.active_frame_key(&mut revisions)?;
+        if self.paint_window != Some(paint_window)
+            || self.paint_revisions != revisions
+            || self.painted_overlay != overlay
+        {
+            let mut frame = workspace.frame_with_revisions(&revisions)?;
+            let presentation_revision = workspace.active_presentation_revision()?;
+            if self.presentation_revision != Some(presentation_revision) {
+                attachment.screen.sync_title(&workspace.active_title()?)?;
+                attachment
+                    .screen
+                    .sync_input_modes(workspace.active_input_modes()?)?;
+                attachment.screen.sync_cursor_style(
+                    workspace.active_cursor_style()?,
+                    frame.cursor.as_ref().is_some_and(|cursor| cursor.blinking),
+                )?;
+                self.presentation_revision = Some(presentation_revision);
+            }
+            if let Some(overlay) = &overlay {
+                add_overlay(&mut frame, overlay);
+            }
+            attachment.screen.paint(frame)?;
+            self.paint_window = Some(paint_window);
+            self.painted_overlay = overlay;
+        } else {
+            attachment.screen.flush()?;
         }
-        attachment.screen.paint(&frame)?;
+        self.paint_revisions.clear();
+        self.paint_revisions.extend_from_slice(&revisions);
+        self.revision_scratch = revisions;
         Ok(true)
     }
 }
@@ -2145,12 +3461,16 @@ impl OuterScreen {
         Ok(())
     }
 
-    pub(crate) fn paint(&mut self, frame: &Frame) -> Result<()> {
-        let changed = self.previous.as_ref() != Some(frame);
+    pub(crate) fn paint(&mut self, frame: Frame) -> Result<()> {
+        let changed = self.previous.as_ref() != Some(&frame);
         if changed {
-            write_frame_update(&mut self.output, self.previous.as_ref(), frame)?;
-            self.previous = Some(frame.clone());
+            write_frame_update(&mut self.output, self.previous.as_ref(), &frame)?;
+            self.previous = Some(frame);
         }
+        self.flush()
+    }
+
+    fn flush(&mut self) -> Result<()> {
         if self.output.is_empty() {
             return Ok(());
         }
@@ -2713,7 +4033,16 @@ mod tests {
         );
         assert_eq!(decoder.push(&[PREFIX, b'd']), [InputAction::Detach]);
         assert_eq!(decoder.push(&[PREFIX, b'q']), [InputAction::PaneNumbers]);
-        assert_eq!(decoder.push(&[PREFIX, b'&']), [InputAction::Quit]);
+        assert_eq!(decoder.push(&[PREFIX, b'c']), [InputAction::NewWindow]);
+        assert_eq!(decoder.push(&[PREFIX, b'n']), [InputAction::NextWindow]);
+        assert_eq!(decoder.push(&[PREFIX, b'p']), [InputAction::PreviousWindow]);
+        assert_eq!(
+            decoder.push(&[PREFIX, b'2']),
+            [InputAction::SelectWindow(2)]
+        );
+        assert_eq!(decoder.push(&[PREFIX, b'w']), [InputAction::WindowList]);
+        assert_eq!(decoder.push(&[PREFIX, b'&']), [InputAction::CloseWindow]);
+        assert_eq!(decoder.push(&[PREFIX, b'Q']), [InputAction::Quit]);
         assert!(decoder.push(&[PREFIX, 0x1b]).is_empty());
         assert!(decoder.push(b"[").is_empty());
         assert_eq!(decoder.push(b"A"), [InputAction::Focus(Direction::Up)]);
@@ -2721,11 +4050,35 @@ mod tests {
             decoder.push(&[PREFIX, 0x1b, b'O', b'D']),
             [InputAction::Focus(Direction::Left)]
         );
-        assert_eq!(decoder.push(&[PREFIX, b'z']), [InputAction::Unknown(b'z')]);
+        assert_eq!(decoder.push(&[PREFIX, b'z']), [InputAction::ToggleZoom]);
         assert_eq!(
             decoder.push(&[PREFIX, PREFIX]),
             [InputAction::Send(vec![PREFIX])]
         );
+    }
+
+    #[test]
+    fn prefix_decoder_bounds_unterminated_mouse_sequences() {
+        let mut decoder = PrefixDecoder::default();
+        let mut malformed = SGR_MOUSE_PREFIX.to_vec();
+        malformed.extend(std::iter::repeat_n(b'1', MAX_SGR_MOUSE_BYTES));
+
+        assert_eq!(
+            decoder.push(&malformed),
+            [InputAction::Send(malformed.clone())]
+        );
+        assert!(decoder.pending.is_empty());
+
+        let mut prefixed = vec![PREFIX];
+        prefixed.extend_from_slice(&malformed);
+        assert_eq!(
+            decoder.push(&prefixed),
+            [
+                InputAction::Send(vec![PREFIX]),
+                InputAction::Send(malformed)
+            ]
+        );
+        assert!(!decoder.waiting());
     }
 
     #[test]
@@ -2913,11 +4266,11 @@ mod tests {
             &options,
         )
         .unwrap();
-        workspace.shell = vec![
+        workspace.set_selected_shell(vec![
             "sh".to_owned(),
             "-c".to_owned(),
             "printf RIGHT; cat".to_owned(),
-        ];
+        ]);
         workspace.split(SplitAxis::Columns).unwrap();
         workspace.send(Some(1), b"AGENT\n").unwrap();
 
@@ -2973,11 +4326,11 @@ mod tests {
             &options,
         )
         .unwrap();
-        workspace.shell = vec![
+        workspace.set_selected_shell(vec![
             "sh".to_owned(),
             "-c".to_owned(),
             "printf BOTTOM; cat".to_owned(),
-        ];
+        ]);
         workspace.split(SplitAxis::Rows).unwrap();
         workspace.send(Some(1), b"AGENT\n").unwrap();
 
@@ -3127,11 +4480,11 @@ mod tests {
             &options,
         )
         .unwrap();
-        workspace.shell = vec![
+        workspace.set_selected_shell(vec![
             "sh".to_owned(),
             "-c".to_owned(),
             "printf TARGET-FINAL".to_owned(),
-        ];
+        ]);
         workspace.split(SplitAxis::Columns).unwrap();
 
         let shot = workspace
@@ -3148,6 +4501,119 @@ mod tests {
             .unwrap();
 
         assert!(shot.frame.text().contains("TARGET-FINAL"));
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn composed_capture_returns_a_windows_final_frame_before_removal() {
+        let mut workspace = Workspace::start(
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf WINDOW-FINAL".to_owned(),
+            ],
+            None,
+            None,
+            &Options {
+                cols: 40,
+                rows: 8,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut terminal = WorkspaceTerminal::detached();
+
+        let shot = workspace
+            .capture_window(
+                "main",
+                Duration::from_secs(600),
+                Duration::from_secs(2),
+                |workspace| terminal.tick(workspace),
+            )
+            .unwrap();
+
+        assert!(shot.frame.text().contains("WINDOW-FINAL"));
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_hidden_zoom_does_not_change_window_selection() {
+        let shell = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        let mut workspace = Workspace::start(&shell, None, None, &Options::default()).unwrap();
+        workspace
+            .create_window(Some("single"), &shell, None)
+            .unwrap();
+        workspace.select_window("main").unwrap();
+
+        assert!(workspace.toggle_zoom_pane(1).is_err());
+        assert_eq!(workspace.active_window_name(), Some("main"));
+        assert_eq!(workspace.windows()[1].zoomed_pane, None);
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_attachment_setup_preserves_workspace_presentation() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("expected attachment failure"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let shell = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        let options = Options {
+            cols: 80,
+            rows: 24,
+            ..Options::default()
+        };
+        let mut workspace = Workspace::start(&shell, None, None, &options).unwrap();
+        let mut terminal = WorkspaceTerminal::detached();
+        let (_send, receive) = std::sync::mpsc::channel();
+        let attached = WorkspaceAttachmentOptions {
+            id: 1,
+            cols: 120,
+            rows: 40,
+            cell_width: 10,
+            cell_height: 20,
+            theme: TerminalTheme::default(),
+        };
+
+        assert!(
+            terminal
+                .attach(&mut workspace, receive, Box::new(FailingWriter), attached,)
+                .is_err()
+        );
+        assert_eq!(
+            (workspace.windows()[0].cols, workspace.windows()[0].rows),
+            (80, 24)
+        );
+        assert!(!terminal.is_attached());
+
+        let (_send, receive) = std::sync::mpsc::channel();
+        terminal
+            .attach(
+                &mut workspace,
+                receive,
+                Box::new(std::io::sink()),
+                WorkspaceAttachmentOptions {
+                    id: 2,
+                    cols: 100,
+                    rows: 30,
+                    cell_width: 9,
+                    cell_height: 18,
+                    theme: TerminalTheme::default(),
+                },
+            )
+            .unwrap();
+        assert!(terminal.is_attached());
         workspace.stop();
     }
 
@@ -3227,6 +4693,140 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn named_windows_keep_independent_layouts_and_global_pane_ids() {
+        let options = Options {
+            cols: 41,
+            rows: 13,
+            ..Options::default()
+        };
+        let command = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        let mut workspace = Workspace::start(&command, None, None, &options).unwrap();
+
+        assert_eq!(
+            workspace
+                .windows()
+                .iter()
+                .map(|window| (window.name.as_str(), window.active_pane))
+                .collect::<Vec<_>>(),
+            [("main", Some(0))]
+        );
+        workspace
+            .create_window(Some("logs"), &command, None)
+            .unwrap();
+        workspace.set_grid(2, 1).unwrap();
+        assert_eq!(workspace.active_window_name(), Some("logs"));
+        assert_eq!(
+            workspace
+                .panes()
+                .unwrap()
+                .iter()
+                .map(|pane| pane.id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+
+        workspace.select_window("main").unwrap();
+        workspace.send(Some(1), b"HIDDEN\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            workspace.pump().unwrap();
+            if workspace.windows[1]
+                .shot(Some(1))
+                .unwrap()
+                .frame
+                .text()
+                .contains("HIDDEN")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "hidden pane output did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(workspace.active_window_name(), Some("main"));
+        workspace.set_selected_shell(command.to_vec());
+        workspace.split(SplitAxis::Rows).unwrap();
+        assert_eq!(
+            workspace
+                .panes()
+                .unwrap()
+                .iter()
+                .map(|pane| pane.id)
+                .collect::<Vec<_>>(),
+            [0, 3]
+        );
+        assert_eq!(workspace.windows()[1].pane_count, 2);
+
+        workspace.rename_window("logs", "output").unwrap();
+        assert!(workspace.rename_window("output", "main").is_err());
+        workspace.move_pane(3, "output", false).unwrap();
+        assert_eq!(
+            workspace
+                .panes_in(Some("main"))
+                .unwrap()
+                .iter()
+                .map(|pane| pane.id)
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert_eq!(
+            workspace
+                .panes_in(Some("output"))
+                .unwrap()
+                .iter()
+                .map(|pane| pane.id)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        workspace.send(Some(3), b"MOVED\n").unwrap();
+        assert_eq!(workspace.active_window_name(), Some("main"));
+        workspace.close_window("output").unwrap();
+        assert_eq!(workspace.windows().len(), 1);
+        assert_eq!(workspace.active_window_name(), Some("main"));
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_hidden_window_is_removed_without_changing_selection() {
+        let options = Options {
+            cols: 41,
+            rows: 13,
+            ..Options::default()
+        };
+        let shell = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        let mut workspace = Workspace::start(&shell, None, None, &options).unwrap();
+        workspace
+            .create_window(
+                Some("short"),
+                &["sh".to_owned(), "-c".to_owned(), "printf DONE".to_owned()],
+                None,
+            )
+            .unwrap();
+        workspace.select_window("main").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            workspace.pump().unwrap();
+            if workspace.observe_exits().unwrap() {
+                workspace.remove_observed_exits().unwrap();
+            }
+            if workspace.windows().len() == 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "hidden window did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(workspace.active_window_name(), Some("main"));
+        assert_eq!(workspace.windows()[0].active_pane, Some(0));
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn semantic_grid_focus_and_close_share_one_layout_tree() {
         let options = Options {
             cols: 41,
@@ -3240,7 +4840,7 @@ mod tests {
             &options,
         )
         .unwrap();
-        workspace.shell = vec!["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        workspace.set_selected_shell(vec!["sh".to_owned(), "-c".to_owned(), "cat".to_owned()]);
 
         workspace.set_grid(2, 2).unwrap();
         let panes = workspace.panes().unwrap();
@@ -3275,6 +4875,123 @@ mod tests {
         workspace.close_pane(0).unwrap();
         assert!(workspace.send_paste(b"ignored after close").unwrap());
         assert!(workspace.end_paste().unwrap());
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_resize_and_zoom_preserve_the_recursive_layout() {
+        let options = Options {
+            cols: 41,
+            rows: 13,
+            ..Options::default()
+        };
+        let shell = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        let mut workspace = Workspace::start(&shell, None, None, &options).unwrap();
+        workspace.set_selected_shell(shell.to_vec());
+        workspace.set_grid(2, 2).unwrap();
+
+        workspace.resize_pane(3, Direction::Left, 4).unwrap();
+        workspace.resize_pane(3, Direction::Up, 2).unwrap();
+        let panes = workspace.panes().unwrap();
+        assert_eq!(
+            panes
+                .iter()
+                .map(|pane| (pane.id, pane.x, pane.y, pane.cols, pane.rows))
+                .collect::<Vec<_>>(),
+            [
+                (0, 0, 0, 20, 4),
+                (1, 21, 0, 20, 4),
+                (2, 0, 5, 16, 8),
+                (3, 17, 5, 24, 8),
+            ]
+        );
+        assert!(workspace.resize_pane(3, Direction::Right, 1).is_err());
+
+        workspace.toggle_zoom_pane(3).unwrap();
+        assert_eq!(workspace.windows()[0].zoomed_pane, Some(3));
+        let panes = workspace.panes().unwrap();
+        assert_eq!(
+            panes
+                .iter()
+                .map(|pane| (pane.id, pane.visible, pane.cols, pane.rows))
+                .collect::<Vec<_>>(),
+            [
+                (0, false, 20, 4),
+                (1, false, 20, 4),
+                (2, false, 16, 8),
+                (3, true, 41, 13),
+            ]
+        );
+        assert_eq!(
+            (
+                workspace.frame().unwrap().cols,
+                workspace.frame().unwrap().rows
+            ),
+            (41, 13)
+        );
+
+        workspace.toggle_zoom_pane(3).unwrap();
+        assert_eq!(workspace.windows()[0].zoomed_pane, None);
+        assert!(workspace.panes().unwrap().iter().all(|pane| pane.visible));
+        assert_eq!(
+            workspace
+                .panes()
+                .unwrap()
+                .iter()
+                .map(|pane| (pane.id, pane.x, pane.y, pane.cols, pane.rows))
+                .collect::<Vec<_>>(),
+            [
+                (0, 0, 0, 20, 4),
+                (1, 21, 0, 20, 4),
+                (2, 0, 5, 16, 8),
+                (3, 17, 5, 24, 8),
+            ]
+        );
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn constrained_layout_and_failed_move_preserve_presentation_state() {
+        let options = Options {
+            cols: 41,
+            rows: 13,
+            ..Options::default()
+        };
+        let shell = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        let mut workspace = Workspace::start(&shell, None, None, &options).unwrap();
+        workspace.set_selected_shell(shell.to_vec());
+        workspace.set_grid(2, 1).unwrap();
+        let mut revisions = Vec::new();
+        let before = workspace.active_frame_key(&mut revisions).unwrap();
+        workspace.resize(2, 13, 9, 18).unwrap();
+        let constrained = workspace.active_frame_key(&mut revisions).unwrap();
+        assert_ne!(before, constrained);
+        assert!(
+            workspace
+                .selected_window()
+                .unwrap()
+                .applied
+                .is_constrained()
+        );
+        workspace.resize(41, 13, 9, 18).unwrap();
+
+        workspace.toggle_zoom_pane(0).unwrap();
+        workspace
+            .create_window(Some("target"), &shell, None)
+            .unwrap();
+        workspace.set_selected_shell(shell.to_vec());
+        workspace.set_grid(2, 1).unwrap();
+        workspace.toggle_zoom_pane(2).unwrap();
+        workspace.resize(2, 13, 9, 18).unwrap();
+
+        assert!(workspace.move_pane(1, "target", false).is_err());
+        let windows = workspace.windows();
+        assert_eq!(windows[0].zoomed_pane, Some(0));
+        assert_eq!(windows[1].zoomed_pane, Some(2));
+        assert_eq!(windows[0].pane_count, 2);
+        assert_eq!(windows[1].pane_count, 2);
         workspace.stop();
     }
 }

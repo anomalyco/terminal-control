@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::frame::{
     Attributes, Cell, Cursor, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, FORMAT_VERSION, Frame,
 };
+use crate::recording;
 use crate::session::{Session, SessionLaunch, SessionState, SessionStatus};
 use crate::shot::{Options, Shot};
 use crate::terminal_core::InputModes;
@@ -33,6 +34,7 @@ const MAX_ATTACHMENT_INPUTS_PER_TICK: usize = 64;
 const MAX_ATTACHMENT_INPUT_BYTES_PER_TICK: usize = 64 * 1024;
 const MAX_ATTACHMENT_ACTIONS_PER_TICK: usize = 1024;
 const MAX_WORKSPACE_PANES: usize = 64;
+const TAB_STRIP_ROWS: u16 = 1;
 
 pub(crate) struct Workspace {
     windows: Vec<Window>,
@@ -40,6 +42,16 @@ pub(crate) struct Workspace {
     next_window_id: WindowId,
     next_pane_id: PaneId,
     launch: SessionLaunch,
+    cols: u16,
+    rows: u16,
+    chrome_generation: u64,
+    recording: Option<WorkspaceRecording>,
+}
+
+struct WorkspaceRecording {
+    writer: recording::Writer,
+    window: Option<(WindowId, u64, u64)>,
+    revisions: PaneRevisions,
 }
 
 pub(crate) struct Window {
@@ -59,6 +71,7 @@ pub(crate) struct Window {
     zoomed: Option<PaneId>,
     cached_frame: Option<(PaneRevisions, Frame)>,
     frame_generation: u64,
+    activity: bool,
 }
 
 struct WindowIdentity {
@@ -75,6 +88,8 @@ pub struct WindowStatus {
     pub active_pane: Option<PaneId>,
     #[serde(default)]
     pub zoomed_pane: Option<PaneId>,
+    #[serde(default)]
+    pub activity: bool,
     pub cols: u16,
     pub rows: u16,
 }
@@ -388,6 +403,9 @@ impl Workspace {
         options: &Options,
         theme: TerminalTheme,
     ) -> Result<Self> {
+        let mut content_options = options.clone();
+        content_options.rows = content_rows(options.rows)?;
+        let started = Instant::now();
         let mut main = Window::start_with_theme(
             WindowIdentity {
                 id: 0,
@@ -396,17 +414,40 @@ impl Workspace {
             0,
             command,
             cwd,
-            record,
-            options,
+            None,
+            &content_options,
             theme,
         )?;
-        let launch = main.panes[0].session.status()?.launch;
+        let mut launch = main.panes[0].session.status()?.launch;
+        launch.rows = options.rows;
+        launch.record = record.map(Path::to_path_buf);
+        let recording = record
+            .map(|path| {
+                recording::Writer::new(
+                    path,
+                    started,
+                    options.cols,
+                    options.rows,
+                    options.cell_width,
+                    options.cell_height,
+                )
+                .map(|writer| WorkspaceRecording {
+                    writer,
+                    window: None,
+                    revisions: Vec::new(),
+                })
+            })
+            .transpose()?;
         Ok(Self {
             windows: vec![main],
             active_window: 0,
             next_window_id: 1,
             next_pane_id: 1,
             launch,
+            cols: options.cols,
+            rows: options.rows,
+            chrome_generation: 0,
+            recording,
         })
     }
 
@@ -469,8 +510,9 @@ impl Workspace {
                 pane_count: window.panes.len(),
                 active_pane: window.active,
                 zoomed_pane: window.zoomed,
-                cols: window.cols,
-                rows: window.rows,
+                activity: window.activity,
+                cols: self.cols,
+                rows: self.rows,
             })
             .collect()
     }
@@ -480,11 +522,22 @@ impl Workspace {
         self.windows[index].panes()
     }
 
+    #[cfg(test)]
     pub(crate) fn set_grid_in(
         &mut self,
         name: Option<&str>,
         columns: u16,
         rows: u16,
+    ) -> Result<Vec<PaneStatus>> {
+        self.set_grid_in_with_command(name, columns, rows, None)
+    }
+
+    pub(crate) fn set_grid_in_with_command(
+        &mut self,
+        name: Option<&str>,
+        columns: u16,
+        rows: u16,
+        command: Option<&[String]>,
     ) -> Result<Vec<PaneStatus>> {
         let index = self.window_index_or_active(name)?;
         let current = self.pane_count();
@@ -497,8 +550,9 @@ impl Workspace {
         let next_pane_id = first_new_id
             .checked_add(u32::try_from(added).unwrap_or(u32::MAX))
             .context("workspace exhausted stable pane ids")?;
-        self.windows[index].set_grid(columns, rows, first_new_id)?;
+        self.windows[index].set_grid(columns, rows, first_new_id, command)?;
         self.next_pane_id = next_pane_id;
+        self.chrome_generation = self.chrome_generation.wrapping_add(1);
         self.windows[index].panes()
     }
 
@@ -586,6 +640,7 @@ impl Workspace {
         self.windows.push(window);
         self.next_window_id = next_window_id;
         self.next_pane_id = next_pane_id;
+        self.chrome_generation = self.chrome_generation.wrapping_add(1);
         self.select_window_id(id)?;
         Ok(id)
     }
@@ -601,6 +656,7 @@ impl Workspace {
         }
         let index = self.window_index(name)?;
         self.windows[index].name = new_name.to_owned();
+        self.chrome_generation = self.chrome_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -632,6 +688,8 @@ impl Workspace {
             let _ = self.windows[current].send_focus(active, false);
         }
         self.active_window = id;
+        self.windows[next].activity = false;
+        self.chrome_generation = self.chrome_generation.wrapping_add(1);
         let active = self.windows[next].active;
         let _ = self.windows[next].send_focus(active, true);
         Ok(())
@@ -661,6 +719,7 @@ impl Workspace {
             let _ = self.windows[index].send_focus(active, false);
         }
         self.windows.remove(index);
+        self.chrome_generation = self.chrome_generation.wrapping_add(1);
         if self.windows.is_empty() {
             return Ok(());
         }
@@ -706,8 +765,33 @@ impl Workspace {
 
     pub(crate) fn pump(&mut self) -> Result<()> {
         for window in &mut self.windows {
-            window.pump()?;
+            let changed = window.pump()?;
+            if changed && window.id != self.active_window && !window.activity {
+                window.activity = true;
+                self.chrome_generation = self.chrome_generation.wrapping_add(1);
+            }
         }
+        self.record_frame()?;
+        Ok(())
+    }
+
+    fn record_frame(&mut self) -> Result<()> {
+        if self.recording.is_none() || self.windows.is_empty() {
+            return Ok(());
+        }
+        let mut revisions = Vec::new();
+        let window = self.active_frame_key(&mut revisions)?;
+        if self.recording.as_ref().is_some_and(|recording| {
+            recording.window == Some(window) && recording.revisions == revisions
+        }) {
+            return Ok(());
+        }
+        let frame = self.frame_with_revisions(&revisions)?;
+        let bytes = frame_ansi(&frame)?;
+        let recording = self.recording.as_mut().expect("recording checked above");
+        recording.writer.output_now(&bytes)?;
+        recording.window = Some(window);
+        recording.revisions = revisions;
         Ok(())
     }
 
@@ -763,6 +847,7 @@ impl Workspace {
         let result = self.selected_window_mut()?.split(axis, pane);
         if result.is_ok() || self.pane_window_index(pane).is_some() {
             self.next_pane_id = next_pane_id;
+            self.chrome_generation = self.chrome_generation.wrapping_add(1);
         }
         result
     }
@@ -784,6 +869,8 @@ impl Workspace {
         self.windows[window].close_pane(pane, focused)?;
         if self.windows[window].is_empty() {
             self.close_window_index(window)?;
+        } else {
+            self.chrome_generation = self.chrome_generation.wrapping_add(1);
         }
         Ok(())
     }
@@ -813,6 +900,7 @@ impl Workspace {
             bail!("window needs at least two panes to zoom");
         }
         self.windows[window].toggle_zoom(pane)?;
+        self.chrome_generation = self.chrome_generation.wrapping_add(1);
         self.focus_pane(pane)?;
         self.panes_in(None)
     }
@@ -954,6 +1042,7 @@ impl Workspace {
             let active = self.windows[source].active;
             let _ = self.windows[source].send_focus(active, true);
         }
+        self.chrome_generation = self.chrome_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -1036,7 +1125,7 @@ impl Workspace {
                 bail!("window ended before capture completed");
             };
             if pane.is_none() && self.windows[window_index].all_exits_observed() {
-                return self.windows[window_index].shot(None);
+                return self.shot_in_window(window_index, None);
             }
             if let Some(pane) = pane {
                 let pane_index = self.windows[window_index].resolve_pane(Some(pane))?;
@@ -1048,7 +1137,7 @@ impl Workspace {
                 }
             }
             if !running {
-                return self.windows[window_index].shot(pane);
+                return self.shot_in_window(window_index, pane);
             }
             let idle = match pane {
                 Some(pane) => {
@@ -1065,10 +1154,21 @@ impl Workspace {
                     .unwrap_or_else(|| started.elapsed()),
             };
             if settle.is_zero() || idle >= settle || Instant::now() >= deadline {
-                return self.windows[window_index].shot(pane);
+                return self.shot_in_window(window_index, pane);
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn shot_in_window(&mut self, window: usize, pane: Option<PaneId>) -> Result<Shot> {
+        if let Some(pane) = pane {
+            return self.windows[window].shot(Some(pane));
+        }
+        let selected = self.windows[window].id;
+        let mut frame = self.windows[window].frame()?;
+        self.add_tab_strip(&mut frame, selected);
+        let ansi = frame_ansi(&frame)?;
+        Ok(Shot { frame, ansi })
     }
 
     pub(crate) fn wait_for_text(
@@ -1125,25 +1225,42 @@ impl Workspace {
         cell_width: u16,
         cell_height: u16,
     ) -> Result<()> {
-        let Some(first) = self.windows.first() else {
+        if self.windows.is_empty() {
             return Ok(());
-        };
+        }
+        let content_rows = content_rows(rows)?;
         let previous = (
-            first.cols,
-            first.rows,
-            first.options.cell_width,
-            first.options.cell_height,
+            self.cols,
+            self.rows,
+            self.windows[0].options.cell_width,
+            self.windows[0].options.cell_height,
         );
         if previous == (cols, rows, cell_width, cell_height) {
             return Ok(());
         }
         for index in 0..self.windows.len() {
-            if let Err(error) = self.windows[index].resize(cols, rows, cell_width, cell_height) {
+            if let Err(error) =
+                self.windows[index].resize(cols, content_rows, cell_width, cell_height)
+            {
                 for window in &mut self.windows[..=index] {
-                    let _ = window.resize(previous.0, previous.1, previous.2, previous.3);
+                    let _ = window.resize(
+                        previous.0,
+                        previous.1 - TAB_STRIP_ROWS,
+                        previous.2,
+                        previous.3,
+                    );
                 }
                 return Err(error);
             }
+        }
+        self.cols = cols;
+        self.rows = rows;
+        self.chrome_generation = self.chrome_generation.wrapping_add(1);
+        if let Some(recording) = &mut self.recording {
+            recording
+                .writer
+                .resize(cols, rows, cell_width, cell_height)?;
+            recording.window = None;
         }
         Ok(())
     }
@@ -1157,7 +1274,10 @@ impl Workspace {
             statuses.push(window.status()?);
         }
         let mut status = aggregate_statuses(&statuses, active)?;
+        status.cols = self.cols;
+        status.rows = self.rows;
         status.launch = self.launch.clone();
+        status.recording = self.recording.is_some();
         Ok(status)
     }
 
@@ -1166,10 +1286,9 @@ impl Workspace {
     }
 
     pub(crate) fn mark_recording(&mut self, name: &str) -> Result<()> {
-        for window in &mut self.windows {
-            if window.has_recording()? {
-                return window.mark_recording(name);
-            }
+        self.pump()?;
+        if let Some(recording) = &mut self.recording {
+            return recording.writer.marker(name);
         }
         bail!("workspace is not recording")
     }
@@ -1212,7 +1331,9 @@ impl Workspace {
 
     #[cfg(test)]
     fn frame(&mut self) -> Result<Frame> {
-        self.selected_window_mut()?.frame()
+        let mut frame = self.selected_window_mut()?.frame()?;
+        self.add_tab_strip(&mut frame, self.active_window);
+        Ok(frame)
     }
 
     fn active_title(&self) -> Result<String> {
@@ -1220,7 +1341,12 @@ impl Workspace {
     }
 
     fn active_input_modes(&self) -> Result<InputModes> {
-        self.selected_window()?.active_input_modes()
+        let mut modes = self.selected_window()?.active_input_modes()?;
+        if self.windows.len() > 1 {
+            modes.normal_mouse = true;
+            modes.sgr_mouse = true;
+        }
+        Ok(modes)
     }
 
     fn send_active_if_open(&mut self, input: &[u8]) -> Result<bool> {
@@ -1289,7 +1415,7 @@ impl Workspace {
         Ok(self.selected_window()?.active_cursor_style())
     }
 
-    fn active_presentation_revision(&self) -> Result<(WindowId, PaneId, u64)> {
+    fn active_presentation_revision(&self) -> Result<(WindowId, PaneId, u64, u64)> {
         let window = self.selected_window()?;
         let pane = window.active.context("workspace has no active pane")?;
         let index = window
@@ -1299,17 +1425,112 @@ impl Workspace {
             window.id,
             pane,
             window.panes[index].session.frame_revision(),
+            self.chrome_generation,
         ))
     }
 
-    fn active_frame_key(&self, revisions: &mut PaneRevisions) -> Result<(WindowId, u64)> {
+    fn active_frame_key(&self, revisions: &mut PaneRevisions) -> Result<(WindowId, u64, u64)> {
         let window = self.selected_window()?;
         window.pane_revisions(revisions);
-        Ok((window.id, window.frame_generation))
+        Ok((window.id, window.frame_generation, self.chrome_generation))
     }
 
     fn frame_with_revisions(&mut self, revisions: &PaneRevisions) -> Result<Frame> {
-        self.selected_window_mut()?.frame_with_revisions(revisions)
+        let mut frame = self
+            .selected_window_mut()?
+            .frame_with_revisions(revisions)?;
+        self.add_tab_strip(&mut frame, self.active_window);
+        Ok(frame)
+    }
+
+    fn add_tab_strip(&self, frame: &mut Frame, selected: WindowId) {
+        frame.rows = self.rows;
+        let y = self.rows - TAB_STRIP_ROWS;
+        frame.cells.push(Cell {
+            x: 0,
+            y,
+            text: String::new(),
+            width: self.cols,
+            foreground: frame.foreground,
+            background: frame.background,
+            attributes: Attributes::default(),
+        });
+        for tab in self.tab_labels(selected) {
+            let window = &self.windows[tab.index];
+            for (offset, character) in tab.text.chars().enumerate() {
+                let Ok(offset) = u16::try_from(offset) else {
+                    break;
+                };
+                let x = tab.start.saturating_add(offset);
+                if x >= self.cols {
+                    break;
+                }
+                let active = window.id == selected;
+                frame.cells.push(Cell {
+                    x,
+                    y,
+                    text: character.to_string(),
+                    width: 1,
+                    foreground: if active {
+                        frame.background
+                    } else {
+                        frame.foreground
+                    },
+                    background: if active {
+                        frame.foreground
+                    } else {
+                        frame.background
+                    },
+                    attributes: Attributes {
+                        bold: active || window.activity,
+                        faint: !active && !window.activity,
+                        ..Attributes::default()
+                    },
+                });
+            }
+        }
+    }
+
+    fn tab_index_at(&self, x: u16, y: u16) -> Option<usize> {
+        if y != self.rows.checked_sub(TAB_STRIP_ROWS)? {
+            return None;
+        }
+        self.tab_labels(self.active_window)
+            .into_iter()
+            .find_map(|tab| (x >= tab.start && x < tab.end).then_some(tab.index))
+    }
+
+    fn tab_labels(&self, selected: WindowId) -> Vec<TabLabel> {
+        let mut x = 0_u16;
+        self.windows
+            .iter()
+            .enumerate()
+            .map_while(|(index, window)| {
+                let activity = if window.activity { "*" } else { "" };
+                let panes = if window.panes.len() > 1 {
+                    format!(" {}p", window.panes.len())
+                } else {
+                    String::new()
+                };
+                let zoom = if window.zoomed.is_some() { " Z" } else { "" };
+                let label = format!("{index}:{}{activity}{panes}{zoom}", window.name);
+                let text = if window.id == selected {
+                    format!("[{label}]")
+                } else {
+                    label
+                };
+                let width = u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
+                let start = x;
+                let end = start.saturating_add(width).min(self.cols);
+                x = end.saturating_add(2);
+                (start < self.cols).then_some(TabLabel {
+                    index,
+                    start,
+                    end,
+                    text,
+                })
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -1318,6 +1539,13 @@ impl Workspace {
             window.shell = shell;
         }
     }
+}
+
+struct TabLabel {
+    index: usize,
+    start: u16,
+    end: u16,
+    text: String,
 }
 
 impl Drop for Workspace {
@@ -1373,6 +1601,7 @@ impl Window {
             zoomed: None,
             cached_frame: None,
             frame_generation: 0,
+            activity: false,
         })
     }
 
@@ -1409,11 +1638,14 @@ impl Window {
         Ok(())
     }
 
-    pub(crate) fn pump(&mut self) -> Result<()> {
+    pub(crate) fn pump(&mut self) -> Result<bool> {
+        let mut changed = false;
         for pane in &mut self.panes {
+            let before = pane.session.frame_revision();
             pane.session.pump()?;
+            changed |= before != pane.session.frame_revision();
         }
-        Ok(())
+        Ok(changed)
     }
 
     pub(crate) fn observe_exits(&mut self) -> Result<bool> {
@@ -1479,7 +1711,7 @@ impl Window {
             .find(|pane| pane.id == new_id)
             .map(|pane| pane.rect)
             .context("new pane has no layout rectangle")?;
-        let pane = self.spawn_pane(new_id, rect)?;
+        let pane = self.spawn_pane(new_id, rect, None)?;
         self.panes.push(pane);
         if let Err(error) = self.apply_geometry(geometry) {
             if let Some(mut pane) = self.panes.pop() {
@@ -1491,7 +1723,13 @@ impl Window {
         self.focus_pane(new_id)
     }
 
-    pub(crate) fn set_grid(&mut self, columns: u16, rows: u16, first_new_id: PaneId) -> Result<()> {
+    pub(crate) fn set_grid(
+        &mut self,
+        columns: u16,
+        rows: u16,
+        first_new_id: PaneId,
+        command: Option<&[String]>,
+    ) -> Result<()> {
         if !(1..=2).contains(&columns) || !(1..=2).contains(&rows) {
             bail!("workspace grids support one or two columns and rows");
         }
@@ -1517,6 +1755,7 @@ impl Window {
         }
         let geometry = geometry(&layout, self.cols, self.rows)?;
         let mut added = Vec::new();
+        let mut command = command.filter(|command| !command.is_empty());
         for id in ids
             .iter()
             .copied()
@@ -1528,7 +1767,7 @@ impl Window {
                 .find(|pane| pane.id == id)
                 .map(|pane| pane.rect)
                 .context("new pane has no layout rectangle")?;
-            added.push(self.spawn_pane(id, rect)?);
+            added.push(self.spawn_pane(id, rect, command.take())?);
         }
         let added_len = added.len();
         self.panes.extend(added);
@@ -1952,24 +2191,6 @@ impl Window {
         self.panes[index].session.logs(ansi)
     }
 
-    pub(crate) fn mark_recording(&mut self, name: &str) -> Result<()> {
-        for pane in &mut self.panes {
-            if pane.session.status()?.recording {
-                return pane.session.mark(name);
-            }
-        }
-        bail!("workspace is not recording")
-    }
-
-    fn has_recording(&mut self) -> Result<bool> {
-        for pane in &mut self.panes {
-            if pane.session.status()?.recording {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     pub(crate) fn stop(&mut self) {
         self.paste = None;
         self.zoomed = None;
@@ -2039,14 +2260,14 @@ impl Window {
         Ok(())
     }
 
-    fn spawn_pane(&self, id: PaneId, rect: PaneRect) -> Result<Pane> {
+    fn spawn_pane(&self, id: PaneId, rect: PaneRect, command: Option<&[String]>) -> Result<Pane> {
         let mut options = self.options.clone();
         options.cols = rect.cols;
         options.rows = rect.rows;
         Ok(Pane {
             id,
             session: Session::start_with_theme(
-                &self.shell,
+                command.unwrap_or(&self.shell),
                 Some(&self.cwd),
                 None,
                 &options,
@@ -2129,6 +2350,12 @@ fn aggregate_statuses(statuses: &[SessionStatus], active: usize) -> Result<Sessi
 
 fn shell_command() -> Vec<String> {
     vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned())]
+}
+
+fn content_rows(rows: u16) -> Result<u16> {
+    rows.checked_sub(TAB_STRIP_ROWS)
+        .filter(|rows| *rows > 0)
+        .context("workspace needs at least two rows for content and tabs")
 }
 
 fn validate_window_name(name: &str) -> Result<()> {
@@ -2829,8 +3056,8 @@ pub(crate) struct WorkspaceTerminal {
     mouse_target: Option<PaneId>,
     pending_removal: bool,
     finished: bool,
-    presentation_revision: Option<(WindowId, PaneId, u64)>,
-    paint_window: Option<(WindowId, u64)>,
+    presentation_revision: Option<(WindowId, PaneId, u64, u64)>,
+    paint_window: Option<(WindowId, u64, u64)>,
     paint_revisions: PaneRevisions,
     revision_scratch: PaneRevisions,
     painted_overlay: Option<String>,
@@ -2888,8 +3115,8 @@ impl WorkspaceTerminal {
         let previous = workspace.selected_window().map(|window| {
             (
                 window.theme,
-                window.cols,
-                window.rows,
+                workspace.cols,
+                workspace.rows,
                 window.options.cell_width,
                 window.options.cell_height,
             )
@@ -3143,6 +3370,16 @@ impl WorkspaceTerminal {
                         captured_event,
                         capture_end,
                     } => {
+                        if let Some((x, y)) = position
+                            && y == workspace.rows - TAB_STRIP_ROWS
+                        {
+                            self.mouse_target = None;
+                            if primary_press && let Some(index) = workspace.tab_index_at(x, y) {
+                                self.ui.clear_armed();
+                                workspace.select_window_index(index)?;
+                            }
+                            continue;
+                        }
                         if workspace.is_multi_pane() || self.mouse_target.is_some() {
                             let target = position.and_then(|(x, y)| {
                                 if captured_event {
@@ -4309,6 +4546,74 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn workspace_recording_replays_composed_panes_windows_and_tabs() {
+        let record = std::env::temp_dir().join(format!(
+            "termctrl-workspace-recording-{}-{:?}.termctrl",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let options = Options {
+            cols: 31,
+            rows: 7,
+            ..Options::default()
+        };
+        let mut workspace = Workspace::start(
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf LEFT; cat".to_owned(),
+            ],
+            None,
+            Some(&record),
+            &options,
+        )
+        .unwrap();
+        workspace.set_selected_shell(vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf RIGHT; cat".to_owned(),
+        ]);
+        workspace.split(SplitAxis::Columns).unwrap();
+        workspace
+            .create_window(
+                Some("other"),
+                &[
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf HIDDEN; cat".to_owned(),
+                ],
+                None,
+            )
+            .unwrap();
+        workspace.select_window("main").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            workspace.pump().unwrap();
+            let text = workspace.frame().unwrap().text();
+            if text.contains("LEFT") && text.contains("RIGHT") && text.contains("1:other*") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "workspace output did not arrive");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        workspace.rename_window("other", "renamed").unwrap();
+        workspace.mark_recording("composed").unwrap();
+        assert!(workspace.status().unwrap().recording);
+        drop(workspace);
+
+        let replayed = crate::recording::shot_at(&record, None, Some("composed")).unwrap();
+        let text = replayed.frame.text();
+        assert!(text.contains("LEFT"), "{text:?}");
+        assert!(text.contains("RIGHT"), "{text:?}");
+        assert!(text.contains("[0:main 2p]"), "{text:?}");
+        assert!(text.contains("1:renamed*"), "{text:?}");
+        assert_eq!((replayed.frame.cols, replayed.frame.rows), (31, 7));
+        let _ = std::fs::remove_file(record);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn real_workspace_stacks_panes_and_focuses_vertically() {
         let options = Options {
             cols: 21,
@@ -4359,7 +4664,7 @@ mod tests {
                 .into_iter()
                 .map(|pane| (pane.cols, pane.rows))
                 .collect::<Vec<_>>(),
-            [(21, 3), (21, 3)]
+            [(21, 2), (21, 3)]
         );
         workspace.resize(21, 9, 9, 18).unwrap();
         assert_eq!(
@@ -4369,12 +4674,12 @@ mod tests {
                 .into_iter()
                 .map(|pane| (pane.cols, pane.rows))
                 .collect::<Vec<_>>(),
-            [(21, 4), (21, 4)]
+            [(21, 3), (21, 4)]
         );
         workspace.resize(21, 2, 9, 18).unwrap();
         assert_eq!(workspace.status().unwrap().rows, 2);
         workspace.set_grid(1, 2).unwrap();
-        assert_eq!(workspace.panes().unwrap()[1].y, 5);
+        assert_eq!(workspace.panes().unwrap()[1].y, 4);
         let constrained = workspace.frame().unwrap();
         assert_eq!(constrained.rows, 2);
         assert!(
@@ -4391,7 +4696,7 @@ mod tests {
             .unwrap();
         let panes = workspace.panes().unwrap();
         assert_eq!(panes.len(), 1);
-        assert_eq!((panes[0].cols, panes[0].rows), (21, 9));
+        assert_eq!((panes[0].cols, panes[0].rows), (21, 8));
         workspace.stop();
     }
 
@@ -4598,13 +4903,34 @@ mod tests {
         assert!(!terminal.is_attached());
 
         let (_send, receive) = std::sync::mpsc::channel();
+        assert!(
+            terminal
+                .attach(
+                    &mut workspace,
+                    receive,
+                    Box::new(std::io::sink()),
+                    WorkspaceAttachmentOptions {
+                        id: 2,
+                        cols: 120,
+                        rows: 1,
+                        cell_width: 10,
+                        cell_height: 20,
+                        theme: TerminalTheme::default(),
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!((workspace.cols, workspace.rows), (80, 24));
+        assert_eq!(workspace.panes().unwrap()[0].rows, 23);
+
+        let (_send, receive) = std::sync::mpsc::channel();
         terminal
             .attach(
                 &mut workspace,
                 receive,
                 Box::new(std::io::sink()),
                 WorkspaceAttachmentOptions {
-                    id: 2,
+                    id: 3,
                     cols: 100,
                     rows: 30,
                     cell_width: 9,
@@ -4790,6 +5116,100 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn tab_strip_persists_and_hidden_output_marks_activity_until_selection() {
+        let options = Options {
+            cols: 41,
+            rows: 7,
+            ..Options::default()
+        };
+        let command = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        let mut workspace = Workspace::start(&command, None, None, &options).unwrap();
+
+        assert_eq!(workspace.panes().unwrap()[0].rows, 6);
+        assert!(workspace.frame().unwrap().text().contains("[0:main]"));
+        workspace
+            .create_window(Some("logs"), &command, None)
+            .unwrap();
+        workspace.select_window("main").unwrap();
+        workspace.send(Some(1), b"ACTIVITY\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !workspace.windows()[1].activity {
+            workspace.pump().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "hidden output did not mark activity"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let frame = workspace.frame().unwrap();
+        assert!(frame.text().contains("1:logs*"));
+        let logs = workspace
+            .tab_labels(workspace.active_window)
+            .into_iter()
+            .find(|tab| tab.index == 1)
+            .unwrap();
+        assert_eq!(workspace.tab_index_at(logs.start, 6), Some(1));
+        workspace.select_window_index(1).unwrap();
+        assert!(!workspace.windows()[1].activity);
+        assert!(workspace.frame().unwrap().text().contains("[1:logs]"));
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alternate_screen_pane_repaints_its_full_width_after_layout_resizes() {
+        let options = Options {
+            cols: 81,
+            rows: 9,
+            ..Options::default()
+        };
+        let shell = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        let redraw = [
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "draw() { set -- $(stty size); printf '\\033[?1049h\\033[2J\\033[%s;1H\\033[7m%*s\\033[0m' \"$1\" \"$2\" RESIZE; }; trap draw WINCH; while :; do draw; sleep 0.05; done"
+                .to_owned(),
+        ];
+        let mut workspace = Workspace::start(&shell, None, None, &options).unwrap();
+        workspace
+            .set_grid_in_with_command(None, 2, 1, Some(&redraw))
+            .unwrap();
+
+        for cols in [101, 61, 121, 81, 101, 61, 121, 81, 101, 61, 121, 81] {
+            workspace.resize(cols, 9, 9, 18).unwrap();
+            let expected = workspace.panes().unwrap()[1].cols;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                workspace.pump().unwrap();
+                let frame = workspace.windows[0].panes[1]
+                    .session
+                    .current_frame()
+                    .unwrap();
+                let bottom = frame.rows - 1;
+                let painted = frame
+                    .cells
+                    .iter()
+                    .filter(|cell| cell.y == bottom && cell.background != frame.background)
+                    .map(|cell| cell.x.saturating_add(cell.width))
+                    .max()
+                    .unwrap_or(0);
+                if frame.cols == expected && frame.text().contains("RESIZE") && painted == expected
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "alternate screen remained partially blank at {expected} columns: painted {painted}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn exited_hidden_window_is_removed_without_changing_selection() {
         let options = Options {
             cols: 41,
@@ -4854,7 +5274,7 @@ mod tests {
                 .iter()
                 .map(|pane| (pane.x, pane.y, pane.cols, pane.rows))
                 .collect::<Vec<_>>(),
-            [(0, 0, 20, 6), (21, 0, 20, 6), (0, 7, 20, 6), (21, 7, 20, 6),]
+            [(0, 0, 20, 5), (21, 0, 20, 5), (0, 6, 20, 6), (21, 6, 20, 6),]
         );
         assert!(workspace.set_grid(2, 1).is_err());
         workspace.focus_pane(3).unwrap();
@@ -4863,9 +5283,9 @@ mod tests {
         assert_eq!(workspace.active_id(), Some(0));
         workspace.focus_pane(3).unwrap();
         assert_eq!(workspace.active_id(), Some(3));
-        assert_eq!(workspace.pane_at(22, 8), Some((3, 1, 1)));
+        assert_eq!(workspace.pane_at(22, 8), Some((3, 1, 2)));
         assert_eq!(workspace.pane_at(20, 6), None);
-        assert_eq!(workspace.pane_position(0, 22, 8), Some((0, 19, 5)));
+        assert_eq!(workspace.pane_position(0, 22, 8), Some((0, 19, 4)));
         workspace.close_pane(1).unwrap();
         assert_eq!(workspace.active_id(), Some(3));
         assert_eq!(workspace.panes().unwrap().len(), 3);
@@ -4900,10 +5320,10 @@ mod tests {
                 .map(|pane| (pane.id, pane.x, pane.y, pane.cols, pane.rows))
                 .collect::<Vec<_>>(),
             [
-                (0, 0, 0, 20, 4),
-                (1, 21, 0, 20, 4),
-                (2, 0, 5, 16, 8),
-                (3, 17, 5, 24, 8),
+                (0, 0, 0, 20, 3),
+                (1, 21, 0, 20, 3),
+                (2, 0, 4, 16, 8),
+                (3, 17, 4, 24, 8),
             ]
         );
         assert!(workspace.resize_pane(3, Direction::Right, 1).is_err());
@@ -4917,10 +5337,10 @@ mod tests {
                 .map(|pane| (pane.id, pane.visible, pane.cols, pane.rows))
                 .collect::<Vec<_>>(),
             [
-                (0, false, 20, 4),
-                (1, false, 20, 4),
+                (0, false, 20, 3),
+                (1, false, 20, 3),
                 (2, false, 16, 8),
-                (3, true, 41, 13),
+                (3, true, 41, 12),
             ]
         );
         assert_eq!(
@@ -4942,10 +5362,10 @@ mod tests {
                 .map(|pane| (pane.id, pane.x, pane.y, pane.cols, pane.rows))
                 .collect::<Vec<_>>(),
             [
-                (0, 0, 0, 20, 4),
-                (1, 21, 0, 20, 4),
-                (2, 0, 5, 16, 8),
-                (3, 17, 5, 24, 8),
+                (0, 0, 0, 20, 3),
+                (1, 21, 0, 20, 3),
+                (2, 0, 4, 16, 8),
+                (3, 17, 4, 24, 8),
             ]
         );
         workspace.stop();

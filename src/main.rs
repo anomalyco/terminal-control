@@ -203,6 +203,8 @@ enum Command {
     Status(StatusArgs),
     /// List named local sessions and their states.
     List(ListArgs),
+    /// Remove retained exited sessions and stale sockets.
+    Prune(PruneArgs),
     /// List panes in a running workspace.
     Panes(PanesArgs),
     /// List named windows in a running workspace.
@@ -428,7 +430,7 @@ struct RunArgs {
     /// Working directory for the terminal command.
     #[arg(long)]
     cwd: Option<PathBuf>,
-    /// Record the initial pane; split panes are not yet included.
+    /// Record the composed workspace, including tabs, splits, and window switches.
     #[arg(long)]
     record: Option<PathBuf>,
     /// Color environment policy for the terminal command.
@@ -503,9 +505,19 @@ struct StatusArgs {
 
 #[derive(Args)]
 struct ListArgs {
-    /// Write structured JSON entries, including stale sockets.
+    /// Include retained exited sessions and stale sockets.
+    #[arg(long)]
+    all: bool,
+    /// Write structured JSON entries.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+struct PruneArgs {
+    /// Show removable entries without deleting them.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -572,6 +584,9 @@ struct LayoutArgs {
     /// Desired grid: 1x1, 2x1, 1x2, or 2x2.
     #[arg(long, value_parser = parse_grid)]
     grid: (u16, u16),
+    /// Command for the first pane created while growing the layout; defaults to $SHELL.
+    #[arg(last = true, allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 #[derive(Args)]
@@ -871,6 +886,7 @@ fn main() -> Result<()> {
         Command::Send(args) => send(args)?,
         Command::Status(args) => status(args)?,
         Command::List(args) => list(args)?,
+        Command::Prune(args) => prune(args)?,
         Command::Panes(args) => panes(args)?,
         Command::Windows(args) => windows(args)?,
         Command::NewWindow(args) => {
@@ -896,6 +912,7 @@ fn main() -> Result<()> {
                 args.window,
                 args.grid.0,
                 args.grid.1,
+                args.command,
             )?;
             print_panes(&panes, true)?;
         }
@@ -1225,7 +1242,16 @@ fn status(args: StatusArgs) -> Result<()> {
 }
 
 fn list(args: ListArgs) -> Result<()> {
-    let sessions = session::list()?;
+    let sessions = session::list()?
+        .into_iter()
+        .filter(|entry| {
+            args.all
+                || entry
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.state == session::SessionState::Running)
+        })
+        .collect::<Vec<_>>();
     if args.json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);
     } else {
@@ -1248,6 +1274,40 @@ fn list(args: ListArgs) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn prune(args: PruneArgs) -> Result<()> {
+    let candidates = session::list()?
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .status
+                .as_ref()
+                .is_some_and(|status| status.state == session::SessionState::Exited)
+                || entry.unavailable == Some(session::UnavailableReason::Stale)
+        })
+        .collect::<Vec<_>>();
+    let mut removed = 0;
+    for entry in candidates {
+        if let Some(kind) = session::prune(&entry.name, args.dry_run)? {
+            let kind = match kind {
+                session::PruneKind::Exited => "exited",
+                session::PruneKind::Stale => "stale",
+            };
+            println!("{}\t{kind}", entry.name);
+            removed += 1;
+        }
+    }
+    eprintln!(
+        "{} {}",
+        if args.dry_run {
+            "would remove"
+        } else {
+            "removed"
+        },
+        removed
+    );
     Ok(())
 }
 
@@ -1313,7 +1373,7 @@ fn run_session(args: &RunArgs) -> Result<()> {
         None => session::infer_name(&args.command)?,
     };
     let (cols, rows) = crossterm::terminal::size().unwrap_or((args.cols, args.rows));
-    validate_terminal_size(cols, rows)?;
+    validate_workspace_size(cols, rows)?;
     let options = shot_engine::Options {
         cols,
         rows,
@@ -1336,7 +1396,7 @@ fn run_session(args: &RunArgs) -> Result<()> {
 fn attach_session(args: &AttachArgs) -> Result<()> {
     let (cols, rows) = crossterm::terminal::size()
         .context("read current terminal size for workspace attachment")?;
-    validate_terminal_size(cols, rows)?;
+    validate_workspace_size(cols, rows)?;
     session::attach(
         &args.name,
         &shot_engine::Options {
@@ -1520,6 +1580,14 @@ fn session_input(events: &[String], paced: bool) -> Result<Vec<Vec<u8>>> {
 fn validate_terminal_size(cols: u16, rows: u16) -> Result<()> {
     if cols == 0 || rows == 0 {
         bail!("terminal dimensions must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_workspace_size(cols: u16, rows: u16) -> Result<()> {
+    validate_terminal_size(cols, rows)?;
+    if rows < 2 {
+        bail!("workspace needs at least two rows for content and tabs");
     }
     Ok(())
 }
@@ -1762,6 +1830,21 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["termctrl", "layout", "workspace", "--grid", "2x2"]).is_ok());
+        let cli = Cli::try_parse_from([
+            "termctrl",
+            "layout",
+            "workspace",
+            "--grid",
+            "2x1",
+            "--",
+            "nvim",
+            "--clean",
+        ])
+        .unwrap();
+        let Command::Layout(layout) = cli.command else {
+            panic!("expected layout command");
+        };
+        assert_eq!(layout.command, ["nvim", "--clean"]);
         assert!(
             Cli::try_parse_from([
                 "termctrl",
@@ -1802,6 +1885,9 @@ mod tests {
             Cli::try_parse_from(["termctrl", "show", "workspace", "--window", "editor"]).is_ok()
         );
         assert!(Cli::try_parse_from(["termctrl", "status", "demo", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "list", "--all", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "prune", "--dry-run"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "termctrl", "resize", "demo", "--cols", "120", "--rows", "40"
@@ -1920,6 +2006,8 @@ mod tests {
     fn rejects_zero_terminal_dimensions() {
         assert!(validate_terminal_size(0, 24).is_err());
         assert!(validate_terminal_size(80, 0).is_err());
+        assert!(validate_workspace_size(80, 1).is_err());
+        assert!(validate_workspace_size(80, 2).is_ok());
     }
 
     #[test]

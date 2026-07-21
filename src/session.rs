@@ -19,10 +19,23 @@ pub use crate::workspace::{Direction as PaneDirection, PaneStatus, WindowStatus}
 const OUTPUT_QUEUE: usize = 64;
 const OUTPUT_BATCH: usize = OUTPUT_QUEUE;
 const OUTPUT_CHUNK: usize = 1024;
+const INITIAL_OUTPUT_GRACE: Duration = Duration::from_millis(50);
 const CONTROL_PROTOCOL_VERSION: u8 = 1;
 const ATTACH_PROTOCOL_VERSION: u8 = 2;
 const WINDOW_PROTOCOL_VERSION: u8 = 3;
-const CURRENT_PROTOCOL_VERSION: u8 = WINDOW_PROTOCOL_VERSION;
+const LAYOUT_COMMAND_PROTOCOL_VERSION: u8 = 4;
+const CURRENT_PROTOCOL_VERSION: u8 = LAYOUT_COMMAND_PROTOCOL_VERSION;
+const ATTACHED_TERMINAL_ERROR: &str = "workspace already has an attached terminal";
+
+fn attachment_rejection(name: &str, error: &str) -> anyhow::Error {
+    if error == ATTACHED_TERMINAL_ERROR {
+        anyhow::anyhow!(
+            "workspace {name:?} already has an attached terminal; detach it there with ctrl-b d, or choose another workspace with `termctrl run NAME`"
+        )
+    } else {
+        anyhow::anyhow!(error.to_owned())
+    }
+}
 
 struct Output {
     at_ms: u64,
@@ -145,11 +158,17 @@ pub struct NamedSessionStatus {
 }
 
 /// Why a named session socket could not report normal status.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnavailableReason {
     Stale,
     IncompatibleProtocol,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PruneKind {
+    Exited,
+    Stale,
 }
 
 impl Session {
@@ -219,15 +238,10 @@ impl Session {
             .master
             .take_writer()
             .context("open session PTY writer")?;
-        let child = pair
-            .slave
-            .spawn_command(builder)
-            .context("spawn session command")?;
-        drop(pair.slave);
-        #[cfg(unix)]
-        let process_group = child.process_id().and_then(|pid| i32::try_from(pid).ok());
         let (send, receive) = mpsc::sync_channel(OUTPUT_QUEUE);
+        let (reader_ready, wait_for_reader) = mpsc::sync_channel(1);
         thread::spawn(move || {
+            let _ = reader_ready.send(());
             let mut buffer = [0_u8; OUTPUT_CHUNK];
             loop {
                 match reader.read(&mut buffer) {
@@ -248,6 +262,16 @@ impl Session {
             }
             let _ = send.send(None);
         });
+        wait_for_reader
+            .recv()
+            .context("session PTY reader exited during startup")?;
+        let child = pair
+            .slave
+            .spawn_command(builder)
+            .context("spawn session command")?;
+        drop(pair.slave);
+        #[cfg(unix)]
+        let process_group = child.process_id().and_then(|pid| i32::try_from(pid).ok());
         Ok(Self {
             master: pair.master,
             child,
@@ -413,7 +437,10 @@ impl Session {
                 Some(CaptureReason::Exited)
             } else if self.output_closed {
                 Some(CaptureReason::OutputClosed)
-            } else if self.last_output.unwrap_or(started).elapsed() >= settle {
+            } else if self.last_output.map_or_else(
+                || settle.is_zero() || started.elapsed() >= settle.max(INITIAL_OUTPUT_GRACE),
+                |last_output| last_output.elapsed() >= settle,
+            ) {
                 Some(CaptureReason::Idle)
             } else if Instant::now() >= deadline {
                 Some(CaptureReason::Deadline)
@@ -870,6 +897,8 @@ enum Request {
         name: String,
         columns: u16,
         rows: u16,
+        #[serde(default)]
+        command: Vec<String>,
     },
     ShowWindow {
         name: String,
@@ -907,6 +936,8 @@ enum Request {
     Layout {
         columns: u16,
         rows: u16,
+        #[serde(default)]
+        command: Vec<String>,
     },
     FocusPane {
         pane: crate::workspace::PaneId,
@@ -1212,6 +1243,7 @@ pub fn set_workspace_layout_in_window(
     window: Option<String>,
     columns: u16,
     rows: u16,
+    command: Vec<String>,
 ) -> Result<Vec<crate::workspace::PaneStatus>> {
     match window {
         Some(name) => pane_response(request(
@@ -1220,9 +1252,17 @@ pub fn set_workspace_layout_in_window(
                 name,
                 columns,
                 rows,
+                command,
             },
         )?),
-        None => set_workspace_layout(workspace, columns, rows),
+        None => pane_response(request(
+            workspace,
+            Request::Layout {
+                columns,
+                rows,
+                command,
+            },
+        )?),
     }
 }
 
@@ -1288,6 +1328,15 @@ fn require_window_protocol(response: &Response) -> Result<()> {
     Ok(())
 }
 
+fn require_layout_command_protocol(response: &Response) -> Result<()> {
+    if response.protocol_version < LAYOUT_COMMAND_PROTOCOL_VERSION {
+        bail!(
+            "running workspace predates pane startup commands; restart it with the current termctrl"
+        );
+    }
+    Ok(())
+}
+
 #[doc(hidden)]
 pub fn create_workspace_window(
     workspace: &str,
@@ -1347,8 +1396,16 @@ pub fn set_workspace_layout(
     name: &str,
     columns: u16,
     rows: u16,
+    command: Vec<String>,
 ) -> Result<Vec<crate::workspace::PaneStatus>> {
-    pane_response(request(name, Request::Layout { columns, rows })?)
+    pane_response(request(
+        name,
+        Request::Layout {
+            columns,
+            rows,
+            command,
+        },
+    )?)
 }
 
 #[doc(hidden)]
@@ -1409,6 +1466,12 @@ pub fn list() -> Result<Vec<NamedSessionStatus>> {
 pub fn stop(name: &str) -> Result<()> {
     request(name, Request::Stop)?;
     Ok(())
+}
+
+#[doc(hidden)]
+pub fn prune(name: &str, dry_run: bool) -> Result<Option<PruneKind>> {
+    validate_name(name)?;
+    implementation::prune(name, dry_run)
 }
 
 #[doc(hidden)]
@@ -1473,17 +1536,23 @@ pub fn infer_name(command: &[String]) -> Result<String> {
     Ok(name.to_owned())
 }
 
-fn request(name: &str, request: Request) -> Result<Response> {
+fn request(name: &str, operation: Request) -> Result<Response> {
     validate_name(name)?;
+    let requires_layout_command = match &operation {
+        Request::Layout { command, .. } | Request::WindowLayout { command, .. } => {
+            !command.is_empty()
+        }
+        _ => false,
+    };
     let requires_pane_protocol = matches!(
-        request,
+        operation,
         Request::Panes
             | Request::Layout { .. }
             | Request::FocusPane { .. }
             | Request::ClosePane { .. }
     );
     let requires_window_protocol = matches!(
-        request,
+        operation,
         Request::Windows
             | Request::CreateWindow { .. }
             | Request::SelectWindow { .. }
@@ -1499,12 +1568,18 @@ fn request(name: &str, request: Request) -> Result<Response> {
             | Request::ResizePane { .. }
             | Request::ToggleZoom { .. }
     );
-    let response = implementation::request(socket_path(name)?, &request)?;
+    if requires_layout_command {
+        require_layout_command_protocol(&request(name, Request::Ping)?)?;
+    }
+    let response = implementation::request(socket_path(name)?, &operation)?;
     if requires_pane_protocol {
         require_pane_protocol(&response)?;
     }
     if requires_window_protocol {
         require_window_protocol(&response)?;
+    }
+    if requires_layout_command {
+        require_layout_command_protocol(&response)?;
     }
     if let Some(error) = response.error {
         bail!(error);
@@ -1550,7 +1625,8 @@ mod implementation {
     use anyhow::{Context, Result, bail};
 
     use super::{
-        ATTACH_PROTOCOL_VERSION, NamedSessionStatus, Request, Response, Session, UnavailableReason,
+        ATTACH_PROTOCOL_VERSION, ATTACHED_TERMINAL_ERROR, NamedSessionStatus, PruneKind, Request,
+        Response, Session, SessionState, UnavailableReason,
     };
     use crate::shot::{self, Options};
     use crate::workspace::{Workspace, WorkspaceAttachmentOptions, WorkspaceTerminal};
@@ -2012,7 +2088,7 @@ mod implementation {
                 );
             }
             if let Some(error) = response.error {
-                bail!(error);
+                return Err(super::attachment_rejection(name, &error));
             }
             mark("attach-request");
             let mut stream = endpoint.accept(Instant::now() + Duration::from_secs(5))?;
@@ -2191,13 +2267,12 @@ mod implementation {
             let (status, error, unavailable) = match request(path, &Request::Status) {
                 Ok(response) => (response.status, response.error, None),
                 Err(error) => {
-                    let error = format!("{error:#}");
-                    let reason = if error.contains("read session response") {
-                        UnavailableReason::IncompatibleProtocol
-                    } else {
+                    let reason = if stale_socket_error(&error) {
                         UnavailableReason::Stale
+                    } else {
+                        UnavailableReason::IncompatibleProtocol
                     };
-                    (None, Some(error), Some(reason))
+                    (None, Some(format!("{error:#}")), Some(reason))
                 }
             };
             sessions.push(NamedSessionStatus {
@@ -2209,6 +2284,74 @@ mod implementation {
         }
         sessions.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(sessions)
+    }
+
+    pub fn prune(name: &str, dry_run: bool) -> Result<Option<PruneKind>> {
+        let runtime = runtime_dir()?;
+        prune_in(&runtime, name, dry_run)
+    }
+
+    fn prune_in(runtime: &Path, name: &str, dry_run: bool) -> Result<Option<PruneKind>> {
+        let _lock = StartLock::acquire(&runtime.join(format!("{name}.lock")))?;
+        let socket = runtime.join(format!("{name}.sock"));
+        ensure_socket_path(&socket)?;
+        let metadata = match fs::symlink_metadata(&socket) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect session socket {}", socket.display()));
+            }
+        };
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            bail!(
+                "refusing to prune untrusted session socket {}",
+                socket.display()
+            );
+        }
+        match request(socket.clone(), &Request::Status) {
+            Ok(response) => {
+                if let Some(error) = response.error {
+                    bail!(error);
+                }
+                let status = response
+                    .status
+                    .context("session did not return status while pruning")?;
+                if status.state != SessionState::Exited {
+                    return Ok(None);
+                }
+                if !dry_run {
+                    let response = request(socket, &Request::Stop)?;
+                    if let Some(error) = response.error {
+                        bail!(error);
+                    }
+                }
+                Ok(Some(PruneKind::Exited))
+            }
+            Err(error) if stale_socket_error(&error) => {
+                if !dry_run {
+                    fs::remove_file(&socket).with_context(|| {
+                        format!("remove stale session socket {}", socket.display())
+                    })?;
+                }
+                Ok(Some(PruneKind::Stale))
+            }
+            Err(error) => Err(error).context("refusing to prune an unresponsive session"),
+        }
+    }
+
+    fn stale_socket_error(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionRefused | ErrorKind::NotFound
+                )
+            })
+        })
     }
 
     pub fn serve(
@@ -2769,9 +2912,15 @@ mod implementation {
                 name,
                 columns,
                 rows,
+                command,
             } => {
                 terminal.tick(workspace)?;
-                response.panes = Some(workspace.set_grid_in(Some(&name), columns, rows)?);
+                response.panes = Some(workspace.set_grid_in_with_command(
+                    Some(&name),
+                    columns,
+                    rows,
+                    Some(&command),
+                )?);
             }
             Request::ShowWindow {
                 name,
@@ -2838,12 +2987,21 @@ mod implementation {
                 response.panes = Some(workspace.toggle_zoom_pane(pane)?);
             }
             Request::Panes => response.panes = Some(workspace.panes_in(None)?),
-            Request::Layout { columns, rows } => {
+            Request::Layout {
+                columns,
+                rows,
+                command,
+            } => {
                 terminal.tick(workspace)?;
                 if workspace.is_empty() {
                     bail!("workspace has ended");
                 }
-                response.panes = Some(workspace.set_grid_in(None, columns, rows)?);
+                response.panes = Some(workspace.set_grid_in_with_command(
+                    None,
+                    columns,
+                    rows,
+                    Some(&command),
+                )?);
             }
             Request::FocusPane { pane } => {
                 terminal.tick(workspace)?;
@@ -2875,7 +3033,7 @@ mod implementation {
                     bail!("workspace has ended");
                 }
                 if terminal.is_attached() {
-                    bail!("workspace already has an attached terminal");
+                    bail!(ATTACHED_TERMINAL_ERROR);
                 }
                 let runtime = runtime_dir()?;
                 let metadata = fs::metadata(&socket)
@@ -2974,12 +3132,47 @@ mod implementation {
             assert!(StartLock::acquire(&path).is_ok());
             let _ = fs::remove_file(path);
         }
+
+        #[test]
+        fn only_connection_failures_identify_stale_sockets() {
+            let stale = anyhow::Error::new(std::io::Error::from(ErrorKind::ConnectionRefused));
+            let incompatible = anyhow::Error::new(std::io::Error::from(ErrorKind::UnexpectedEof));
+
+            assert!(stale_socket_error(&stale));
+            assert!(!stale_socket_error(&incompatible));
+        }
+
+        #[test]
+        fn prune_dry_run_preserves_and_prune_removes_a_trusted_stale_socket() {
+            let runtime = std::env::temp_dir().join(format!(
+                "termctrl-prune-test-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::create_dir_all(&runtime).unwrap();
+            let socket = runtime.join("stale.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+            drop(listener);
+
+            assert_eq!(
+                prune_in(&runtime, "stale", true).unwrap(),
+                Some(PruneKind::Stale)
+            );
+            assert!(socket.exists());
+            assert_eq!(
+                prune_in(&runtime, "stale", false).unwrap(),
+                Some(PruneKind::Stale)
+            );
+            assert!(!socket.exists());
+            let _ = fs::remove_dir_all(runtime);
+        }
     }
 }
 
 #[cfg(not(unix))]
 mod implementation {
-    use super::{NamedSessionStatus, Options, Request, Response};
+    use super::{NamedSessionStatus, Options, PruneKind, Request, Response};
     use anyhow::{Result, bail};
     use std::path::{Path, PathBuf};
 
@@ -3023,6 +3216,9 @@ mod implementation {
     pub fn list() -> Result<Vec<NamedSessionStatus>> {
         bail!("persistent sessions require Unix sockets")
     }
+    pub fn prune(_: &str, _: bool) -> Result<Option<PruneKind>> {
+        bail!("persistent sessions require Unix sockets")
+    }
     pub fn serve(
         _: PathBuf,
         _: Vec<String>,
@@ -3046,6 +3242,16 @@ mod implementation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn occupied_workspace_attachment_error_names_recovery_actions() {
+        let error = attachment_rejection("editor", "workspace already has an attached terminal")
+            .to_string();
+
+        assert!(error.contains("workspace \"editor\""));
+        assert!(error.contains("ctrl-b d"));
+        assert!(error.contains("termctrl run NAME"));
+    }
 
     #[test]
     fn old_control_responses_deserialize_but_require_a_workspace_restart() {
@@ -3086,7 +3292,13 @@ mod tests {
                 .to_string()
                 .contains("predates named windows")
         );
-        assert_eq!(Response::default().protocol_version, 3);
+        assert!(
+            require_layout_command_protocol(&response)
+                .unwrap_err()
+                .to_string()
+                .contains("predates pane startup commands")
+        );
+        assert_eq!(Response::default().protocol_version, 4);
     }
 
     #[test]
@@ -3095,6 +3307,7 @@ mod tests {
             Request::Layout {
                 columns: 2,
                 rows: 2,
+                command: vec!["nvim".to_owned()],
             },
             Request::FocusPane { pane: 3 },
             Request::ClosePane { pane: 2 },
@@ -3118,6 +3331,7 @@ mod tests {
                 name: "code".to_owned(),
                 columns: 2,
                 rows: 1,
+                command: Vec::new(),
             },
             Request::CloseWindow {
                 name: "code".to_owned(),
@@ -3252,6 +3466,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(capture.reason, CaptureReason::Deadline);
+        session.stop().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn short_settling_waits_for_initial_output_grace() {
+        let mut session = Session::start(
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "sleep 0.02; printf READY".to_owned(),
+            ],
+            None,
+            None,
+            &Options::default(),
+        )
+        .unwrap();
+
+        let capture = session
+            .capture(Duration::from_millis(10), Duration::from_secs(2))
+            .unwrap();
+
+        assert_eq!(capture.shot.frame.text(), "READY");
         session.stop().unwrap();
     }
 

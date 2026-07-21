@@ -1,5 +1,7 @@
 //! MCP tools for discovering and controlling named Terminal Control sessions.
 
+use std::fs;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use rmcp::{
@@ -10,7 +12,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::session;
+use crate::{render, session};
 
 #[derive(Debug, Clone)]
 pub struct TerminalControl;
@@ -33,16 +35,29 @@ struct ScreenRequest {
     #[serde(default)]
     #[schemars(description = "Optional workspace pane id; omit for the composed workspace")]
     pane: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SaveScreenRequest {
+    name: String,
     #[serde(default)]
     #[schemars(
-        description = "Optional quiet period before returning. Defaults to 0; omit unless intentionally settling, and never send an explicit 0"
+        description = "Optional stable workspace window name; cannot be combined with pane"
     )]
-    settle_ms: u64,
+    window: Option<String>,
     #[serde(default)]
-    #[schemars(
-        description = "Maximum optional settling wait. Defaults to 0; omit unless intentionally settling, and never send an explicit 0"
-    )]
-    deadline_ms: u64,
+    #[schemars(description = "Optional workspace pane id; omit for the composed workspace")]
+    pane: Option<u32>,
+    #[schemars(description = "PNG output path; parent directories are created")]
+    path: PathBuf,
+    #[serde(default = "default_pixel_ratio")]
+    #[schemars(default = "default_pixel_ratio")]
+    pixel_ratio: f32,
+}
+
+fn default_pixel_ratio() -> f32 {
+    2.0
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -89,16 +104,6 @@ struct InteractRequest {
         description = "Maximum wait for waitFor text. Defaults to 5000; omit unless intentionally overriding, and never send an explicit 5000"
     )]
     timeout_ms: u64,
-    #[serde(default)]
-    #[schemars(
-        description = "Optional quiet period before returning. Defaults to 0; omit unless intentionally settling, and never send an explicit 0"
-    )]
-    settle_ms: u64,
-    #[serde(default)]
-    #[schemars(
-        description = "Maximum optional settling wait. Defaults to 0; omit unless intentionally settling, and never send an explicit 0"
-    )]
-    deadline_ms: u64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -155,6 +160,11 @@ struct LayoutRequest {
     columns: u16,
     #[schemars(description = "Grid rows, either 1 or 2")]
     rows: u16,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional argv for the first pane created while growing the layout; omit to start the workspace shell"
+    )]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -305,6 +315,7 @@ struct WindowSummary {
     pane_count: usize,
     active_pane: Option<u32>,
     zoomed_pane: Option<u32>,
+    activity: bool,
     cols: u16,
     rows: u16,
 }
@@ -351,15 +362,30 @@ struct Screen {
     rows: u16,
 }
 
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ScreenArtifact {
+    name: String,
+    path: String,
+    cols: u16,
+    rows: u16,
+}
+
 #[tool_router(server_handler)]
 impl TerminalControl {
-    #[tool(description = "List named local Terminal Control sessions and their state")]
+    #[tool(description = "List running local Terminal Control sessions")]
     async fn list_sessions(&self) -> Result<Json<SessionList>, String> {
         blocking(|| {
             let sessions = session::list().map_err(format_error)?;
             Ok(Json(SessionList {
                 sessions: sessions
                     .into_iter()
+                    .filter(|entry| {
+                        entry
+                            .status
+                            .as_ref()
+                            .is_some_and(|status| status.state == session::SessionState::Running)
+                    })
                     .map(|entry| {
                         let status = entry.status;
                         SessionSummary {
@@ -549,6 +575,7 @@ impl TerminalControl {
                 request.window,
                 request.columns,
                 request.rows,
+                request.command,
             )
             .map(pane_list)
             .map(Json)
@@ -593,6 +620,16 @@ impl TerminalControl {
         Parameters(request): Parameters<ScreenRequest>,
     ) -> Result<Json<Screen>, String> {
         blocking(move || capture(request)).await.map(Json)
+    }
+
+    #[tool(
+        description = "Save a PNG screenshot of a composed workspace, named window, or stable pane"
+    )]
+    async fn save_screen(
+        &self,
+        Parameters(request): Parameters<SaveScreenRequest>,
+    ) -> Result<Json<ScreenArtifact>, String> {
+        blocking(move || save_screen(request)).await.map(Json)
     }
 
     #[tool(
@@ -645,7 +682,7 @@ impl TerminalControl {
                 )
                 .map_err(format_error)?;
             }
-            capture_target(request.name, target, request.settle_ms, request.deadline_ms)
+            capture_target(request.name, target)
         })
         .await
         .map(Json)
@@ -695,22 +732,36 @@ pub async fn serve() -> anyhow::Result<()> {
 
 fn capture(request: ScreenRequest) -> Result<Screen, String> {
     let target = session::terminal_target(request.window, request.pane).map_err(format_error)?;
-    capture_target(request.name, target, request.settle_ms, request.deadline_ms)
+    capture_target(request.name, target)
 }
 
-fn capture_target(
-    name: String,
-    target: session::TerminalTarget,
-    settle_ms: u64,
-    deadline_ms: u64,
-) -> Result<Screen, String> {
-    let shot = session::show_target(
-        &name,
-        target,
-        Duration::from_millis(settle_ms),
-        Duration::from_millis(deadline_ms),
-    )
-    .map_err(format_error)?;
+fn save_screen(request: SaveScreenRequest) -> Result<ScreenArtifact, String> {
+    if !request.pixel_ratio.is_finite() || request.pixel_ratio <= 0.0 {
+        return Err("pixelRatio must be greater than zero".to_owned());
+    }
+    let target = session::terminal_target(request.window, request.pane).map_err(format_error)?;
+    let shot = session::show_target(&request.name, target, Duration::ZERO, Duration::ZERO)
+        .map_err(format_error)?;
+    let path = request.path;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let svg = render::svg(&shot.frame, &render::Options::default());
+    render::png(&svg, &path, request.pixel_ratio).map_err(format_error)?;
+    Ok(ScreenArtifact {
+        name: request.name,
+        path: path.to_string_lossy().into_owned(),
+        cols: shot.frame.cols,
+        rows: shot.frame.rows,
+    })
+}
+
+fn capture_target(name: String, target: session::TerminalTarget) -> Result<Screen, String> {
+    let shot = session::show_target(&name, target, Duration::ZERO, Duration::ZERO)
+        .map_err(format_error)?;
     let status = session::status(&name).map_err(format_error)?;
     Ok(Screen {
         name,
@@ -753,6 +804,7 @@ fn window_list(windows: Vec<session::WindowStatus>) -> WindowList {
                 pane_count: window.pane_count,
                 active_pane: window.active_pane,
                 zoomed_pane: window.zoomed_pane,
+                activity: window.activity,
                 cols: window.cols,
                 rows: window.rows,
             })
@@ -867,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn screen_and_interact_requests_default_to_an_immediate_snapshot() {
+    fn screen_and_interact_requests_use_explicit_targets() {
         let screen: ScreenRequest = serde_json::from_value(serde_json::json!({
             "name": "editor"
         }))
@@ -879,12 +931,18 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(screen.settle_ms, 0);
-        assert_eq!(screen.deadline_ms, 0);
-        assert_eq!(interact.settle_ms, 0);
-        assert_eq!(interact.deadline_ms, 0);
+        assert!(screen.window.is_none());
         assert_eq!(interact.window.as_deref(), Some("tests"));
         assert!(session::terminal_target(Some("tests".to_owned()), Some(3)).is_err());
+
+        let save: SaveScreenRequest = serde_json::from_value(serde_json::json!({
+            "name": "editor",
+            "pane": 3,
+            "path": "/tmp/editor-pane.png"
+        }))
+        .unwrap();
+        assert_eq!(save.pane, Some(3));
+        assert_eq!(save.pixel_ratio, 2.0);
     }
 
     #[test]
@@ -912,6 +970,7 @@ mod tests {
                 "rename_workspace_window",
                 "resize_session",
                 "resize_workspace_pane",
+                "save_screen",
                 "select_workspace_window",
                 "send_input",
                 "set_workspace_layout",
@@ -987,6 +1046,7 @@ mod tests {
             "paneCount",
             "activePane",
             "zoomedPane",
+            "activity",
             "cols",
             "rows",
         ] {
@@ -995,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn publishes_settling_as_optional_and_immediate_by_default() {
+    fn publishes_immediate_screen_reads_without_settling_controls() {
         let tools = TerminalControl::tool_router().list_all();
 
         for name in ["get_screen", "interact"] {
@@ -1004,17 +1064,23 @@ mod tests {
                 .find(|tool| tool.name.as_ref() == name)
                 .unwrap();
             let schema = serde_json::to_value(&tool.input_schema).unwrap();
-            let required = schema["required"].as_array().unwrap();
-
             for field in ["settleMs", "deadlineMs"] {
-                let property = &schema["properties"][field];
-                assert_eq!(property["default"], 0);
-                let description = property["description"].as_str().unwrap();
-                assert!(description.contains("omit"));
-                assert!(description.contains("never send an explicit 0"));
-                assert!(!required.iter().any(|value| value == field));
+                assert!(schema["properties"].get(field).is_none());
             }
         }
+
+        let save = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "save_screen")
+            .unwrap();
+        let schema = serde_json::to_value(&save.input_schema).unwrap();
+        assert_eq!(schema["properties"]["pixelRatio"]["default"], 2.0);
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&"path".into())
+        );
 
         let interact = tools
             .iter()

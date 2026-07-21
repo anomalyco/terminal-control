@@ -39,9 +39,9 @@ Or expose sessions as structured MCP tools instead of shell commands (stdio serv
 termctrl mcp
 ```
 
-MCP screen reads and interactions return the current frame immediately. Agents can opt into
-quiet-output settling with `settleMs` and `deadlineMs` when a specific transition requires it.
-Omit both fields for immediate reads; never send explicit zero values.
+MCP screen reads and interactions return the current frame immediately. Use `waitFor` on `interact`
+when a specific transition must complete. `save_screen` writes a PNG of the composed workspace, one
+named window, or one stable pane.
 
 Then ask for terminal work in ordinary language:
 
@@ -106,7 +106,10 @@ termctrl stop demo
 - `send` accepts `text:<value>`, named keys (`enter`, `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, `page-down`), and `ctrl-a` through `ctrl-z`. Pipe exact bytes with `--stdin`.
 - `wait` blocks until text is visible; use it instead of sleeping. It defaults to a five-second
   maximum, so omit `--timeout 5000` and override only when choosing a different limit.
-- `status` reports running/exited state, command, cwd, viewport, and recording path. `list` shows all sessions.
+- `status` reports running/exited state, command, cwd, viewport, and recording path. `list` shows
+  running sessions; `list --all` also shows retained exited sessions and stale sockets.
+- `prune --dry-run` previews retained exited sessions and stale sockets; `prune` removes them without
+  deleting recording artifacts.
 - `resize demo --cols 132 --rows 38` tests responsive layouts.
 - `restart demo` relaunches with the stored command, cwd, viewport, and recording settings.
 - An exited session keeps its final screen for `show` until stopped.
@@ -141,7 +144,13 @@ termctrl attach editor
 
 The workspace daemon owns named windows and their panes independently from any terminal. Every workspace starts with a `main` window. Closing an attached terminal detaches without killing anything; `ctrl-b Q` followed by `y`, `termctrl stop NAME`, or closing the final window ends the workspace. One human terminal may be attached at a time, while agent controls remain available whether attached or detached. A new attachment adopts its terminal size and theme and performs a full repaint.
 
-Use `ctrl-b c` to create a window, `ctrl-b n/p` or `ctrl-b 0-9` to select one, and `ctrl-b w` to list them. Use `ctrl-b %` for left/right panes, `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l`, arrow keys, or a mouse click to focus, `ctrl-b H/J/K/L` to resize by five cells, `ctrl-b z` to toggle pane zoom, `ctrl-b q` to show stable pane IDs, `ctrl-b d` to detach, and `ctrl-b ?` for help. `ctrl-b x` closes a pane, `ctrl-b &` closes the current window, and `ctrl-b Q` closes the workspace; each requires `y` confirmation.
+The bottom row is a persistent tab strip. It shows the selected window, hidden-window activity, pane
+counts, and zoom state; click a tab to select it. Use `ctrl-b c` to create a window, `ctrl-b n/p` or
+`ctrl-b 0-9` to select one, and `ctrl-b w` to list them. Use `ctrl-b %` for left/right panes,
+`ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l`, arrow keys, or a mouse click to focus,
+`ctrl-b H/J/K/L` to resize by five cells, `ctrl-b z` to toggle pane zoom, `ctrl-b q` to show stable
+pane IDs, `ctrl-b d` to detach, and `ctrl-b ?` for help. `ctrl-b x` closes a pane, `ctrl-b &` closes
+the current window, and `ctrl-b Q` closes the workspace; each requires `y` confirmation.
 
 Mouse events over a pane use pane-local coordinates and continue to mouse-aware applications. A
 primary click also focuses that pane; divider clicks are ignored.
@@ -155,6 +164,7 @@ termctrl show workspace --window editor
 termctrl send workspace --window editor text::help enter
 termctrl panes workspace --window editor --json
 termctrl layout workspace --window editor --grid 2x2
+termctrl layout workspace --window editor --grid 2x2 -- nvim
 termctrl select-window workspace editor
 termctrl rename-window workspace editor code
 termctrl close-window workspace code
@@ -174,7 +184,11 @@ Window names are stable exact selectors; their numeric indexes are presentation 
 
 Without a command or name, the workspace is named `workspace`. When a command is supplied without `NAME`, its executable basename remains the inferred name.
 
-A workspace follows the size of its current human attachment, so resize that terminal itself rather than using `termctrl resize`. `--record` currently records the initial pane; use an outer Terminal Control session when a composed workspace recording is required. Composed ANSI saves are rendered snapshots, while `--pane ID --format ansi` retains that pane's original VT stream.
+A workspace follows the size of its current human attachment, so resize that terminal itself rather
+than using `termctrl resize`. An occupied attachment names the workspace and suggests either
+`ctrl-b d` there or `termctrl run NAME` for another workspace. `run --record` records the composed
+workspace, including tabs, splits, window switches, resizes, and markers. Composed ANSI saves are
+rendered snapshots, while `--pane ID --format ansi` retains that pane's original VT stream.
 
 Each human attachment queries its terminal's default foreground, background, and ANSI 0-15 palette before repainting. Existing Ghostty-backed panes, dividers, overlays, and panes opened later therefore inherit the current visible terminal theme; unsupported terminals retain Terminal Control's deterministic fallback palette.
 

@@ -42,6 +42,7 @@ termctrl new-window workspace editor -- nvim
 termctrl show workspace --window editor
 termctrl panes workspace --json
 termctrl layout workspace --grid 2x2
+termctrl layout workspace --grid 2x2 -- nvim
 termctrl send workspace --pane 1 text:opencode2 enter
 termctrl focus workspace --pane 1
 termctrl close-pane workspace --pane 1
@@ -49,8 +50,9 @@ termctrl resize-pane workspace --pane 1 --direction left --cells 5
 termctrl zoom-pane workspace --pane 1
 ```
 
-With no arguments, `run` starts `$SHELL` in the `workspace/main` window. Use `ctrl-b c` to create a
-window, `ctrl-b n/p` or `ctrl-b 0-9` to select one, and `ctrl-b w` to list them. Use `ctrl-b %` and
+With no arguments, `run` starts `$SHELL` in the `workspace/main` window. The persistent bottom tab
+strip shows selection, hidden activity, pane count, and zoom; click a tab to select it. Use `ctrl-b c`
+to create a window, `ctrl-b n/p` or `ctrl-b 0-9` to select one, and `ctrl-b w` to list them. Use `ctrl-b %` and
 `ctrl-b "` to split, `ctrl-b h/j/k/l`, arrows, or a mouse click to focus, `ctrl-b H/J/K/L` to resize,
 `ctrl-b z` to toggle zoom, `ctrl-b d` to detach,
 `ctrl-b q` to show stable pane IDs, and `ctrl-b ?` for help. `ctrl-b x` closes a pane, `ctrl-b &`
@@ -67,8 +69,8 @@ Window-targeted `show`, `send`, `wait`, `logs`, `panes`, and `layout` do not cha
 Only `select-window` and `focus --pane ID` intentionally move the visible human context.
 
 Workspaces follow their current human terminal and reject `termctrl resize`. `run --record` records
-the initial pane only; wrap `run` in an outer named session when a composed workspace recording is
-needed. Composed ANSI output is a rendered snapshot; pane-targeted ANSI is the original pane stream.
+the composed workspace, including tabs, splits, window switches, resizes, and markers. Composed ANSI
+output is a rendered snapshot; pane-targeted ANSI is the original pane stream.
 
 ## Choose The Correct Observation
 
@@ -141,7 +143,9 @@ Treat `.termctrl` recordings, ANSI transcripts, screen artifacts, command argume
 ## Recover From Problems
 
 - Run `termctrl status app` to inspect state and launch settings.
-- Run `termctrl list` to discover retained named sessions.
+- Run `termctrl list` for running sessions, or `termctrl list --all` to include retained exited and
+  stale entries. Preview cleanup with `termctrl prune --dry-run`, then run `termctrl prune`.
 - MCP agents can use `list_sessions` for command/cwd discovery and `get_session_status({ name })` for complete structured status without parsing CLI output.
+- MCP agents can use `save_screen` with an optional `window` or `pane` to persist a PNG without shelling out.
 - If a session socket path is too long, set `TERMCTRL_RUNTIME_DIR` to a short private directory under `/tmp` before starting sessions.
 - If `termctrl` is unavailable, install Terminal Control with `cargo install terminal-control` or ask the user which installed binary to use.

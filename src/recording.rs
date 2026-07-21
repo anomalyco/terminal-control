@@ -119,6 +119,10 @@ impl Writer {
         })
     }
 
+    pub fn output_now(&mut self, bytes: &[u8]) -> Result<()> {
+        self.output(self.started.elapsed().as_millis() as u64, bytes)
+    }
+
     pub fn input(&mut self, origin: InputOrigin, bytes: &[u8]) -> Result<()> {
         self.write(Entry::Input {
             at_ms: self.started.elapsed().as_millis() as u64,

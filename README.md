@@ -145,11 +145,14 @@ termctrl attach editor
 
 The workspace daemon owns named windows and their panes independently from any terminal. Every workspace starts with a `main` window. Closing an attached terminal detaches without killing anything; `ctrl-b Q` followed by `y`, `termctrl stop NAME`, or closing the final window ends the workspace. One human terminal may be attached at a time, while agent controls remain available whether attached or detached. A new attachment adopts its terminal size and theme and performs a full repaint.
 
-The persistent tab strip shows the selected window, hidden-window activity, pane counts, and zoom
-state; click a tab to select it. It defaults to the bottom; use `run NAME --tab-position top` when
-creating a workspace to place it above the panes. Use `ctrl-b c` to create a window, `ctrl-b n/p` or
-`ctrl-b 0-9` to select one, and `ctrl-b w` to list them. Use `ctrl-b %` for left/right panes,
-`ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l`, arrow keys, or a mouse click to focus,
+The persistent tab strip shows the selected window, pin state, pane count, zoom, and unread activity:
+`+` output, `!` bell, `x` a pane exit while its window remains, and `=` a configured literal that is
+visible when hidden output changes. It defaults to the bottom; use
+`run NAME --tab-position top` at creation or `tab-position NAME top|bottom` at runtime. Click a tab
+to select it or drag within its pinned/unpinned group to reorder. Use `ctrl-b p` for the command
+palette, `ctrl-b l` for the last window, `ctrl-b n` for the next window, `ctrl-b 0-9` to select,
+`ctrl-b P` to pin, `ctrl-b </>` to reorder, and `ctrl-b t` to move the strip. Use `ctrl-b %` for left/right panes,
+`ctrl-b "` for top/bottom panes, arrow keys, `ctrl-b h/j/k`, or a mouse click to focus,
 `ctrl-b H/J/K/L` to resize by five cells, `ctrl-b z` to toggle pane zoom, `ctrl-b q` to show stable
 pane IDs, `ctrl-b d` to detach, and `ctrl-b ?` for help. `ctrl-b x` closes a pane, `ctrl-b &` closes
 the current window, and `ctrl-b Q` closes the workspace; each requires `y` confirmation.
@@ -161,6 +164,11 @@ Agents discover stable pane IDs and geometry, declaratively grow a layout, and i
 
 ```bash
 termctrl windows workspace --json
+termctrl current --json
+termctrl tab-position workspace top
+termctrl pin-window workspace editor
+termctrl move-window workspace editor --index 0
+termctrl add-window-match workspace editor FAILED
 termctrl new-window workspace editor --cwd ~/src/project -- nvim
 termctrl show workspace --window editor
 termctrl send workspace --window editor text::help enter
@@ -182,7 +190,14 @@ termctrl focus workspace --pane 1
 termctrl close-pane workspace --pane 1
 ```
 
-Window names are stable exact selectors; their numeric indexes are presentation order and may shift after a close. Pane IDs are globally unique across every window. `move-pane` preserves the process, screen, logs, recording, and stable ID while inserting it beside the destination's active pane. Pane resize moves the nearest boundary in the requested direction; zoom is reversible presentation state and does not remove hidden panes. Window-targeted reads, input, waits, logs, pane discovery, layouts, and moves do not select that window. Only `select-window`, a human shortcut, `focus --pane ID`, or `zoom-pane` changes the visible window. Layout shrinkage never kills a process implicitly; close exact pane IDs first. Pane titles remain application-owned and are not identities.
+Window names are stable exact selectors; numeric indexes are presentation order and change after reorder, pinning, or close. Pinned windows form the leading tab group, and moves cannot cross that boundary until the window is pinned or unpinned. Pane IDs are globally unique across every window. `move-pane` preserves the process, screen, logs, recording, and stable ID while inserting it beside the destination's active pane. Pane resize moves the nearest boundary in the requested direction; zoom is reversible presentation state and does not remove hidden panes. Window-targeted reads, input, waits, logs, pane discovery, layouts, and moves do not select that window. Only `select-window`, a human shortcut, `focus --pane ID`, or `zoom-pane` changes the visible window. Layout shrinkage never kills a process implicitly; close exact pane IDs first. Pane titles remain application-owned and are not identities.
+
+Every named session child receives `TERMCTRL_SESSION`. Workspace panes also receive
+`TERMCTRL_WORKSPACE`, globally stable `TERMCTRL_PANE_ID`, and historical
+`TERMCTRL_LAUNCH_WINDOW_ID`. Run `termctrl current --json` inside a pane to resolve its authoritative
+current window after rename, reorder, pinning, or pane movement. Agents should prefer this command
+over inferring context from a title, geometry, or launch-time window ID. In a normal named session,
+the same command reports the session name, state, command, and working directory.
 
 Without a command or name, the workspace is named `workspace`. When a command is supplied without `NAME`, its executable basename remains the inferred name.
 

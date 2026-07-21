@@ -71,9 +71,10 @@ Run creates or reattaches a visible Terminal Control workspace. With no argument
 default name `workspace`. Supply a command after -- to replace the first shell when creating, or
 NAME to expose a stable explicit control socket. If NAME already exists, no command may be supplied.
 
-Each workspace starts with a `main` window. Use ctrl-b c to create a window, ctrl-b n/p or 0-9 to
-select one, and ctrl-b w to list them. Use ctrl-b % to split left/right, ctrl-b \" to split
-top/bottom, ctrl-b h/j/k/l or arrow keys to focus, ctrl-b H/J/K/L to resize, ctrl-b z to zoom,
+Each workspace starts with a `main` window. Use ctrl-b p for the command palette, ctrl-b l for the
+last window, ctrl-b n for the next window, and 0-9 to select by index. Use ctrl-b P to pin, ctrl-b
+</> or tab dragging to reorder, and ctrl-b t to move tabs. Use ctrl-b % to split left/right, ctrl-b
+\" to split top/bottom, arrow keys or h/j/k to focus, ctrl-b H/J/K/L to resize, ctrl-b z to zoom,
 ctrl-b q to show pane ids, ctrl-b d to detach, ctrl-b ? for help, and ctrl-b ctrl-b to send a literal ctrl-b. Destructive ctrl-b x (pane), ctrl-b
 & (window), and ctrl-b Q (workspace) actions require y/n confirmation. Agents can target hidden
 windows without changing human selection. Foreground workspaces inherit the outer terminal colors.
@@ -82,6 +83,10 @@ Examples:
   termctrl run
   termctrl new-window workspace editor -- nvim
   termctrl windows workspace
+  termctrl current --json
+  termctrl tab-position workspace top
+  termctrl pin-window workspace editor
+  termctrl move-window workspace editor --index 0
   termctrl show workspace --window editor
   termctrl panes workspace
   termctrl layout workspace --grid 2x2
@@ -209,6 +214,20 @@ enum Command {
     Panes(PanesArgs),
     /// List named windows in a running workspace.
     Windows(WindowsArgs),
+    /// Resolve this pane's authoritative workspace, window, and pane identity.
+    Current(CurrentArgs),
+    /// Move a live workspace tab strip between the top and bottom.
+    TabPosition(TabPositionArgs),
+    /// Reorder one workspace window within its pinned or unpinned group.
+    MoveWindow(MoveWindowArgs),
+    /// Keep one workspace window at the front of the tab strip.
+    PinWindow(WindowActionArgs),
+    /// Return one pinned workspace window to normal tab ordering.
+    UnpinWindow(WindowActionArgs),
+    /// Add a literal hidden-window activity match.
+    AddWindowMatch(WindowMatchArgs),
+    /// Remove a literal hidden-window activity match.
+    RemoveWindowMatch(WindowMatchArgs),
     /// Create and select a named workspace window.
     NewWindow(NewWindowArgs),
     /// Select one named workspace window for the attached terminal.
@@ -545,6 +564,49 @@ struct WindowsArgs {
 }
 
 #[derive(Args)]
+struct CurrentArgs {
+    /// Workspace name; defaults to TERMCTRL_WORKSPACE from the current pane.
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
+    /// Stable pane id; defaults to TERMCTRL_PANE_ID from the current pane.
+    #[arg(long)]
+    pane: Option<u32>,
+    /// Write structured JSON context.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct TabPositionArgs {
+    /// Name of a running workspace.
+    name: String,
+    /// New live tab strip position.
+    #[arg(value_enum)]
+    position: TabPositionArg,
+}
+
+#[derive(Args)]
+struct MoveWindowArgs {
+    /// Name of a running workspace.
+    name: String,
+    /// Exact window name returned by `termctrl windows`.
+    window: String,
+    /// Final zero-based tab index within the same pin group.
+    #[arg(long)]
+    index: usize,
+}
+
+#[derive(Args)]
+struct WindowMatchArgs {
+    /// Name of a running workspace.
+    name: String,
+    /// Exact window name returned by `termctrl windows`.
+    window: String,
+    /// Literal visible text that marks matching hidden output.
+    pattern: String,
+}
+
+#[derive(Args)]
 struct NewWindowArgs {
     /// Name of a running workspace.
     name: String,
@@ -733,6 +795,8 @@ struct SessionArgs {
 #[derive(Args)]
 struct ServeArgs {
     #[arg(long)]
+    name: String,
+    #[arg(long)]
     socket: PathBuf,
     #[arg(long)]
     cwd: Option<PathBuf>,
@@ -758,6 +822,8 @@ struct ServeArgs {
 
 #[derive(Args)]
 struct ServeWorkspaceArgs {
+    #[arg(long)]
+    name: String,
     #[arg(long)]
     socket: PathBuf,
     #[arg(long)]
@@ -909,6 +975,33 @@ fn main() -> Result<()> {
         Command::Prune(args) => prune(args)?,
         Command::Panes(args) => panes(args)?,
         Command::Windows(args) => windows(args)?,
+        Command::Current(args) => current(args)?,
+        Command::TabPosition(args) => {
+            let windows = session::set_workspace_tab_position(&args.name, args.position.into())?;
+            print_windows(&windows, true)?;
+        }
+        Command::MoveWindow(args) => {
+            let windows = session::move_workspace_window(&args.name, args.window, args.index)?;
+            print_windows(&windows, true)?;
+        }
+        Command::PinWindow(args) => {
+            let windows = session::set_workspace_window_pinned(&args.name, args.window, true)?;
+            print_windows(&windows, true)?;
+        }
+        Command::UnpinWindow(args) => {
+            let windows = session::set_workspace_window_pinned(&args.name, args.window, false)?;
+            print_windows(&windows, true)?;
+        }
+        Command::AddWindowMatch(args) => {
+            let windows =
+                session::add_workspace_window_match(&args.name, args.window, args.pattern)?;
+            print_windows(&windows, true)?;
+        }
+        Command::RemoveWindowMatch(args) => {
+            let windows =
+                session::remove_workspace_window_match(&args.name, args.window, args.pattern)?;
+            print_windows(&windows, true)?;
+        }
         Command::NewWindow(args) => {
             let windows =
                 session::create_workspace_window(&args.name, args.window, args.command, args.cwd)?;
@@ -1009,6 +1102,7 @@ fn main() -> Result<()> {
         }
         Command::Serve(args) => {
             session::serve(
+                args.name,
                 args.socket,
                 args.command,
                 args.cwd,
@@ -1033,6 +1127,7 @@ fn main() -> Result<()> {
         }
         Command::ServeWorkspace(args) => {
             session::serve_workspace(
+                args.name,
                 args.socket,
                 args.command,
                 args.cwd,
@@ -1262,6 +1357,68 @@ fn status(args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
+fn current(args: CurrentArgs) -> Result<()> {
+    let explicit_name = args.name.is_some();
+    let workspace = std::env::var("TERMCTRL_WORKSPACE").ok();
+    let session_name = std::env::var("TERMCTRL_SESSION").ok();
+    if args.name.is_none() && workspace.is_none() {
+        if args.pane.is_some() {
+            bail!("--pane requires a workspace name or TERMCTRL_WORKSPACE");
+        }
+        let name = session_name.context(
+            "not running inside a named Terminal Control session; provide a workspace NAME",
+        )?;
+        let status = session::status(&name)?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "session": name,
+                    "workspace": null,
+                    "pane": null,
+                    "state": session_state(status.state),
+                    "command": status.launch.command,
+                    "cwd": status.launch.cwd,
+                }))?
+            );
+        } else {
+            println!("session: {name}");
+            println!("state: {}", session_state(status.state));
+            println!("cwd: {}", status.launch.cwd.display());
+            println!("command: {}", status.launch.command.join(" "));
+        }
+        return Ok(());
+    }
+    let name = args.name.or(workspace).context(
+        "not running inside a Terminal Control workspace; provide NAME or set TERMCTRL_WORKSPACE",
+    )?;
+    let pane = match args.pane {
+        Some(pane) => Some(pane),
+        None if explicit_name => None,
+        None => std::env::var("TERMCTRL_PANE_ID")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .with_context(|| format!("invalid TERMCTRL_PANE_ID {value:?}"))
+            })
+            .transpose()?,
+    };
+    let context = session::workspace_context(&name, pane)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&context)?);
+    } else {
+        println!("workspace: {}", context.workspace);
+        println!(
+            "window: {} ({}:{})",
+            context.window_index, context.window_id, context.window
+        );
+        println!("pane: {}", context.pane);
+        println!("tabs: {:?}", context.tab_position);
+    }
+    Ok(())
+}
+
 fn list(args: ListArgs) -> Result<()> {
     let sessions = session::list()?
         .into_iter()
@@ -1447,14 +1604,22 @@ fn print_windows(windows: &[session::WindowStatus], json: bool) -> Result<()> {
         return Ok(());
     }
     for window in windows {
+        let activity = window
+            .activity_kinds
+            .iter()
+            .map(|kind| format!("{kind:?}").to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(",");
         println!(
-            "{}\t{}\t{}\t{} panes\t{}x{}",
+            "{}\t{}\t{}\t{} panes\t{}x{}\t{}\t{}",
             window.index,
             if window.active { "active" } else { "" },
             window.name,
             window.pane_count,
             window.cols,
             window.rows,
+            if window.pinned { "pinned" } else { "" },
+            activity,
         );
     }
     Ok(())
@@ -1813,6 +1978,42 @@ mod tests {
         assert!(Cli::try_parse_from(["termctrl", "run", "editor", "--", "nvim", "."]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "panes", "workspace", "--json"]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "windows", "workspace", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "current", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "current", "workspace", "--pane", "3"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "tab-position", "workspace", "top"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "termctrl",
+                "move-window",
+                "workspace",
+                "editor",
+                "--index",
+                "0"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["termctrl", "pin-window", "workspace", "editor"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "unpin-window", "workspace", "editor"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "termctrl",
+                "add-window-match",
+                "workspace",
+                "editor",
+                "FAILED"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "termctrl",
+                "remove-window-match",
+                "workspace",
+                "editor",
+                "FAILED"
+            ])
+            .is_ok()
+        );
         assert!(
             Cli::try_parse_from([
                 "termctrl",

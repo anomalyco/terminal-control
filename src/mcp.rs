@@ -198,6 +198,65 @@ struct WindowRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct ContextRequest {
+    #[schemars(description = "Named Terminal Control workspace")]
+    name: String,
+    #[serde(default)]
+    #[schemars(description = "Optional stable pane id; omit for the selected pane")]
+    pane: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum TabPosition {
+    Top,
+    Bottom,
+}
+
+impl From<TabPosition> for session::TabPosition {
+    fn from(position: TabPosition) -> Self {
+        match position {
+            TabPosition::Top => Self::Top,
+            TabPosition::Bottom => Self::Bottom,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct TabPositionRequest {
+    name: String,
+    position: TabPosition,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct MoveWindowRequest {
+    name: String,
+    window: String,
+    #[schemars(description = "Final zero-based tab index within the same pin group")]
+    index: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PinWindowRequest {
+    name: String,
+    window: String,
+    pinned: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct WindowMatchRequest {
+    name: String,
+    window: String,
+    #[schemars(description = "Literal visible text that marks matching hidden output")]
+    pattern: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct CreateWindowRequest {
     #[schemars(description = "Named Terminal Control workspace")]
     name: String,
@@ -316,6 +375,9 @@ struct WindowSummary {
     active_pane: Option<u32>,
     zoomed_pane: Option<u32>,
     activity: bool,
+    activity_kinds: Vec<String>,
+    match_rules: Vec<String>,
+    pinned: bool,
     cols: u16,
     rows: u16,
 }
@@ -323,6 +385,20 @@ struct WindowSummary {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct WindowList {
     windows: Vec<WindowSummary>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceContext {
+    session: String,
+    workspace: String,
+    window_id: u32,
+    window: String,
+    window_index: usize,
+    pane: u32,
+    window_active: bool,
+    pane_active: bool,
+    tab_position: String,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -438,6 +514,92 @@ impl TerminalControl {
     ) -> Result<Json<WindowList>, String> {
         blocking(move || {
             session::windows(&name)
+                .map(window_list)
+                .map(Json)
+                .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Resolve a workspace pane to its authoritative current workspace, window, pane, and tab placement"
+    )]
+    async fn get_workspace_context(
+        &self,
+        Parameters(request): Parameters<ContextRequest>,
+    ) -> Result<Json<WorkspaceContext>, String> {
+        blocking(move || {
+            session::workspace_context(&request.name, request.pane)
+                .map(workspace_context)
+                .map(Json)
+                .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(description = "Move a live workspace tab strip to the top or bottom")]
+    async fn set_workspace_tab_position(
+        &self,
+        Parameters(request): Parameters<TabPositionRequest>,
+    ) -> Result<Json<WindowList>, String> {
+        blocking(move || {
+            session::set_workspace_tab_position(&request.name, request.position.into())
+                .map(window_list)
+                .map(Json)
+                .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(description = "Reorder one workspace window within its pinned or unpinned tab group")]
+    async fn move_workspace_window(
+        &self,
+        Parameters(request): Parameters<MoveWindowRequest>,
+    ) -> Result<Json<WindowList>, String> {
+        blocking(move || {
+            session::move_workspace_window(&request.name, request.window, request.index)
+                .map(window_list)
+                .map(Json)
+                .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(description = "Pin or unpin one workspace window at the front of the tab strip")]
+    async fn set_workspace_window_pinned(
+        &self,
+        Parameters(request): Parameters<PinWindowRequest>,
+    ) -> Result<Json<WindowList>, String> {
+        blocking(move || {
+            session::set_workspace_window_pinned(&request.name, request.window, request.pinned)
+                .map(window_list)
+                .map(Json)
+                .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(description = "Add a literal hidden-window activity match rule")]
+    async fn add_workspace_window_match(
+        &self,
+        Parameters(request): Parameters<WindowMatchRequest>,
+    ) -> Result<Json<WindowList>, String> {
+        blocking(move || {
+            session::add_workspace_window_match(&request.name, request.window, request.pattern)
+                .map(window_list)
+                .map(Json)
+                .map_err(format_error)
+        })
+        .await
+    }
+
+    #[tool(description = "Remove a literal hidden-window activity match rule")]
+    async fn remove_workspace_window_match(
+        &self,
+        Parameters(request): Parameters<WindowMatchRequest>,
+    ) -> Result<Json<WindowList>, String> {
+        blocking(move || {
+            session::remove_workspace_window_match(&request.name, request.window, request.pattern)
                 .map(window_list)
                 .map(Json)
                 .map_err(format_error)
@@ -805,10 +967,31 @@ fn window_list(windows: Vec<session::WindowStatus>) -> WindowList {
                 active_pane: window.active_pane,
                 zoomed_pane: window.zoomed_pane,
                 activity: window.activity,
+                activity_kinds: window
+                    .activity_kinds
+                    .into_iter()
+                    .map(|kind| format!("{kind:?}").to_ascii_lowercase())
+                    .collect(),
+                match_rules: window.match_rules,
+                pinned: window.pinned,
                 cols: window.cols,
                 rows: window.rows,
             })
             .collect(),
+    }
+}
+
+fn workspace_context(context: session::WorkspaceContext) -> WorkspaceContext {
+    WorkspaceContext {
+        session: context.session,
+        workspace: context.workspace,
+        window_id: context.window_id,
+        window: context.window,
+        window_index: context.window_index,
+        pane: context.pane,
+        window_active: context.window_active,
+        pane_active: context.pane_active,
+        tab_position: format!("{:?}", context.tab_position).to_ascii_lowercase(),
     }
 }
 
@@ -956,17 +1139,21 @@ mod tests {
         assert_eq!(
             names,
             [
+                "add_workspace_window_match",
                 "close_workspace_pane",
                 "close_workspace_window",
                 "create_workspace_window",
                 "focus_workspace_pane",
                 "get_screen",
                 "get_session_status",
+                "get_workspace_context",
                 "interact",
                 "list_panes",
                 "list_sessions",
                 "list_windows",
                 "move_workspace_pane",
+                "move_workspace_window",
+                "remove_workspace_window_match",
                 "rename_workspace_window",
                 "resize_session",
                 "resize_workspace_pane",
@@ -974,6 +1161,8 @@ mod tests {
                 "select_workspace_window",
                 "send_input",
                 "set_workspace_layout",
+                "set_workspace_tab_position",
+                "set_workspace_window_pinned",
                 "stop_session",
                 "toggle_workspace_zoom",
             ]
@@ -1004,10 +1193,15 @@ mod tests {
             .iter()
             .find(|tool| tool.name.as_ref() == "list_windows")
             .unwrap();
+        let context = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "get_workspace_context")
+            .unwrap();
         let list_schema = serde_json::to_value(list.output_schema.as_ref().unwrap()).unwrap();
         let status_schema = serde_json::to_value(status.output_schema.as_ref().unwrap()).unwrap();
         let pane_schema = serde_json::to_value(panes.output_schema.as_ref().unwrap()).unwrap();
         let window_schema = serde_json::to_value(windows.output_schema.as_ref().unwrap()).unwrap();
+        let context_schema = serde_json::to_value(context.output_schema.as_ref().unwrap()).unwrap();
 
         let summary_properties = &list_schema["$defs"]["SessionSummary"]["properties"];
         assert!(summary_properties.get("command").is_some());
@@ -1047,10 +1241,27 @@ mod tests {
             "activePane",
             "zoomedPane",
             "activity",
+            "activityKinds",
+            "matchRules",
+            "pinned",
             "cols",
             "rows",
         ] {
             assert!(properties.get(field).is_some(), "missing window {field}");
+        }
+        let properties = &context_schema["properties"];
+        for field in [
+            "session",
+            "workspace",
+            "windowId",
+            "window",
+            "windowIndex",
+            "pane",
+            "windowActive",
+            "paneActive",
+            "tabPosition",
+        ] {
+            assert!(properties.get(field).is_some(), "missing context {field}");
         }
     }
 

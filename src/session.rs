@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 
+pub use crate::workspace::{ActivityKind, WorkspaceContext};
 pub use crate::workspace::{Direction as PaneDirection, PaneStatus, TabPosition, WindowStatus};
 
 const OUTPUT_QUEUE: usize = 64;
@@ -24,7 +25,8 @@ const CONTROL_PROTOCOL_VERSION: u8 = 1;
 const ATTACH_PROTOCOL_VERSION: u8 = 2;
 const WINDOW_PROTOCOL_VERSION: u8 = 3;
 const LAYOUT_COMMAND_PROTOCOL_VERSION: u8 = 4;
-const CURRENT_PROTOCOL_VERSION: u8 = LAYOUT_COMMAND_PROTOCOL_VERSION;
+const WORKSPACE_CONTROL_PROTOCOL_VERSION: u8 = 5;
+const CURRENT_PROTOCOL_VERSION: u8 = WORKSPACE_CONTROL_PROTOCOL_VERSION;
 const ATTACHED_TERMINAL_ERROR: &str = "workspace already has an attached terminal";
 
 fn attachment_rejection(name: &str, error: &str) -> anyhow::Error {
@@ -895,6 +897,29 @@ enum Request {
         name: String,
     },
     Windows,
+    WorkspaceContext {
+        #[serde(default)]
+        pane: Option<crate::workspace::PaneId>,
+    },
+    SetTabPosition {
+        position: TabPosition,
+    },
+    MoveWindow {
+        name: String,
+        index: usize,
+    },
+    SetWindowPinned {
+        name: String,
+        pinned: bool,
+    },
+    AddWindowMatch {
+        name: String,
+        pattern: String,
+    },
+    RemoveWindowMatch {
+        name: String,
+        pattern: String,
+    },
     CreateWindow {
         name: Option<String>,
         command: Vec<String>,
@@ -996,6 +1021,8 @@ struct Response {
     panes: Option<Vec<crate::workspace::PaneStatus>>,
     #[serde(default)]
     windows: Option<Vec<crate::workspace::WindowStatus>>,
+    #[serde(default)]
+    context: Option<WorkspaceContext>,
 }
 
 impl Default for Response {
@@ -1008,6 +1035,7 @@ impl Default for Response {
             logs: None,
             panes: None,
             windows: None,
+            context: None,
         }
     }
 }
@@ -1247,6 +1275,69 @@ pub fn windows(name: &str) -> Result<Vec<crate::workspace::WindowStatus>> {
 }
 
 #[doc(hidden)]
+pub fn workspace_context(
+    name: &str,
+    pane: Option<crate::workspace::PaneId>,
+) -> Result<WorkspaceContext> {
+    request(name, Request::WorkspaceContext { pane })?
+        .context
+        .ok_or_else(|| anyhow::anyhow!("session did not return workspace context"))
+}
+
+#[doc(hidden)]
+pub fn set_workspace_tab_position(
+    workspace: &str,
+    position: TabPosition,
+) -> Result<Vec<WindowStatus>> {
+    window_response(request(workspace, Request::SetTabPosition { position })?)
+}
+
+#[doc(hidden)]
+pub fn move_workspace_window(
+    workspace: &str,
+    name: String,
+    index: usize,
+) -> Result<Vec<WindowStatus>> {
+    window_response(request(workspace, Request::MoveWindow { name, index })?)
+}
+
+#[doc(hidden)]
+pub fn set_workspace_window_pinned(
+    workspace: &str,
+    name: String,
+    pinned: bool,
+) -> Result<Vec<WindowStatus>> {
+    window_response(request(
+        workspace,
+        Request::SetWindowPinned { name, pinned },
+    )?)
+}
+
+#[doc(hidden)]
+pub fn add_workspace_window_match(
+    workspace: &str,
+    name: String,
+    pattern: String,
+) -> Result<Vec<WindowStatus>> {
+    window_response(request(
+        workspace,
+        Request::AddWindowMatch { name, pattern },
+    )?)
+}
+
+#[doc(hidden)]
+pub fn remove_workspace_window_match(
+    workspace: &str,
+    name: String,
+    pattern: String,
+) -> Result<Vec<WindowStatus>> {
+    window_response(request(
+        workspace,
+        Request::RemoveWindowMatch { name, pattern },
+    )?)
+}
+
+#[doc(hidden)]
 pub fn panes_in_window(
     workspace: &str,
     window: Option<String>,
@@ -1352,6 +1443,15 @@ fn require_layout_command_protocol(response: &Response) -> Result<()> {
     if response.protocol_version < LAYOUT_COMMAND_PROTOCOL_VERSION {
         bail!(
             "running workspace predates pane startup commands; restart it with the current termctrl"
+        );
+    }
+    Ok(())
+}
+
+fn require_workspace_control_protocol(response: &Response) -> Result<()> {
+    if response.protocol_version < WORKSPACE_CONTROL_PROTOCOL_VERSION {
+        bail!(
+            "running workspace predates runtime workspace controls; restart it with the current termctrl"
         );
     }
     Ok(())
@@ -1496,17 +1596,19 @@ pub fn prune(name: &str, dry_run: bool) -> Result<Option<PruneKind>> {
 
 #[doc(hidden)]
 pub fn serve(
+    name: String,
     socket: PathBuf,
     command: Vec<String>,
     cwd: Option<PathBuf>,
     record: Option<PathBuf>,
     options: Options,
 ) -> Result<()> {
-    implementation::serve(socket, command, cwd, record, options)
+    implementation::serve(name, socket, command, cwd, record, options)
 }
 
 #[doc(hidden)]
 pub fn serve_workspace(
+    name: String,
     socket: PathBuf,
     command: Vec<String>,
     cwd: Option<PathBuf>,
@@ -1514,7 +1616,7 @@ pub fn serve_workspace(
     options: Options,
     tab_position: TabPosition,
 ) -> Result<()> {
-    implementation::serve_workspace(socket, command, cwd, record, options, tab_position)
+    implementation::serve_workspace(name, socket, command, cwd, record, options, tab_position)
 }
 
 /// Run a named session in the foreground, mirrored through the current terminal.
@@ -1576,6 +1678,12 @@ fn request(name: &str, operation: Request) -> Result<Response> {
     let requires_window_protocol = matches!(
         operation,
         Request::Windows
+            | Request::WorkspaceContext { .. }
+            | Request::SetTabPosition { .. }
+            | Request::MoveWindow { .. }
+            | Request::SetWindowPinned { .. }
+            | Request::AddWindowMatch { .. }
+            | Request::RemoveWindowMatch { .. }
             | Request::CreateWindow { .. }
             | Request::SelectWindow { .. }
             | Request::RenameWindow { .. }
@@ -1590,6 +1698,15 @@ fn request(name: &str, operation: Request) -> Result<Response> {
             | Request::ResizePane { .. }
             | Request::ToggleZoom { .. }
     );
+    let requires_workspace_control = matches!(
+        operation,
+        Request::WorkspaceContext { .. }
+            | Request::SetTabPosition { .. }
+            | Request::MoveWindow { .. }
+            | Request::SetWindowPinned { .. }
+            | Request::AddWindowMatch { .. }
+            | Request::RemoveWindowMatch { .. }
+    );
     let response = if requires_layout_command {
         implementation::request_layout_command(name, &operation)?
     } else {
@@ -1603,6 +1720,9 @@ fn request(name: &str, operation: Request) -> Result<Response> {
     }
     if requires_layout_command {
         require_layout_command_protocol(&response)?;
+    }
+    if requires_workspace_control {
+        require_workspace_control_protocol(&response)?;
     }
     if let Some(error) = response.error {
         bail!(error);
@@ -1877,6 +1997,8 @@ mod implementation {
             Command::new(std::env::current_exe().context("locate termctrl executable")?);
         daemon
             .arg("__serve")
+            .arg("--name")
+            .arg(name)
             .arg("--socket")
             .arg(&socket)
             .arg("--cols")
@@ -1889,6 +2011,11 @@ mod implementation {
             .arg(options.cell_height.to_string())
             .arg("--max-bytes")
             .arg(options.max_bytes.to_string());
+        daemon
+            .env_remove("TERMCTRL_WORKSPACE")
+            .env_remove("TERMCTRL_PANE_ID")
+            .env_remove("TERMCTRL_LAUNCH_WINDOW_ID")
+            .env("TERMCTRL_SESSION", name);
         if options.opentui_host {
             daemon.arg("--opentui-host");
         }
@@ -2404,16 +2531,18 @@ mod implementation {
     }
 
     pub fn serve(
+        name: String,
         socket: PathBuf,
         command: Vec<String>,
         cwd: Option<PathBuf>,
         record: Option<PathBuf>,
-        options: Options,
+        mut options: Options,
     ) -> Result<()> {
         ensure_socket_path(&socket)?;
         if command.is_empty() {
             bail!("provide a command after --");
         }
+        options.env.insert("TERMCTRL_SESSION".to_owned(), name);
         let result = (|| {
             let listener = UnixListener::bind(&socket)
                 .with_context(|| format!("bind {}", socket.display()))?;
@@ -2433,6 +2562,7 @@ mod implementation {
     }
 
     pub fn serve_workspace(
+        name: String,
         socket: PathBuf,
         command: Vec<String>,
         cwd: Option<PathBuf>,
@@ -2449,7 +2579,8 @@ mod implementation {
             listener
                 .set_nonblocking(true)
                 .context("set workspace socket nonblocking")?;
-            let mut workspace = Workspace::start_with_theme(
+            let mut workspace = Workspace::start_named_with_theme(
+                &name,
                 &command,
                 cwd.as_deref(),
                 record.as_deref(),
@@ -2587,6 +2718,8 @@ mod implementation {
             Command::new(std::env::current_exe().context("locate termctrl executable")?);
         daemon
             .arg("__serve-workspace")
+            .arg("--name")
+            .arg(name)
             .arg("--socket")
             .arg(socket)
             .arg("--cols")
@@ -2860,6 +2993,12 @@ mod implementation {
             }
             Request::Mark { name } => session.mark(&name)?,
             Request::Windows
+            | Request::WorkspaceContext { .. }
+            | Request::SetTabPosition { .. }
+            | Request::MoveWindow { .. }
+            | Request::SetWindowPinned { .. }
+            | Request::AddWindowMatch { .. }
+            | Request::RemoveWindowMatch { .. }
             | Request::CreateWindow { .. }
             | Request::SelectWindow { .. }
             | Request::RenameWindow { .. }
@@ -2955,6 +3094,29 @@ mod implementation {
             }
             Request::Mark { name } => workspace.mark_recording(&name)?,
             Request::Windows => response.windows = Some(workspace.windows()),
+            Request::WorkspaceContext { pane } => {
+                response.context = Some(workspace.context(pane)?);
+            }
+            Request::SetTabPosition { position } => {
+                workspace.set_tab_position(position);
+                response.windows = Some(workspace.windows());
+            }
+            Request::MoveWindow { name, index } => {
+                workspace.move_window(&name, index)?;
+                response.windows = Some(workspace.windows());
+            }
+            Request::SetWindowPinned { name, pinned } => {
+                workspace.set_window_pinned(&name, pinned)?;
+                response.windows = Some(workspace.windows());
+            }
+            Request::AddWindowMatch { name, pattern } => {
+                workspace.add_match_rule(&name, pattern)?;
+                response.windows = Some(workspace.windows());
+            }
+            Request::RemoveWindowMatch { name, pattern } => {
+                workspace.remove_match_rule(&name, &pattern)?;
+                response.windows = Some(workspace.windows());
+            }
             Request::CreateWindow { name, command, cwd } => {
                 terminal.tick(workspace)?;
                 workspace.create_window(name.as_deref(), &command, cwd.as_deref())?;
@@ -3289,6 +3451,7 @@ mod implementation {
         bail!("persistent sessions require Unix sockets")
     }
     pub fn serve_workspace(
+        _: String,
         _: PathBuf,
         _: Vec<String>,
         _: Option<PathBuf>,
@@ -3333,6 +3496,7 @@ mod implementation {
         bail!("persistent sessions require Unix sockets")
     }
     pub fn serve(
+        _: String,
         _: PathBuf,
         _: Vec<String>,
         _: Option<PathBuf>,
@@ -3400,6 +3564,21 @@ mod tests {
         assert_eq!((pane.x, pane.y), (0, 0));
         assert!(pane.visible);
         assert!(pane.title.is_empty());
+        let window: WindowStatus = serde_json::from_str(
+            r#"{
+                "index": 0,
+                "name": "main",
+                "active": true,
+                "pane_count": 1,
+                "active_pane": 0,
+                "cols": 80,
+                "rows": 24
+            }"#,
+        )
+        .unwrap();
+        assert!(!window.pinned);
+        assert!(window.activity_kinds.is_empty());
+        assert!(window.match_rules.is_empty());
         assert!(
             require_pane_protocol(&response)
                 .unwrap_err()
@@ -3418,7 +3597,20 @@ mod tests {
                 .to_string()
                 .contains("predates pane startup commands")
         );
-        assert_eq!(Response::default().protocol_version, 4);
+        assert!(
+            require_workspace_control_protocol(&response)
+                .unwrap_err()
+                .to_string()
+                .contains("predates runtime workspace controls")
+        );
+        let version_four = Response {
+            protocol_version: LAYOUT_COMMAND_PROTOCOL_VERSION,
+            ..Response::default()
+        };
+        require_window_protocol(&version_four).unwrap();
+        require_layout_command_protocol(&version_four).unwrap();
+        assert!(require_workspace_control_protocol(&version_four).is_err());
+        assert_eq!(Response::default().protocol_version, 5);
     }
 
     #[test]
@@ -3432,6 +3624,26 @@ mod tests {
             Request::FocusPane { pane: 3 },
             Request::ClosePane { pane: 2 },
             Request::Windows,
+            Request::WorkspaceContext { pane: Some(3) },
+            Request::SetTabPosition {
+                position: TabPosition::Top,
+            },
+            Request::MoveWindow {
+                name: "editor".to_owned(),
+                index: 0,
+            },
+            Request::SetWindowPinned {
+                name: "editor".to_owned(),
+                pinned: true,
+            },
+            Request::AddWindowMatch {
+                name: "editor".to_owned(),
+                pattern: "DONE".to_owned(),
+            },
+            Request::RemoveWindowMatch {
+                name: "editor".to_owned(),
+                pattern: "DONE".to_owned(),
+            },
             Request::CreateWindow {
                 name: Some("editor".to_owned()),
                 command: vec!["nvim".to_owned()],
@@ -3927,6 +4139,7 @@ mod tests {
             std::process::id()
         ));
         let result = serve(
+            "daemon-start-failure".to_owned(),
             socket.clone(),
             vec!["/definitely/not/a/termctrl-command".to_owned()],
             None,

@@ -39,6 +39,11 @@ termctrl run workspace --tab-position top
 termctrl run editor
 termctrl attach editor
 termctrl windows workspace --json
+termctrl current --json
+termctrl tab-position workspace top
+termctrl pin-window workspace editor
+termctrl move-window workspace editor --index 0
+termctrl add-window-match workspace editor FAILED
 termctrl new-window workspace editor -- nvim
 termctrl show workspace --window editor
 termctrl panes workspace --json
@@ -52,10 +57,11 @@ termctrl zoom-pane workspace --pane 1
 ```
 
 With no arguments, `run` starts `$SHELL` in the `workspace/main` window. The persistent tab strip
-shows selection, hidden activity, pane count, and zoom; click a tab to select it. It defaults to the
-bottom; choose `--tab-position top` when creating a workspace to move it above the panes. Use `ctrl-b c`
-to create a window, `ctrl-b n/p` or `ctrl-b 0-9` to select one, and `ctrl-b w` to list them. Use `ctrl-b %` and
-`ctrl-b "` to split, `ctrl-b h/j/k/l`, arrows, or a mouse click to focus, `ctrl-b H/J/K/L` to resize,
+shows selection, pinning, pane count, zoom, and output (`+`), bell (`!`), surviving-window pane exit
+(`x`), or visible literal-match (`=`) activity. Use `tab-position NAME top|bottom` to move it live. Use
+`ctrl-b p` for the command palette, `ctrl-b l` for the last window, `ctrl-b n` for next, `ctrl-b P`
+to pin, `ctrl-b </>` or tab dragging to reorder, and `ctrl-b t` to move tabs. Use `ctrl-b %` and
+`ctrl-b "` to split, arrows, `ctrl-b h/j/k`, or a mouse click to focus, `ctrl-b H/J/K/L` to resize,
 `ctrl-b z` to toggle zoom, `ctrl-b d` to detach,
 `ctrl-b q` to show stable pane IDs, and `ctrl-b ?` for help. `ctrl-b x` closes a pane, `ctrl-b &`
 closes the current window, and `ctrl-b Q` closes the workspace after `y` confirmation.
@@ -65,8 +71,10 @@ requires an existing workspace. Closing the terminal detaches without killing pa
 followed by `y`, or `termctrl stop NAME`, ends the workspace. Only one human terminal may be attached,
 while agent controls remain available when detached.
 
-Discover windows before panes. Window names are exact stable selectors; numeric indexes may shift.
+Discover windows before panes. Window names are exact stable selectors; numeric indexes shift after reorder, pinning, or close.
 Pane IDs are globally stable across windows; do not infer identity from geometry or titles.
+Inside a pane, use `termctrl current --json`; `TERMCTRL_WORKSPACE` and `TERMCTRL_PANE_ID` identify
+the caller while the daemon resolves its current window after moves or renames.
 Window-targeted `show`, `send`, `wait`, `logs`, `panes`, and `layout` do not change human selection.
 Only `select-window` and `focus --pane ID` intentionally move the visible human context.
 

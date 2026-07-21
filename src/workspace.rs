@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -45,9 +45,31 @@ pub enum TabPosition {
     Bottom,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum ActivityKind {
+    Output,
+    Bell,
+    Exit,
+    Match,
+}
+
+impl ActivityKind {
+    fn badge(self) -> char {
+        match self {
+            Self::Output => '+',
+            Self::Bell => '!',
+            Self::Exit => 'x',
+            Self::Match => '=',
+        }
+    }
+}
+
 pub(crate) struct Workspace {
+    name: String,
     windows: Vec<Window>,
     active_window: WindowId,
+    previous_window: Option<WindowId>,
     next_window_id: WindowId,
     next_pane_id: PaneId,
     launch: SessionLaunch,
@@ -68,6 +90,7 @@ struct WorkspaceRecording {
 pub(crate) struct Window {
     id: WindowId,
     name: String,
+    workspace: String,
     panes: Vec<Pane>,
     active: Option<PaneId>,
     layout: Option<LayoutNode>,
@@ -82,13 +105,16 @@ pub(crate) struct Window {
     zoomed: Option<PaneId>,
     cached_frame: Option<(PaneRevisions, Frame)>,
     frame_generation: u64,
-    activity: bool,
+    activity_kinds: BTreeSet<ActivityKind>,
+    match_rules: Vec<String>,
+    pinned: bool,
     capture_input: bool,
 }
 
 struct WindowIdentity {
     id: WindowId,
     name: String,
+    workspace: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -102,8 +128,27 @@ pub struct WindowStatus {
     pub zoomed_pane: Option<PaneId>,
     #[serde(default)]
     pub activity: bool,
+    #[serde(default)]
+    pub activity_kinds: Vec<ActivityKind>,
+    #[serde(default)]
+    pub match_rules: Vec<String>,
+    #[serde(default)]
+    pub pinned: bool,
     pub cols: u16,
     pub rows: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WorkspaceContext {
+    pub session: String,
+    pub workspace: String,
+    pub window_id: WindowId,
+    pub window: String,
+    pub window_index: usize,
+    pub pane: PaneId,
+    pub window_active: bool,
+    pub pane_active: bool,
+    pub tab_position: TabPosition,
 }
 
 struct Pane {
@@ -422,7 +467,28 @@ impl Workspace {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn start_with_theme(
+        command: &[String],
+        cwd: Option<&Path>,
+        record: Option<&Path>,
+        options: &Options,
+        theme: TerminalTheme,
+        tab_position: TabPosition,
+    ) -> Result<Self> {
+        Self::start_named_with_theme(
+            "workspace",
+            command,
+            cwd,
+            record,
+            options,
+            theme,
+            tab_position,
+        )
+    }
+
+    pub(crate) fn start_named_with_theme(
+        name: &str,
         command: &[String],
         cwd: Option<&Path>,
         record: Option<&Path>,
@@ -437,6 +503,7 @@ impl Workspace {
             WindowIdentity {
                 id: 0,
                 name: DEFAULT_WINDOW_NAME.to_owned(),
+                workspace: name.to_owned(),
             },
             0,
             command,
@@ -466,8 +533,10 @@ impl Workspace {
             })
             .transpose()?;
         Ok(Self {
+            name: name.to_owned(),
             windows: vec![main],
             active_window: 0,
+            previous_window: None,
             next_window_id: 1,
             next_pane_id: 1,
             launch,
@@ -539,11 +608,131 @@ impl Workspace {
                 pane_count: window.panes.len(),
                 active_pane: window.active,
                 zoomed_pane: window.zoomed,
-                activity: window.activity,
+                activity: !window.activity_kinds.is_empty(),
+                activity_kinds: window.activity_kinds.iter().copied().collect(),
+                match_rules: window.match_rules.clone(),
+                pinned: window.pinned,
                 cols: self.cols,
                 rows: self.rows,
             })
             .collect()
+    }
+
+    pub(crate) fn context(&self, pane: Option<PaneId>) -> Result<WorkspaceContext> {
+        let pane = pane
+            .or_else(|| self.selected_window().ok().and_then(|window| window.active))
+            .context("workspace has no active pane")?;
+        let window_index = self
+            .pane_window_index(pane)
+            .ok_or_else(|| anyhow::anyhow!("workspace has no pane {pane}"))?;
+        let window = &self.windows[window_index];
+        Ok(WorkspaceContext {
+            session: self.name.clone(),
+            workspace: self.name.clone(),
+            window_id: window.id,
+            window: window.name.clone(),
+            window_index,
+            pane,
+            window_active: window.id == self.active_window,
+            pane_active: window.active == Some(pane),
+            tab_position: self.tab_position,
+        })
+    }
+
+    pub(crate) fn set_tab_position(&mut self, position: TabPosition) {
+        if self.tab_position != position {
+            self.tab_position = position;
+            self.chrome_generation = self.chrome_generation.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn move_window(&mut self, name: &str, target: usize) -> Result<()> {
+        let index = self.window_index(name)?;
+        if target >= self.windows.len() {
+            bail!(
+                "window index {target} is out of range for {} windows",
+                self.windows.len()
+            );
+        }
+        if index == target {
+            return Ok(());
+        }
+        if self.windows[index].pinned != self.windows[target].pinned {
+            bail!("pin or unpin the window before moving it across the pinned boundary");
+        }
+        let window = self.windows.remove(index);
+        self.windows.insert(target, window);
+        self.chrome_generation = self.chrome_generation.wrapping_add(1);
+        Ok(())
+    }
+
+    fn move_active_window(&mut self, offset: isize) -> Result<bool> {
+        let current = self
+            .active_window_index()
+            .context("workspace has no active window")?;
+        let target = isize::try_from(current).unwrap_or(0) + offset;
+        if target < 0 || target >= isize::try_from(self.windows.len()).unwrap_or(isize::MAX) {
+            return Ok(false);
+        }
+        let target = usize::try_from(target).unwrap_or(current);
+        if self.windows[current].pinned != self.windows[target].pinned {
+            return Ok(false);
+        }
+        let name = self.windows[current].name.clone();
+        self.move_window(&name, target)?;
+        Ok(true)
+    }
+
+    pub(crate) fn set_window_pinned(&mut self, name: &str, pinned: bool) -> Result<()> {
+        let index = self.window_index(name)?;
+        if self.windows[index].pinned == pinned {
+            return Ok(());
+        }
+        let mut window = self.windows.remove(index);
+        window.pinned = pinned;
+        let pinned_count = self
+            .windows
+            .iter()
+            .take_while(|window| window.pinned)
+            .count();
+        self.windows.insert(pinned_count, window);
+        self.chrome_generation = self.chrome_generation.wrapping_add(1);
+        Ok(())
+    }
+
+    fn toggle_active_pinned(&mut self) -> Result<bool> {
+        let index = self
+            .active_window_index()
+            .context("workspace has no active window")?;
+        let name = self.windows[index].name.clone();
+        let pinned = !self.windows[index].pinned;
+        self.set_window_pinned(&name, pinned)?;
+        Ok(pinned)
+    }
+
+    pub(crate) fn add_match_rule(&mut self, name: &str, pattern: String) -> Result<()> {
+        if pattern.is_empty() {
+            bail!("activity match pattern cannot be empty");
+        }
+        let index = self.window_index(name)?;
+        if !self.windows[index].match_rules.contains(&pattern) {
+            self.windows[index].match_rules.push(pattern);
+            self.chrome_generation = self.chrome_generation.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_match_rule(&mut self, name: &str, pattern: &str) -> Result<()> {
+        let index = self.window_index(name)?;
+        let before = self.windows[index].match_rules.len();
+        self.windows[index]
+            .match_rules
+            .retain(|candidate| candidate != pattern);
+        if self.windows[index].match_rules.len() == before {
+            bail!("window {name:?} has no activity match rule {pattern:?}");
+        }
+        self.chrome_generation = self.chrome_generation.wrapping_add(1);
+        Ok(())
     }
 
     pub(crate) fn panes_in(&mut self, name: Option<&str>) -> Result<Vec<PaneStatus>> {
@@ -674,7 +863,11 @@ impl Workspace {
             .checked_add(1)
             .context("workspace exhausted stable pane ids")?;
         let window = Window::start_with_theme(
-            WindowIdentity { id, name },
+            WindowIdentity {
+                id,
+                name,
+                workspace: self.name.clone(),
+            },
             pane_id,
             command,
             cwd.or(Some(source_cwd.as_path())),
@@ -728,12 +921,13 @@ impl Workspace {
             .position(|window| window.id == id)
             .ok_or_else(|| anyhow::anyhow!("workspace has no window {id}"))?;
         if let Some(current) = self.active_window_index() {
+            self.previous_window = Some(self.windows[current].id);
             self.windows[current].cancel_paste();
             let active = self.windows[current].active;
             let _ = self.windows[current].send_focus(active, false);
         }
         self.active_window = id;
-        self.windows[next].activity = false;
+        self.windows[next].clear_activity();
         self.chrome_generation = self.chrome_generation.wrapping_add(1);
         let active = self.windows[next].active;
         let _ = self.windows[next].send_focus(active, true);
@@ -752,13 +946,29 @@ impl Workspace {
         self.select_window_index(usize::try_from(next).unwrap_or(0))
     }
 
+    fn select_previous_window(&mut self) -> Result<bool> {
+        let Some(previous) = self.previous_window else {
+            return Ok(false);
+        };
+        if !self.windows.iter().any(|window| window.id == previous) {
+            self.previous_window = None;
+            return Ok(false);
+        }
+        self.select_window_id(previous)?;
+        Ok(true)
+    }
+
     pub(crate) fn close_window(&mut self, name: &str) -> Result<()> {
         let index = self.window_index(name)?;
         self.close_window_index(index)
     }
 
     fn close_window_index(&mut self, index: usize) -> Result<()> {
-        let closing_active = self.windows[index].id == self.active_window;
+        let closing_id = self.windows[index].id;
+        let closing_active = closing_id == self.active_window;
+        let previous = self.previous_window.filter(|previous| {
+            *previous != closing_id && self.windows.iter().any(|window| window.id == *previous)
+        });
         if closing_active {
             let active = self.windows[index].active;
             let _ = self.windows[index].send_focus(active, false);
@@ -768,11 +978,18 @@ impl Workspace {
         self.flush_input(None)?;
         self.chrome_generation = self.chrome_generation.wrapping_add(1);
         if self.windows.is_empty() {
+            self.previous_window = None;
             return Ok(());
         }
+        if self.previous_window == Some(window.id) {
+            self.previous_window = None;
+        }
         if closing_active {
-            let next = index.min(self.windows.len() - 1);
+            let next = previous
+                .and_then(|previous| self.windows.iter().position(|window| window.id == previous))
+                .unwrap_or_else(|| index.min(self.windows.len() - 1));
             self.active_window = self.windows[next].id;
+            self.previous_window = None;
             let active = self.windows[next].active;
             let _ = self.windows[next].send_focus(active, true);
         }
@@ -813,12 +1030,18 @@ impl Workspace {
     pub(crate) fn pump(&mut self) -> Result<()> {
         for index in 0..self.windows.len() {
             let changed = self.windows[index].pump(&mut self.pending_input)?;
-            if changed
-                && self.windows[index].id != self.active_window
-                && !self.windows[index].activity
-            {
-                self.windows[index].activity = true;
-                self.chrome_generation = self.chrome_generation.wrapping_add(1);
+            if changed {
+                let matched = self.windows[index].matches_visible_rule()?;
+                if self.windows[index].id == self.active_window {
+                    continue;
+                }
+                let mut activity_changed = self.windows[index].mark_activity(ActivityKind::Output);
+                if matched {
+                    activity_changed |= self.windows[index].mark_activity(ActivityKind::Match);
+                }
+                if activity_changed {
+                    self.chrome_generation = self.chrome_generation.wrapping_add(1);
+                }
             }
         }
         self.flush_input(Some(recording::InputOrigin::Client))?;
@@ -873,7 +1096,14 @@ impl Workspace {
     pub(crate) fn observe_exits(&mut self) -> Result<bool> {
         let mut exited = false;
         for window in &mut self.windows {
-            exited |= window.observe_exits()?;
+            let changed = window.observe_exits()?;
+            if changed
+                && window.id != self.active_window
+                && window.mark_activity(ActivityKind::Exit)
+            {
+                self.chrome_generation = self.chrome_generation.wrapping_add(1);
+            }
+            exited |= changed;
         }
         Ok(exited)
     }
@@ -1360,8 +1590,19 @@ impl Workspace {
         Ok(status)
     }
 
-    pub(crate) fn take_bells(&self) -> u64 {
-        self.windows.iter().map(Window::take_bells).sum()
+    pub(crate) fn take_bells(&mut self) -> u64 {
+        let mut bells = 0;
+        for window in &mut self.windows {
+            let count = window.take_bells();
+            if count > 0
+                && window.id != self.active_window
+                && window.mark_activity(ActivityKind::Bell)
+            {
+                self.chrome_generation = self.chrome_generation.wrapping_add(1);
+            }
+            bells += count;
+        }
+        bells
     }
 
     pub(crate) fn mark_recording(&mut self, name: &str) -> Result<()> {
@@ -1577,8 +1818,8 @@ impl Workspace {
                         frame.background
                     },
                     attributes: Attributes {
-                        bold: active || window.activity,
-                        faint: !active && !window.activity,
+                        bold: active || !window.activity_kinds.is_empty(),
+                        faint: !active && window.activity_kinds.is_empty(),
                         ..Attributes::default()
                     },
                 });
@@ -1595,20 +1836,43 @@ impl Workspace {
             .find_map(|tab| (x >= tab.start && x < tab.end).then_some(tab.index))
     }
 
+    fn tab_drop_index_at(&self, x: u16, y: u16) -> Option<usize> {
+        if y != self.tab_row() {
+            return None;
+        }
+        let labels = self.tab_labels(self.active_window);
+        labels
+            .iter()
+            .find(|tab| x < tab.end.saturating_add(1))
+            .or_else(|| labels.last())
+            .map(|tab| tab.index)
+    }
+
     fn tab_labels(&self, selected: WindowId) -> Vec<TabLabel> {
         let mut x = 0_u16;
         self.windows
             .iter()
             .enumerate()
             .map_while(|(index, window)| {
-                let activity = if window.activity { "*" } else { "" };
+                let pin = if window.pinned { "^" } else { "" };
+                let badges = window
+                    .activity_kinds
+                    .iter()
+                    .copied()
+                    .map(ActivityKind::badge)
+                    .collect::<String>();
+                let activity = if badges.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {{{badges}}}")
+                };
                 let panes = if window.panes.len() > 1 {
                     format!(" {}p", window.panes.len())
                 } else {
                     String::new()
                 };
                 let zoom = if window.zoomed.is_some() { " Z" } else { "" };
-                let label = format!("{index}:{}{activity}{panes}{zoom}", window.name);
+                let label = format!("{index}:{pin}{}{activity}{panes}{zoom}", window.name);
                 let text = if window.id == selected {
                     format!("[{label}]")
                 } else {
@@ -1678,13 +1942,15 @@ impl Window {
             .unwrap_or(std::env::current_dir().context("resolve workspace directory")?);
         let shell = shell_command();
         let command = if command.is_empty() { &shell } else { command };
-        let mut session = Session::start_with_theme(command, Some(&cwd), None, options, theme)?;
+        let options = pane_options(options, &identity.workspace, identity.id, pane_id);
+        let mut session = Session::start_with_theme(command, Some(&cwd), None, &options, theme)?;
         if capture_input {
             session.capture_input();
         }
         Ok(Self {
             id: identity.id,
             name: identity.name,
+            workspace: identity.workspace,
             panes: vec![Pane {
                 id: pane_id,
                 session,
@@ -1713,7 +1979,9 @@ impl Window {
             zoomed: None,
             cached_frame: None,
             frame_generation: 0,
-            activity: false,
+            activity_kinds: BTreeSet::new(),
+            match_rules: Vec::new(),
+            pinned: false,
             capture_input,
         })
     }
@@ -1760,6 +2028,22 @@ impl Window {
             pending_input.extend(pane.session.take_captured_input());
         }
         Ok(changed)
+    }
+
+    fn mark_activity(&mut self, kind: ActivityKind) -> bool {
+        self.activity_kinds.insert(kind)
+    }
+
+    fn clear_activity(&mut self) {
+        self.activity_kinds.clear();
+    }
+
+    fn matches_visible_rule(&mut self) -> Result<bool> {
+        if self.match_rules.is_empty() {
+            return Ok(false);
+        }
+        let text = self.frame()?.text();
+        Ok(self.match_rules.iter().any(|rule| text.contains(rule)))
     }
 
     pub(crate) fn observe_exits(&mut self) -> Result<bool> {
@@ -2404,6 +2688,7 @@ impl Window {
         let mut options = self.options.clone();
         options.cols = rect.cols;
         options.rows = rect.rows;
+        let options = pane_options(&options, &self.workspace, self.id, id);
         let mut session = Session::start_with_theme(
             command.unwrap_or(&self.shell),
             Some(&self.cwd),
@@ -2493,6 +2778,23 @@ fn shell_command() -> Vec<String> {
     vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned())]
 }
 
+fn pane_options(options: &Options, workspace: &str, window: WindowId, pane: PaneId) -> Options {
+    let mut options = options.clone();
+    options
+        .env
+        .insert("TERMCTRL_SESSION".to_owned(), workspace.to_owned());
+    options
+        .env
+        .insert("TERMCTRL_WORKSPACE".to_owned(), workspace.to_owned());
+    options
+        .env
+        .insert("TERMCTRL_LAUNCH_WINDOW_ID".to_owned(), window.to_string());
+    options
+        .env
+        .insert("TERMCTRL_PANE_ID".to_owned(), pane.to_string());
+    options
+}
+
 fn content_rows(rows: u16) -> Result<u16> {
     rows.checked_sub(TAB_STRIP_ROWS)
         .filter(|rows| *rows > 0)
@@ -2503,13 +2805,13 @@ fn uncaptured_tab_position(
     position: Option<(u16, u16)>,
     rows: u16,
     tab_position: TabPosition,
-    mouse_target: Option<PaneId>,
+    pane_captured: bool,
 ) -> Option<(u16, u16)> {
     let tab_row = match tab_position {
         TabPosition::Top => 0,
         TabPosition::Bottom => rows.saturating_sub(TAB_STRIP_ROWS),
     };
-    position.filter(|(_, y)| mouse_target.is_none() && *y == tab_row)
+    position.filter(|(_, y)| !pane_captured && *y == tab_row)
 }
 
 fn validate_window_name(name: &str) -> Result<()> {
@@ -2824,6 +3126,10 @@ enum InputAction {
     NewWindow,
     NextWindow,
     PreviousWindow,
+    Palette,
+    MoveWindow(isize),
+    TogglePin,
+    ToggleTabPosition,
     SelectWindow(usize),
     WindowList,
     CloseWindow,
@@ -2958,7 +3264,6 @@ impl PrefixDecoder {
                     b'%' => InputAction::Split(SplitAxis::Columns),
                     b'"' => InputAction::Split(SplitAxis::Rows),
                     b'h' => InputAction::Focus(Direction::Left),
-                    b'l' => InputAction::Focus(Direction::Right),
                     b'k' => InputAction::Focus(Direction::Up),
                     b'j' => InputAction::Focus(Direction::Down),
                     b'H' => InputAction::Resize(Direction::Left),
@@ -2969,7 +3274,12 @@ impl PrefixDecoder {
                     b'x' => InputAction::CloseActive,
                     b'c' => InputAction::NewWindow,
                     b'n' => InputAction::NextWindow,
-                    b'p' => InputAction::PreviousWindow,
+                    b'l' => InputAction::PreviousWindow,
+                    b'p' => InputAction::Palette,
+                    b'<' => InputAction::MoveWindow(-1),
+                    b'>' => InputAction::MoveWindow(1),
+                    b'P' => InputAction::TogglePin,
+                    b't' => InputAction::ToggleTabPosition,
                     b'0'..=b'9' => InputAction::SelectWindow(usize::from(byte - b'0')),
                     b'w' => InputAction::WindowList,
                     b'd' => InputAction::Detach,
@@ -3129,9 +3439,32 @@ enum ArmedAction {
     Quit,
 }
 
+#[derive(Clone, Copy)]
+enum PaletteCommand {
+    SelectWindow(WindowId),
+    FocusPane(PaneId),
+    ToggleTabPosition,
+    TogglePin,
+    MoveWindow(isize),
+    NewWindow,
+    Detach,
+}
+
+struct PaletteItem {
+    label: String,
+    command: PaletteCommand,
+}
+
+#[derive(Default)]
+struct CommandPalette {
+    query: String,
+    selected: usize,
+}
+
 struct WorkspaceUi {
     notice: Option<(String, Instant)>,
     armed: Option<(ArmedAction, Instant)>,
+    palette: Option<CommandPalette>,
 }
 
 impl WorkspaceUi {
@@ -3139,6 +3472,7 @@ impl WorkspaceUi {
         let mut ui = Self {
             notice: None,
             armed: None,
+            palette: None,
         };
         ui.notice("^B ? workspace keys", Duration::from_secs(2));
         ui
@@ -3152,6 +3486,62 @@ impl WorkspaceUi {
         if self.armed.take().is_some() {
             self.notice = None;
         }
+    }
+
+    fn open_palette(&mut self) {
+        self.clear_armed();
+        self.notice = None;
+        self.palette = Some(CommandPalette::default());
+    }
+
+    fn palette_input(
+        &mut self,
+        workspace: &Workspace,
+        input: &[u8],
+    ) -> (Option<PaletteCommand>, Vec<u8>) {
+        let mut index = 0;
+        while index < input.len() {
+            let remaining = &input[index..];
+            let Some(palette) = self.palette.as_mut() else {
+                return (None, input[index..].to_vec());
+            };
+            if remaining.starts_with(b"\x1b[A") || remaining.starts_with(b"\x1bOA") {
+                palette.selected = palette.selected.saturating_sub(1);
+                index += 3;
+                continue;
+            }
+            if remaining.starts_with(b"\x1b[B") || remaining.starts_with(b"\x1bOB") {
+                select_next_palette_item(workspace, palette);
+                index += 3;
+                continue;
+            }
+            match input[index] {
+                0x1b | 0x03 => {
+                    self.palette = None;
+                    return (None, input[index + 1..].to_vec());
+                }
+                b'\r' | b'\n' => {
+                    let command = palette_items(workspace, &palette.query)
+                        .get(palette.selected)
+                        .map(|item| item.command);
+                    self.palette = None;
+                    return (command, input[index + 1..].to_vec());
+                }
+                0x10 => palette.selected = palette.selected.saturating_sub(1),
+                0x0e | b'\t' => select_next_palette_item(workspace, palette),
+                0x7f | 0x08 => {
+                    palette.query.pop();
+                    palette.selected = 0;
+                }
+                byte if byte.is_ascii_graphic() || byte == b' ' => {
+                    palette.query.push(char::from(byte));
+                    palette.selected = 0;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        (None, Vec::new())
     }
 
     fn arm(&mut self, action: ArmedAction, prompt: &str) {
@@ -3179,6 +3569,29 @@ impl WorkspaceUi {
         }
     }
 
+    fn palette_lines(&self, workspace: &Workspace) -> Option<Vec<String>> {
+        let palette = self.palette.as_ref()?;
+        let items = palette_items(workspace, &palette.query);
+        let mut lines = vec![format!("COMMAND PALETTE  > {}", palette.query)];
+        if items.is_empty() {
+            lines.push("  no matches".to_owned());
+            return Some(lines);
+        }
+        let visible = 6_usize;
+        let start = palette
+            .selected
+            .saturating_sub(visible / 2)
+            .min(items.len().saturating_sub(visible));
+        for (index, item) in items.iter().enumerate().skip(start).take(visible) {
+            lines.push(format!(
+                "{} {}",
+                if index == palette.selected { '>' } else { ' ' },
+                item.label
+            ));
+        }
+        Some(lines)
+    }
+
     fn overlay(&mut self, prefix: bool) -> Option<String> {
         if prefix {
             return Some("^B".to_owned());
@@ -3202,12 +3615,112 @@ impl WorkspaceUi {
     }
 }
 
+fn select_next_palette_item(workspace: &Workspace, palette: &mut CommandPalette) {
+    let length = palette_items(workspace, &palette.query).len();
+    if length > 0 {
+        palette.selected = (palette.selected + 1).min(length - 1);
+    }
+}
+
+fn palette_items(workspace: &Workspace, query: &str) -> Vec<PaletteItem> {
+    let mut items = Vec::new();
+    for (index, window) in workspace.windows.iter().enumerate() {
+        items.push(PaletteItem {
+            label: format!("window {index}:{}", window.name),
+            command: PaletteCommand::SelectWindow(window.id),
+        });
+        for pane in &window.panes {
+            items.push(PaletteItem {
+                label: format!("pane {} in {}", pane.id, window.name),
+                command: PaletteCommand::FocusPane(pane.id),
+            });
+        }
+    }
+    items.extend([
+        PaletteItem {
+            label: "tabs toggle top/bottom".to_owned(),
+            command: PaletteCommand::ToggleTabPosition,
+        },
+        PaletteItem {
+            label: "window toggle pin".to_owned(),
+            command: PaletteCommand::TogglePin,
+        },
+        PaletteItem {
+            label: "window move left".to_owned(),
+            command: PaletteCommand::MoveWindow(-1),
+        },
+        PaletteItem {
+            label: "window move right".to_owned(),
+            command: PaletteCommand::MoveWindow(1),
+        },
+        PaletteItem {
+            label: "window new".to_owned(),
+            command: PaletteCommand::NewWindow,
+        },
+        PaletteItem {
+            label: "workspace detach".to_owned(),
+            command: PaletteCommand::Detach,
+        },
+    ]);
+    if query.is_empty() {
+        return items;
+    }
+    let query = query.to_ascii_lowercase();
+    items
+        .into_iter()
+        .filter(|item| fuzzy_matches(&item.label.to_ascii_lowercase(), &query))
+        .collect()
+}
+
+fn fuzzy_matches(candidate: &str, query: &str) -> bool {
+    let mut query = query.chars();
+    let mut expected = query.next();
+    for character in candidate.chars() {
+        if expected == Some(character) {
+            expected = query.next();
+        }
+    }
+    expected.is_none()
+}
+
+fn apply_palette_command(
+    workspace: &mut Workspace,
+    ui: &mut WorkspaceUi,
+    command: PaletteCommand,
+) -> Result<bool> {
+    match command {
+        PaletteCommand::SelectWindow(window) => workspace.select_window_id(window)?,
+        PaletteCommand::FocusPane(pane) => workspace.focus_pane(pane)?,
+        PaletteCommand::ToggleTabPosition => {
+            let position = match workspace.tab_position {
+                TabPosition::Top => TabPosition::Bottom,
+                TabPosition::Bottom => TabPosition::Top,
+            };
+            workspace.set_tab_position(position);
+        }
+        PaletteCommand::TogglePin => {
+            workspace.toggle_active_pinned()?;
+        }
+        PaletteCommand::MoveWindow(offset) => {
+            if !workspace.move_active_window(offset)? {
+                bail!("window cannot move across this boundary");
+            }
+        }
+        PaletteCommand::NewWindow => {
+            workspace.create_window(None, &[], None)?;
+        }
+        PaletteCommand::Detach => return Ok(false),
+    }
+    ui.notice("palette action applied", Duration::from_millis(1_000));
+    Ok(true)
+}
+
 pub(crate) struct WorkspaceTerminal {
     attachment: Option<WorkspaceAttachment>,
     decoder: PrefixDecoder,
     pending_actions: VecDeque<InputAction>,
     ui: WorkspaceUi,
-    mouse_target: Option<PaneId>,
+    mouse_capture: Option<MouseCapture>,
     pending_removal: bool,
     finished: bool,
     presentation_revision: Option<(WindowId, PaneId, u64, u64)>,
@@ -3215,6 +3728,21 @@ pub(crate) struct WorkspaceTerminal {
     paint_revisions: PaneRevisions,
     revision_scratch: PaneRevisions,
     painted_overlay: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum MouseCapture {
+    Pane(PaneId),
+    Tab { window: WindowId, origin_x: u16 },
+}
+
+impl MouseCapture {
+    fn dragged_tab(self, release_x: u16) -> Option<WindowId> {
+        match self {
+            Self::Tab { window, origin_x } if release_x != origin_x => Some(window),
+            _ => None,
+        }
+    }
 }
 
 struct WorkspaceAttachment {
@@ -3240,7 +3768,7 @@ impl WorkspaceTerminal {
             decoder: PrefixDecoder::default(),
             pending_actions: VecDeque::new(),
             ui: WorkspaceUi::new(),
-            mouse_target: None,
+            mouse_capture: None,
             pending_removal: false,
             finished: false,
             presentation_revision: None,
@@ -3289,7 +3817,7 @@ impl WorkspaceTerminal {
         self.decoder = PrefixDecoder::default();
         self.pending_actions.clear();
         self.ui = WorkspaceUi::new();
-        self.mouse_target = None;
+        self.mouse_capture = None;
         self.presentation_revision = None;
         self.paint_window = None;
         self.paint_revisions.clear();
@@ -3402,6 +3930,34 @@ impl WorkspaceTerminal {
                 let Some(action) = self.pending_actions.pop_front() else {
                     break;
                 };
+                if self.ui.palette.is_some() {
+                    let (command, remainder) = match &action {
+                        InputAction::Send(input) | InputAction::PasteData(input) => {
+                            self.ui.palette_input(workspace, input)
+                        }
+                        InputAction::Cancel => {
+                            self.ui.palette = None;
+                            (None, Vec::new())
+                        }
+                        _ => (None, Vec::new()),
+                    };
+                    if let Some(command) = command {
+                        match apply_palette_command(workspace, &mut self.ui, command) {
+                            Ok(true) => {}
+                            Ok(false) => return Ok(false),
+                            Err(error) => {
+                                attachment.screen.bell()?;
+                                self.ui
+                                    .notice(error.to_string(), Duration::from_millis(1_500));
+                            }
+                        }
+                    }
+                    if !remainder.is_empty() {
+                        self.pending_actions
+                            .push_front(InputAction::Send(remainder));
+                    }
+                    continue;
+                }
                 match action {
                     InputAction::Send(input) => {
                         if let Some(confirmation) = self.ui.confirmation(&input) {
@@ -3528,30 +4084,72 @@ impl WorkspaceTerminal {
                             position,
                             workspace.rows,
                             workspace.tab_position,
-                            self.mouse_target,
+                            matches!(self.mouse_capture, Some(MouseCapture::Pane(_))),
                         ) {
-                            self.mouse_target = None;
-                            if primary_press && let Some(index) = workspace.tab_index_at(x, y) {
+                            let target = workspace.tab_index_at(x, y);
+                            if primary_press && let Some(index) = target {
                                 self.ui.clear_armed();
+                                self.mouse_capture =
+                                    workspace
+                                        .windows
+                                        .get(index)
+                                        .map(|window| MouseCapture::Tab {
+                                            window: window.id,
+                                            origin_x: x,
+                                        });
                                 workspace.select_window_index(index)?;
+                            }
+                            if capture_end {
+                                let source = self
+                                    .mouse_capture
+                                    .take()
+                                    .and_then(|capture| capture.dragged_tab(x));
+                                let drop_target = workspace.tab_drop_index_at(x, y);
+                                if let (Some(window), Some(target)) = (source, drop_target)
+                                    && let Some(index) = workspace
+                                        .windows
+                                        .iter()
+                                        .position(|candidate| candidate.id == window)
+                                {
+                                    let name = workspace.windows[index].name.clone();
+                                    if let Err(error) = workspace.move_window(&name, target) {
+                                        attachment.screen.bell()?;
+                                        self.ui.notice(
+                                            error.to_string(),
+                                            Duration::from_millis(1_500),
+                                        );
+                                    }
+                                }
                             }
                             continue;
                         }
-                        if workspace.is_multi_pane() || self.mouse_target.is_some() {
+                        if matches!(self.mouse_capture, Some(MouseCapture::Tab { .. })) {
+                            if capture_end {
+                                self.mouse_capture = None;
+                            }
+                            continue;
+                        }
+                        if workspace.is_multi_pane()
+                            || matches!(self.mouse_capture, Some(MouseCapture::Pane(_)))
+                        {
                             let target = position.and_then(|(x, y)| {
                                 if captured_event {
-                                    self.mouse_target
-                                        .and_then(|pane| workspace.pane_position(pane, x, y))
+                                    match self.mouse_capture {
+                                        Some(MouseCapture::Pane(pane)) => {
+                                            workspace.pane_position(pane, x, y)
+                                        }
+                                        _ => None,
+                                    }
                                 } else {
                                     workspace.pane_at(x, y)
                                 }
                             });
                             if capture_end {
-                                self.mouse_target = None;
+                                self.mouse_capture = None;
                             }
                             if let Some((pane, local_x, local_y)) = target {
                                 if capture_start {
-                                    self.mouse_target = Some(pane);
+                                    self.mouse_capture = Some(MouseCapture::Pane(pane));
                                 }
                                 if primary_press {
                                     self.ui.clear_armed();
@@ -3612,7 +4210,7 @@ impl WorkspaceTerminal {
                     }
                     InputAction::PreviousWindow => {
                         self.ui.clear_armed();
-                        if workspace.select_relative_window(-1)? {
+                        if workspace.select_previous_window()? {
                             self.ui.notice(
                                 format!(
                                     "window {} active",
@@ -3621,6 +4219,47 @@ impl WorkspaceTerminal {
                                 Duration::from_millis(1_000),
                             );
                         }
+                    }
+                    InputAction::Palette => {
+                        self.mouse_capture = None;
+                        self.ui.open_palette();
+                    }
+                    InputAction::MoveWindow(offset) => {
+                        self.ui.clear_armed();
+                        if workspace.move_active_window(offset)? {
+                            self.ui
+                                .notice("window reordered", Duration::from_millis(1_000));
+                        } else {
+                            attachment.screen.bell()?;
+                            self.ui.notice(
+                                "window cannot move across this boundary",
+                                Duration::from_millis(1_200),
+                            );
+                        }
+                    }
+                    InputAction::TogglePin => {
+                        self.ui.clear_armed();
+                        let pinned = workspace.toggle_active_pinned()?;
+                        self.ui.notice(
+                            if pinned {
+                                "window pinned"
+                            } else {
+                                "window unpinned"
+                            },
+                            Duration::from_millis(1_000),
+                        );
+                    }
+                    InputAction::ToggleTabPosition => {
+                        self.ui.clear_armed();
+                        let position = match workspace.tab_position {
+                            TabPosition::Top => TabPosition::Bottom,
+                            TabPosition::Bottom => TabPosition::Top,
+                        };
+                        workspace.set_tab_position(position);
+                        self.ui.notice(
+                            format!("tabs moved to {position:?}").to_ascii_lowercase(),
+                            Duration::from_millis(1_000),
+                        );
                     }
                     InputAction::SelectWindow(index) => {
                         self.ui.clear_armed();
@@ -3691,7 +4330,7 @@ impl WorkspaceTerminal {
                     InputAction::Help => {
                         self.ui.clear_armed();
                         self.ui.notice(
-                            "^B c new  n/p windows  0-9 select  w list  %/\" split  H/J/K/L resize  z zoom  x pane  & window  d detach",
+                            "^B p palette  l last  n next  </> move  P pin  t tabs  c new  0-9 select  %/\" split  H/J/K/L resize  z zoom  d detach",
                             Duration::from_secs(4),
                         );
                     }
@@ -3719,7 +4358,11 @@ impl WorkspaceTerminal {
                 }
             }
         }
-        let overlay = self.ui.overlay(self.decoder.waiting());
+        let palette = self.ui.palette_lines(workspace);
+        let overlay = palette
+            .as_ref()
+            .map(|lines| lines.join("\n"))
+            .or_else(|| self.ui.overlay(self.decoder.waiting()));
         let mut revisions = std::mem::take(&mut self.revision_scratch);
         let paint_window = workspace.active_frame_key(&mut revisions)?;
         if self.paint_window != Some(paint_window)
@@ -3739,7 +4382,9 @@ impl WorkspaceTerminal {
                 )?;
                 self.presentation_revision = Some(presentation_revision);
             }
-            if let Some(overlay) = &overlay {
+            if let Some(lines) = &palette {
+                add_palette_overlay(&mut frame, lines, workspace.tab_position);
+            } else if let Some(overlay) = &overlay {
                 add_overlay_at(&mut frame, overlay, workspace.tab_row());
             }
             attachment.screen.paint(frame)?;
@@ -3775,6 +4420,58 @@ fn attachment_closed(error: &anyhow::Error) -> bool {
 fn add_overlay(frame: &mut Frame, text: &str) {
     let y = frame.rows.saturating_sub(1);
     add_overlay_at(frame, text, y);
+}
+
+fn add_palette_overlay(frame: &mut Frame, lines: &[String], tab_position: TabPosition) {
+    if frame.cols == 0 || frame.rows <= TAB_STRIP_ROWS || lines.is_empty() {
+        return;
+    }
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .min(frame.rows - TAB_STRIP_ROWS);
+    let width = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .and_then(|width| u16::try_from(width.saturating_add(2)).ok())
+        .unwrap_or(frame.cols)
+        .min(frame.cols);
+    let start_y = match tab_position {
+        TabPosition::Top => TAB_STRIP_ROWS,
+        TabPosition::Bottom => frame.rows - TAB_STRIP_ROWS - height,
+    };
+    for (offset, line) in lines.iter().take(usize::from(height)).enumerate() {
+        let y = start_y + u16::try_from(offset).unwrap_or(0);
+        frame.cells.retain(|cell| cell.y != y || cell.x >= width);
+        frame.cells.push(Cell {
+            x: 0,
+            y,
+            text: String::new(),
+            width,
+            foreground: frame.background,
+            background: frame.foreground,
+            attributes: Attributes::default(),
+        });
+        for (x, character) in format!(" {line}")
+            .chars()
+            .take(usize::from(width))
+            .enumerate()
+        {
+            frame.cells.push(Cell {
+                x: u16::try_from(x).unwrap_or(0),
+                y,
+                text: character.to_string(),
+                width: 1,
+                foreground: frame.background,
+                background: frame.foreground,
+                attributes: Attributes {
+                    bold: offset == 0 || line.starts_with('>'),
+                    ..Attributes::default()
+                },
+            });
+        }
+    }
+    frame.cursor = None;
 }
 
 fn add_overlay_at(frame: &mut Frame, text: &str, y: u16) {
@@ -4433,7 +5130,15 @@ mod tests {
         assert_eq!(decoder.push(&[PREFIX, b'q']), [InputAction::PaneNumbers]);
         assert_eq!(decoder.push(&[PREFIX, b'c']), [InputAction::NewWindow]);
         assert_eq!(decoder.push(&[PREFIX, b'n']), [InputAction::NextWindow]);
-        assert_eq!(decoder.push(&[PREFIX, b'p']), [InputAction::PreviousWindow]);
+        assert_eq!(decoder.push(&[PREFIX, b'p']), [InputAction::Palette]);
+        assert_eq!(decoder.push(&[PREFIX, b'l']), [InputAction::PreviousWindow]);
+        assert_eq!(decoder.push(&[PREFIX, b'<']), [InputAction::MoveWindow(-1)]);
+        assert_eq!(decoder.push(&[PREFIX, b'>']), [InputAction::MoveWindow(1)]);
+        assert_eq!(decoder.push(&[PREFIX, b'P']), [InputAction::TogglePin]);
+        assert_eq!(
+            decoder.push(&[PREFIX, b't']),
+            [InputAction::ToggleTabPosition]
+        );
         assert_eq!(
             decoder.push(&[PREFIX, b'2']),
             [InputAction::SelectWindow(2)]
@@ -4536,6 +5241,21 @@ mod tests {
             translate_mouse(b"\x1b[<0;42;13M", 2, 3, false).as_deref(),
             Some(b"\x1b[M #$".as_slice())
         );
+    }
+
+    #[test]
+    fn tab_click_requires_horizontal_movement_before_it_becomes_a_drag() {
+        let click = MouseCapture::Tab {
+            window: 7,
+            origin_x: 12,
+        };
+        let drag = MouseCapture::Tab {
+            window: 7,
+            origin_x: 12,
+        };
+
+        assert_eq!(click.dragged_tab(12), None);
+        assert_eq!(drag.dragged_tab(13), Some(7));
     }
 
     #[test]
@@ -4752,7 +5472,7 @@ mod tests {
         loop {
             workspace.pump().unwrap();
             let text = workspace.frame().unwrap().text();
-            if text.contains("LEFT") && text.contains("RIGHT") && text.contains("1:other*") {
+            if text.contains("LEFT") && text.contains("RIGHT") && text.contains("1:other {+}") {
                 break;
             }
             assert!(Instant::now() < deadline, "workspace output did not arrive");
@@ -4794,7 +5514,7 @@ mod tests {
         assert!(text.contains("LEFT"), "{text:?}");
         assert!(text.contains("RIGHT"), "{text:?}");
         assert!(text.contains("[0:main 2p]"), "{text:?}");
-        assert!(text.contains("1:renamed*"), "{text:?}");
+        assert!(text.contains("1:renamed {+}"), "{text:?}");
         assert_eq!((replayed.frame.cols, replayed.frame.rows), (31, 7));
         let recording = crate::recording::read(&record).unwrap();
         assert!(recording.events.iter().any(|entry| matches!(
@@ -5368,7 +6088,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let frame = workspace.frame().unwrap();
-        assert!(frame.text().contains("1:logs*"));
+        assert!(frame.text().contains("1:logs {+}"));
         let logs = workspace
             .tab_labels(workspace.active_window)
             .into_iter()
@@ -5376,16 +6096,109 @@ mod tests {
             .unwrap();
         assert_eq!(workspace.tab_index_at(logs.start, 6), Some(1));
         assert_eq!(
-            uncaptured_tab_position(Some((logs.start, 6)), 7, TabPosition::Bottom, None,),
+            uncaptured_tab_position(Some((logs.start, 6)), 7, TabPosition::Bottom, false),
             Some((logs.start, 6))
         );
         assert_eq!(
-            uncaptured_tab_position(Some((logs.start, 6)), 7, TabPosition::Bottom, Some(0),),
+            uncaptured_tab_position(Some((logs.start, 6)), 7, TabPosition::Bottom, true),
             None
         );
         workspace.select_window_index(1).unwrap();
         assert!(!workspace.windows()[1].activity);
         assert!(workspace.frame().unwrap().text().contains("[1:logs]"));
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tab_badges_compose_activity_kinds_and_match_rules_are_exact() {
+        let command = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        let mut workspace = Workspace::start(&command, None, None, &Options::default()).unwrap();
+        workspace
+            .create_window(Some("logs"), &command, None)
+            .unwrap();
+        workspace.select_window("main").unwrap();
+        workspace
+            .add_match_rule("logs", "FAILED".to_owned())
+            .unwrap();
+        workspace
+            .add_match_rule("logs", "FAILED".to_owned())
+            .unwrap();
+        assert_eq!(workspace.windows()[1].match_rules, ["FAILED"]);
+        for kind in [
+            ActivityKind::Output,
+            ActivityKind::Bell,
+            ActivityKind::Exit,
+            ActivityKind::Match,
+        ] {
+            workspace.windows[1].mark_activity(kind);
+        }
+        assert!(workspace.frame().unwrap().text().contains("logs {+!x=}"));
+        workspace.remove_match_rule("logs", "FAILED").unwrap();
+        assert!(workspace.remove_match_rule("logs", "FAILED").is_err());
+        workspace.select_window("logs").unwrap();
+        assert!(workspace.windows()[1].activity_kinds.is_empty());
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_activity_detects_output_bell_match_and_surviving_pane_exit() {
+        let command = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        let delayed_activity = [
+            "sh".to_owned(),
+            "-c".to_owned(),
+            r"sleep 0.2; printf '\aFAILED'; cat".to_owned(),
+        ];
+        let mut workspace = Workspace::start(&command, None, None, &Options::default()).unwrap();
+        workspace
+            .create_window(Some("logs"), &delayed_activity, None)
+            .unwrap();
+        workspace
+            .add_match_rule("logs", "FAILED".to_owned())
+            .unwrap();
+        workspace.select_window("main").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            workspace.pump().unwrap();
+            workspace.take_bells();
+            let kinds = &workspace.windows[1].activity_kinds;
+            if [
+                ActivityKind::Output,
+                ActivityKind::Bell,
+                ActivityKind::Match,
+            ]
+            .iter()
+            .all(|kind| kinds.contains(kind))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "hidden activity did not arrive");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let delayed_exit = ["sh".to_owned(), "-c".to_owned(), "sleep 0.2".to_owned()];
+        workspace
+            .create_window(Some("worker"), &delayed_exit, None)
+            .unwrap();
+        workspace
+            .set_grid_in_with_command(Some("worker"), 1, 2, Some(&command))
+            .unwrap();
+        workspace.select_window("main").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            workspace.pump().unwrap();
+            workspace.observe_exits().unwrap();
+            if workspace.windows[2]
+                .activity_kinds
+                .contains(&ActivityKind::Exit)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "hidden exit did not arrive");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(workspace.windows[2].panes.len(), 2);
         workspace.stop();
     }
 
@@ -5423,6 +6236,129 @@ mod tests {
         assert_eq!(workspace.tab_index_at(0, 0), Some(0));
         assert_eq!(workspace.pane_at(0, 1), Some((0, 0, 0)));
         assert_eq!(workspace.pane_position(0, 0, 0), Some((0, 0, 0)));
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_tab_position_reorder_pin_and_context_share_authoritative_state() {
+        let command = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        let mut workspace = Workspace::start_named_with_theme(
+            "identity-test",
+            &command,
+            None,
+            None,
+            &Options::default(),
+            TerminalTheme::default(),
+            TabPosition::Bottom,
+        )
+        .unwrap();
+        workspace
+            .create_window(Some("one"), &command, None)
+            .unwrap();
+        workspace
+            .create_window(Some("two"), &command, None)
+            .unwrap();
+        let two_pane = workspace.windows()[2].active_pane.unwrap();
+
+        workspace.set_window_pinned("one", true).unwrap();
+        workspace.move_window("two", 1).unwrap();
+        workspace.set_tab_position(TabPosition::Top);
+
+        let windows = workspace.windows();
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.name.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two", "main"]
+        );
+        assert!(windows[0].pinned);
+        assert!(workspace.move_window("one", 2).is_err());
+        let context = workspace.context(Some(two_pane)).unwrap();
+        assert_eq!(context.session, "identity-test");
+        assert_eq!(context.workspace, "identity-test");
+        assert_eq!(context.window, "two");
+        assert_eq!(context.window_index, 1);
+        assert_eq!(context.pane, two_pane);
+        assert_eq!(context.tab_position, TabPosition::Top);
+        assert_eq!(workspace.panes_in(Some("two")).unwrap()[0].y, 1);
+
+        workspace.select_window("one").unwrap();
+        assert!(workspace.select_previous_window().unwrap());
+        assert_eq!(workspace.active_window_name(), Some("two"));
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_environment_identifies_itself_and_context_tracks_window_moves() {
+        let command = [
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf 'IDENTITY=%s:%s' \"$TERMCTRL_WORKSPACE\" \"$TERMCTRL_PANE_ID\"; cat".to_owned(),
+        ];
+        let mut workspace = Workspace::start_named_with_theme(
+            "agent-home",
+            &command,
+            None,
+            None,
+            &Options::default(),
+            TerminalTheme::default(),
+            TabPosition::Bottom,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            workspace.pump().unwrap();
+            if workspace
+                .frame()
+                .unwrap()
+                .text()
+                .contains("IDENTITY=agent-home:0")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pane identity output did not arrive"
+            );
+        }
+        workspace
+            .create_window(Some("destination"), &command, None)
+            .unwrap();
+        workspace.move_pane(0, "destination", false).unwrap();
+        let context = workspace.context(Some(0)).unwrap();
+        assert_eq!(context.window, "destination");
+        assert_eq!(context.pane, 0);
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_palette_handles_coalesced_input_and_renders_a_panel() {
+        let command = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        let mut workspace = Workspace::start(&command, None, None, &Options::default()).unwrap();
+        workspace
+            .create_window(Some("tests"), &command, None)
+            .unwrap();
+        workspace.select_window("main").unwrap();
+        let mut ui = WorkspaceUi::new();
+        ui.open_palette();
+
+        let (action, remainder) = ui.palette_input(&workspace, b"window tests\rtyped after");
+        let action = action.unwrap();
+        assert_eq!(remainder, b"typed after");
+        apply_palette_command(&mut workspace, &mut ui, action).unwrap();
+        assert_eq!(workspace.active_window_name(), Some("tests"));
+
+        ui.open_palette();
+        let lines = ui.palette_lines(&workspace).unwrap();
+        let mut frame = frame(80, 12, "content", Some((0, 0)));
+        add_palette_overlay(&mut frame, &lines, TabPosition::Bottom);
+        assert!(frame.text().contains("COMMAND PALETTE"));
+        assert!(frame.text().contains("> window"));
+        assert!(frame.cursor.is_none());
         workspace.stop();
     }
 

@@ -37,6 +37,14 @@ const MAX_ATTACHMENT_ACTIONS_PER_TICK: usize = 1024;
 const MAX_WORKSPACE_PANES: usize = 64;
 const TAB_STRIP_ROWS: u16 = 1;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TabPosition {
+    Top,
+    #[default]
+    Bottom,
+}
+
 pub(crate) struct Workspace {
     windows: Vec<Window>,
     active_window: WindowId,
@@ -48,6 +56,7 @@ pub(crate) struct Workspace {
     chrome_generation: u64,
     recording: Option<WorkspaceRecording>,
     pending_input: CapturedInput,
+    tab_position: TabPosition,
 }
 
 struct WorkspaceRecording {
@@ -403,7 +412,14 @@ impl Workspace {
         record: Option<&Path>,
         options: &Options,
     ) -> Result<Self> {
-        Self::start_with_theme(command, cwd, record, options, TerminalTheme::default())
+        Self::start_with_theme(
+            command,
+            cwd,
+            record,
+            options,
+            TerminalTheme::default(),
+            TabPosition::Bottom,
+        )
     }
 
     pub(crate) fn start_with_theme(
@@ -412,6 +428,7 @@ impl Workspace {
         record: Option<&Path>,
         options: &Options,
         theme: TerminalTheme,
+        tab_position: TabPosition,
     ) -> Result<Self> {
         let mut content_options = options.clone();
         content_options.rows = content_rows(options.rows)?;
@@ -459,6 +476,7 @@ impl Workspace {
             chrome_generation: 0,
             recording,
             pending_input: Vec::new(),
+            tab_position,
         })
     }
 
@@ -530,7 +548,17 @@ impl Workspace {
 
     pub(crate) fn panes_in(&mut self, name: Option<&str>) -> Result<Vec<PaneStatus>> {
         let index = self.window_index_or_active(name)?;
-        self.windows[index].panes()
+        self.pane_statuses(index)
+    }
+
+    fn pane_statuses(&mut self, index: usize) -> Result<Vec<PaneStatus>> {
+        let mut panes = self.windows[index].panes()?;
+        if self.tab_position == TabPosition::Top {
+            for pane in &mut panes {
+                pane.y = pane.y.saturating_add(TAB_STRIP_ROWS);
+            }
+        }
+        Ok(panes)
     }
 
     #[cfg(test)]
@@ -570,7 +598,7 @@ impl Workspace {
         )?;
         self.next_pane_id = next_pane_id;
         self.chrome_generation = self.chrome_generation.wrapping_add(1);
-        self.windows[index].panes()
+        self.pane_statuses(index)
     }
 
     pub(crate) fn send_all_in(
@@ -939,7 +967,7 @@ impl Workspace {
             .pane_window_index(pane)
             .ok_or_else(|| anyhow::anyhow!("workspace has no pane {pane}"))?;
         self.windows[window].resize_pane(pane, direction, cells)?;
-        self.windows[window].panes()
+        self.pane_statuses(window)
     }
 
     pub(crate) fn toggle_zoom_pane(&mut self, pane: PaneId) -> Result<Vec<PaneStatus>> {
@@ -1453,11 +1481,13 @@ impl Workspace {
     }
 
     fn pane_at(&self, x: u16, y: u16) -> Option<(PaneId, u16, u16)> {
-        self.selected_window().ok()?.pane_at(x, y)
+        self.selected_window().ok()?.pane_at(x, self.content_y(y))
     }
 
     fn pane_position(&self, pane: PaneId, x: u16, y: u16) -> Option<(PaneId, u16, u16)> {
-        self.selected_window().ok()?.pane_position(pane, x, y)
+        self.selected_window()
+            .ok()?
+            .pane_position(pane, x, self.content_y(y))
     }
 
     fn pane_input_modes(&self, pane: PaneId) -> Result<InputModes> {
@@ -1501,8 +1531,16 @@ impl Workspace {
     }
 
     fn add_tab_strip(&self, frame: &mut Frame, selected: WindowId) {
+        if self.tab_position == TabPosition::Top {
+            for cell in &mut frame.cells {
+                cell.y = cell.y.saturating_add(TAB_STRIP_ROWS);
+            }
+            if let Some(cursor) = &mut frame.cursor {
+                cursor.y = cursor.y.saturating_add(TAB_STRIP_ROWS);
+            }
+        }
         frame.rows = self.rows;
-        let y = self.rows - TAB_STRIP_ROWS;
+        let y = self.tab_row();
         frame.cells.push(Cell {
             x: 0,
             y,
@@ -1549,7 +1587,7 @@ impl Workspace {
     }
 
     fn tab_index_at(&self, x: u16, y: u16) -> Option<usize> {
-        if y != self.rows.checked_sub(TAB_STRIP_ROWS)? {
+        if y != self.tab_row() {
             return None;
         }
         self.tab_labels(self.active_window)
@@ -1588,6 +1626,20 @@ impl Workspace {
                 })
             })
             .collect()
+    }
+
+    fn tab_row(&self) -> u16 {
+        match self.tab_position {
+            TabPosition::Top => 0,
+            TabPosition::Bottom => self.rows.saturating_sub(TAB_STRIP_ROWS),
+        }
+    }
+
+    fn content_y(&self, y: u16) -> u16 {
+        match self.tab_position {
+            TabPosition::Top => y.saturating_sub(TAB_STRIP_ROWS),
+            TabPosition::Bottom => y,
+        }
     }
 
     #[cfg(test)]
@@ -2450,9 +2502,14 @@ fn content_rows(rows: u16) -> Result<u16> {
 fn uncaptured_tab_position(
     position: Option<(u16, u16)>,
     rows: u16,
+    tab_position: TabPosition,
     mouse_target: Option<PaneId>,
 ) -> Option<(u16, u16)> {
-    position.filter(|(_, y)| mouse_target.is_none() && *y == rows.saturating_sub(TAB_STRIP_ROWS))
+    let tab_row = match tab_position {
+        TabPosition::Top => 0,
+        TabPosition::Bottom => rows.saturating_sub(TAB_STRIP_ROWS),
+    };
+    position.filter(|(_, y)| mouse_target.is_none() && *y == tab_row)
 }
 
 fn validate_window_name(name: &str) -> Result<()> {
@@ -3467,9 +3524,12 @@ impl WorkspaceTerminal {
                         captured_event,
                         capture_end,
                     } => {
-                        if let Some((x, y)) =
-                            uncaptured_tab_position(position, workspace.rows, self.mouse_target)
-                        {
+                        if let Some((x, y)) = uncaptured_tab_position(
+                            position,
+                            workspace.rows,
+                            workspace.tab_position,
+                            self.mouse_target,
+                        ) {
                             self.mouse_target = None;
                             if primary_press && let Some(index) = workspace.tab_index_at(x, y) {
                                 self.ui.clear_armed();
@@ -3680,7 +3740,7 @@ impl WorkspaceTerminal {
                 self.presentation_revision = Some(presentation_revision);
             }
             if let Some(overlay) = &overlay {
-                add_overlay(&mut frame, overlay);
+                add_overlay_at(&mut frame, overlay, workspace.tab_row());
             }
             attachment.screen.paint(frame)?;
             self.paint_window = Some(paint_window);
@@ -3713,7 +3773,12 @@ fn attachment_closed(error: &anyhow::Error) -> bool {
 }
 
 fn add_overlay(frame: &mut Frame, text: &str) {
-    if frame.cols == 0 || frame.rows == 0 || text.is_empty() {
+    let y = frame.rows.saturating_sub(1);
+    add_overlay_at(frame, text, y);
+}
+
+fn add_overlay_at(frame: &mut Frame, text: &str, y: u16) {
+    if frame.cols == 0 || frame.rows == 0 || y >= frame.rows || text.is_empty() {
         return;
     }
     let text = text
@@ -3726,7 +3791,6 @@ fn add_overlay(frame: &mut Frame, text: &str) {
         .collect::<String>();
     let width = u16::try_from(text.chars().count()).unwrap_or(frame.cols);
     let start = frame.cols - width;
-    let y = frame.rows - 1;
     let mut replacements = Vec::new();
     for cell in &frame.cells {
         if cell.y == y && cell.x < start && cell.x.saturating_add(cell.width) > start {
@@ -5312,16 +5376,96 @@ mod tests {
             .unwrap();
         assert_eq!(workspace.tab_index_at(logs.start, 6), Some(1));
         assert_eq!(
-            uncaptured_tab_position(Some((logs.start, 6)), 7, None),
+            uncaptured_tab_position(Some((logs.start, 6)), 7, TabPosition::Bottom, None,),
             Some((logs.start, 6))
         );
         assert_eq!(
-            uncaptured_tab_position(Some((logs.start, 6)), 7, Some(0)),
+            uncaptured_tab_position(Some((logs.start, 6)), 7, TabPosition::Bottom, Some(0),),
             None
         );
         workspace.select_window_index(1).unwrap();
         assert!(!workspace.windows()[1].activity);
         assert!(workspace.frame().unwrap().text().contains("[1:logs]"));
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn top_tab_strip_offsets_content_geometry_and_mouse_coordinates() {
+        let options = Options {
+            cols: 41,
+            rows: 7,
+            ..Options::default()
+        };
+        let command = [
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf CONTENT; cat".to_owned(),
+        ];
+        let mut workspace = Workspace::start_with_theme(
+            &command,
+            None,
+            None,
+            &options,
+            TerminalTheme::default(),
+            TabPosition::Top,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !workspace.frame().unwrap().text().contains("CONTENT") {
+            workspace.pump().unwrap();
+            assert!(Instant::now() < deadline, "workspace output did not arrive");
+        }
+
+        let frame = workspace.frame().unwrap();
+        assert_eq!(frame.text().lines().next(), Some("[0:main]"));
+        assert_eq!(workspace.panes().unwrap()[0].y, 1);
+        assert_eq!(workspace.tab_index_at(0, 0), Some(0));
+        assert_eq!(workspace.pane_at(0, 1), Some((0, 0, 0)));
+        assert_eq!(workspace.pane_position(0, 0, 0), Some((0, 0, 0)));
+        workspace.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_resize_recovers_after_an_invalid_transient_size() {
+        let command = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+        let mut workspace = Workspace::start(&command, None, None, &Options::default()).unwrap();
+        let mut terminal = WorkspaceTerminal::detached();
+        let (_send, receive) = std::sync::mpsc::channel();
+        terminal
+            .attach(
+                &mut workspace,
+                receive,
+                Box::new(std::io::sink()),
+                WorkspaceAttachmentOptions {
+                    id: 1,
+                    cols: 80,
+                    rows: 24,
+                    cell_width: 9,
+                    cell_height: 18,
+                    theme: TerminalTheme::default(),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            terminal
+                .resize_attachment(&mut workspace, 1, 100, 1, 9, 18)
+                .is_err()
+        );
+        terminal
+            .resize_attachment(&mut workspace, 1, 100, 30, 9, 18)
+            .unwrap();
+
+        assert_eq!((workspace.cols, workspace.rows), (100, 30));
+        assert_eq!(
+            (
+                workspace.panes().unwrap()[0].cols,
+                workspace.panes().unwrap()[0].rows
+            ),
+            (100, 29)
+        );
         workspace.stop();
     }
 

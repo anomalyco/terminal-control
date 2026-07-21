@@ -35,6 +35,7 @@ Enter a visible workspace that humans and agents control together:
 termctrl run
 termctrl run -- /usr/bin/nvim
 termctrl run editor -- nvim
+termctrl run workspace --tab-position top
 termctrl run editor
 termctrl attach editor
 termctrl windows workspace --json
@@ -50,8 +51,9 @@ termctrl resize-pane workspace --pane 1 --direction left --cells 5
 termctrl zoom-pane workspace --pane 1
 ```
 
-With no arguments, `run` starts `$SHELL` in the `workspace/main` window. The persistent bottom tab
-strip shows selection, hidden activity, pane count, and zoom; click a tab to select it. Use `ctrl-b c`
+With no arguments, `run` starts `$SHELL` in the `workspace/main` window. The persistent tab strip
+shows selection, hidden activity, pane count, and zoom; click a tab to select it. It defaults to the
+bottom; choose `--tab-position top` when creating a workspace to move it above the panes. Use `ctrl-b c`
 to create a window, `ctrl-b n/p` or `ctrl-b 0-9` to select one, and `ctrl-b w` to list them. Use `ctrl-b %` and
 `ctrl-b "` to split, `ctrl-b h/j/k/l`, arrows, or a mouse click to focus, `ctrl-b H/J/K/L` to resize,
 `ctrl-b z` to toggle zoom, `ctrl-b d` to detach,

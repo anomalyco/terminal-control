@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 
-pub use crate::workspace::{Direction as PaneDirection, PaneStatus, WindowStatus};
+pub use crate::workspace::{Direction as PaneDirection, PaneStatus, TabPosition, WindowStatus};
 
 const OUTPUT_QUEUE: usize = 64;
 const OUTPUT_BATCH: usize = OUTPUT_QUEUE;
@@ -1512,8 +1512,9 @@ pub fn serve_workspace(
     cwd: Option<PathBuf>,
     record: Option<PathBuf>,
     options: Options,
+    tab_position: TabPosition,
 ) -> Result<()> {
-    implementation::serve_workspace(socket, command, cwd, record, options)
+    implementation::serve_workspace(socket, command, cwd, record, options, tab_position)
 }
 
 /// Run a named session in the foreground, mirrored through the current terminal.
@@ -1523,9 +1524,10 @@ pub fn run_foreground(
     cwd: Option<&Path>,
     record: Option<&Path>,
     options: &Options,
+    tab_position: TabPosition,
 ) -> Result<()> {
     validate_name(name)?;
-    implementation::run_foreground(name, command, cwd, record, options)
+    implementation::run_foreground(name, command, cwd, record, options, tab_position)
 }
 
 /// Attach the current terminal to an existing named workspace.
@@ -1647,7 +1649,8 @@ mod implementation {
 
     use super::{
         ATTACH_PROTOCOL_VERSION, ATTACHED_TERMINAL_ERROR, LAYOUT_COMMAND_PROTOCOL_VERSION,
-        NamedSessionStatus, PruneKind, Request, Response, Session, SessionState, UnavailableReason,
+        NamedSessionStatus, PruneKind, Request, Response, Session, SessionState, TabPosition,
+        UnavailableReason,
     };
     use crate::shot::{self, Options};
     use crate::workspace::{Workspace, WorkspaceAttachmentOptions, WorkspaceTerminal};
@@ -2150,6 +2153,7 @@ mod implementation {
             let resize_flag = Arc::clone(&resize_running);
             let resize_socket = socket.clone();
             let mut last_size = (options.cols, options.rows);
+            let mut uncertain = false;
             let mut retry_after = Instant::now();
             let cell_width = options.cell_width;
             let cell_height = options.cell_height;
@@ -2157,7 +2161,7 @@ mod implementation {
                 while resize_flag.load(Ordering::Relaxed) {
                     if let Ok((cols, rows)) = crossterm::terminal::size()
                         && super::valid_workspace_attachment_size(cols, rows)
-                        && (cols, rows) != last_size
+                        && ((cols, rows) != last_size || uncertain)
                         && Instant::now() >= retry_after
                     {
                         match request_with_timeout(
@@ -2173,9 +2177,10 @@ mod implementation {
                         ) {
                             Ok(response) if response.error.is_none() => {
                                 last_size = (cols, rows);
+                                uncertain = false;
                             }
-                            Ok(_) => break,
-                            Err(_) => {
+                            Ok(_) | Err(_) => {
+                                uncertain = true;
                                 retry_after = Instant::now() + Duration::from_secs(1);
                             }
                         }
@@ -2433,6 +2438,7 @@ mod implementation {
         cwd: Option<PathBuf>,
         record: Option<PathBuf>,
         options: Options,
+        tab_position: TabPosition,
     ) -> Result<()> {
         ensure_socket_path(&socket)?;
         let result = (|| {
@@ -2449,6 +2455,7 @@ mod implementation {
                 record.as_deref(),
                 &options,
                 crate::terminal_theme::TerminalTheme::default(),
+                tab_position,
             )?;
             let mut terminal = WorkspaceTerminal::detached();
             let mut active_until = Instant::now();
@@ -2535,6 +2542,7 @@ mod implementation {
         cwd: Option<&Path>,
         record: Option<&Path>,
         options: &Options,
+        tab_position: TabPosition,
     ) -> Result<()> {
         require_attachment_terminal()?;
         let runtime = runtime_dir()?;
@@ -2552,7 +2560,7 @@ mod implementation {
             fs::remove_file(&socket)
                 .with_context(|| format!("remove stale {}", socket.display()))?;
         }
-        spawn_workspace(name, command, cwd, record, options, &socket)?;
+        spawn_workspace(name, command, cwd, record, options, tab_position, &socket)?;
         drop(_lock);
         attach(socket, name, options)
     }
@@ -2572,6 +2580,7 @@ mod implementation {
         cwd: Option<&Path>,
         record: Option<&Path>,
         options: &Options,
+        tab_position: TabPosition,
         socket: &Path,
     ) -> Result<()> {
         let mut daemon =
@@ -2589,7 +2598,12 @@ mod implementation {
             .arg("--cell-height")
             .arg(options.cell_height.to_string())
             .arg("--max-bytes")
-            .arg(options.max_bytes.to_string());
+            .arg(options.max_bytes.to_string())
+            .arg("--tab-position")
+            .arg(match tab_position {
+                TabPosition::Top => "top",
+                TabPosition::Bottom => "bottom",
+            });
         if options.opentui_host {
             daemon.arg("--opentui-host");
         }
@@ -3267,7 +3281,7 @@ mod implementation {
 
 #[cfg(not(unix))]
 mod implementation {
-    use super::{NamedSessionStatus, Options, PruneKind, Request, Response};
+    use super::{NamedSessionStatus, Options, PruneKind, Request, Response, TabPosition};
     use anyhow::{Result, bail};
     use std::path::{Path, PathBuf};
 
@@ -3280,6 +3294,7 @@ mod implementation {
         _: Option<PathBuf>,
         _: Option<PathBuf>,
         _: Options,
+        _: TabPosition,
     ) -> Result<()> {
         bail!("persistent workspaces require Unix sockets")
     }
@@ -3332,6 +3347,7 @@ mod implementation {
         _: Option<&Path>,
         _: Option<&Path>,
         _: &Options,
+        _: TabPosition,
     ) -> Result<()> {
         bail!("persistent sessions require Unix sockets")
     }

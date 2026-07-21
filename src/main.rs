@@ -433,6 +433,9 @@ struct RunArgs {
     /// Record the composed workspace, including tabs, splits, and window switches.
     #[arg(long)]
     record: Option<PathBuf>,
+    /// Place the persistent workspace tab strip at the top or bottom.
+    #[arg(long, value_enum, default_value = "bottom")]
+    tab_position: TabPositionArg,
     /// Color environment policy for the terminal command.
     #[arg(long, value_enum, default_value = "auto")]
     color: ColorMode,
@@ -761,6 +764,8 @@ struct ServeWorkspaceArgs {
     cwd: Option<PathBuf>,
     #[arg(long)]
     record: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "bottom")]
+    tab_position: TabPositionArg,
     #[arg(long)]
     opentui_host: bool,
     #[arg(long, value_enum, default_value = "auto")]
@@ -838,6 +843,21 @@ enum ColorMode {
     Always,
     /// Set common no-color environment variables.
     Never,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TabPositionArg {
+    Top,
+    Bottom,
+}
+
+impl From<TabPositionArg> for session::TabPosition {
+    fn from(position: TabPositionArg) -> Self {
+        match position {
+            TabPositionArg::Top => Self::Top,
+            TabPositionArg::Bottom => Self::Bottom,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1033,6 +1053,7 @@ fn main() -> Result<()> {
                     env: Default::default(),
                     inherit_env: true,
                 },
+                args.tab_position.into(),
             )?;
         }
     }
@@ -1390,6 +1411,7 @@ fn run_session(args: &RunArgs) -> Result<()> {
         args.cwd.as_deref(),
         args.record.as_deref(),
         &options,
+        args.tab_position.into(),
     )
 }
 
@@ -1781,6 +1803,12 @@ mod tests {
     #[test]
     fn parses_flat_session_control_commands() {
         assert!(Cli::try_parse_from(["termctrl", "run"]).is_ok());
+        let cli =
+            Cli::try_parse_from(["termctrl", "run", "workspace", "--tab-position", "top"]).unwrap();
+        let Command::Run(run) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(matches!(run.tab_position, TabPositionArg::Top));
         assert!(Cli::try_parse_from(["termctrl", "attach", "workspace"]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "run", "editor", "--", "nvim", "."]).is_ok());
         assert!(Cli::try_parse_from(["termctrl", "panes", "workspace", "--json"]).is_ok());

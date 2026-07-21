@@ -137,6 +137,7 @@ Full-screen alternate-screen TUIs do not produce useful logs; read their visible
 ```bash
 termctrl run
 termctrl run -- nvim
+termctrl run workspace --tab-position top
 termctrl run editor --cwd ~/src/project -- nvim
 termctrl run editor
 termctrl attach editor
@@ -144,8 +145,9 @@ termctrl attach editor
 
 The workspace daemon owns named windows and their panes independently from any terminal. Every workspace starts with a `main` window. Closing an attached terminal detaches without killing anything; `ctrl-b Q` followed by `y`, `termctrl stop NAME`, or closing the final window ends the workspace. One human terminal may be attached at a time, while agent controls remain available whether attached or detached. A new attachment adopts its terminal size and theme and performs a full repaint.
 
-The bottom row is a persistent tab strip. It shows the selected window, hidden-window activity, pane
-counts, and zoom state; click a tab to select it. Use `ctrl-b c` to create a window, `ctrl-b n/p` or
+The persistent tab strip shows the selected window, hidden-window activity, pane counts, and zoom
+state; click a tab to select it. It defaults to the bottom; use `run NAME --tab-position top` when
+creating a workspace to place it above the panes. Use `ctrl-b c` to create a window, `ctrl-b n/p` or
 `ctrl-b 0-9` to select one, and `ctrl-b w` to list them. Use `ctrl-b %` for left/right panes,
 `ctrl-b "` for top/bottom panes, `ctrl-b h/j/k/l`, arrow keys, or a mouse click to focus,
 `ctrl-b H/J/K/L` to resize by five cells, `ctrl-b z` to toggle pane zoom, `ctrl-b q` to show stable
@@ -185,7 +187,8 @@ Window names are stable exact selectors; their numeric indexes are presentation 
 Without a command or name, the workspace is named `workspace`. When a command is supplied without `NAME`, its executable basename remains the inferred name.
 
 A workspace follows the size of its current human attachment, so resize that terminal itself rather
-than using `termctrl resize`. An occupied attachment names the workspace and suggests either
+than using `termctrl resize`. Attachment resize tracking retries transient size and server errors
+instead of silently stopping. An occupied attachment names the workspace and suggests either
 `ctrl-b d` there or `termctrl run NAME` for another workspace. `run --record` records the composed
 workspace, including tabs, splits, window switches, resizes, and markers. Composed ANSI saves are
 rendered snapshots, while `--pane ID --format ansi` retains that pane's original VT stream.

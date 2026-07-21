@@ -37,6 +37,10 @@ fn attachment_rejection(name: &str, error: &str) -> anyhow::Error {
     }
 }
 
+fn valid_workspace_attachment_size(cols: u16, rows: u16) -> bool {
+    cols > 0 && rows >= 2
+}
+
 struct Output {
     at_ms: u64,
     bytes: Vec<u8>,
@@ -66,6 +70,8 @@ pub struct Session {
     exit_ready: bool,
     last_output: Option<Instant>,
     recording: Option<recording::Writer>,
+    capture_input: bool,
+    captured_input: Vec<(InputOrigin, Vec<u8>)>,
     cols: u16,
     rows: u16,
     cell_width: u16,
@@ -290,6 +296,8 @@ impl Session {
             exit_ready: false,
             last_output: None,
             recording,
+            capture_input: false,
+            captured_input: Vec::new(),
             cols: options.cols,
             rows: options.rows,
             cell_width: options.cell_width,
@@ -344,9 +352,7 @@ impl Session {
         if !self.host.send_if_open(input)? {
             return Ok(false);
         }
-        if let Some(recording) = &mut self.recording {
-            recording.input(InputOrigin::Client, input)?;
-        }
+        self.record_input(InputOrigin::Client, input)?;
         Ok(true)
     }
 
@@ -355,8 +361,24 @@ impl Session {
             bail!("session command has exited");
         }
         self.host.send(input)?;
+        self.record_input(InputOrigin::Client, input)?;
+        Ok(())
+    }
+
+    pub(crate) fn capture_input(&mut self) {
+        self.capture_input = true;
+    }
+
+    pub(crate) fn take_captured_input(&mut self) -> Vec<(InputOrigin, Vec<u8>)> {
+        std::mem::take(&mut self.captured_input)
+    }
+
+    fn record_input(&mut self, origin: InputOrigin, input: &[u8]) -> Result<()> {
         if let Some(recording) = &mut self.recording {
-            recording.input(InputOrigin::Client, input)?;
+            recording.input(origin, input)?;
+        }
+        if self.capture_input {
+            self.captured_input.push((origin, input.to_vec()));
         }
         Ok(())
     }
@@ -801,10 +823,8 @@ impl Session {
             mirror.flush().context("flush mirrored PTY output")?;
         }
         let response = respond_to_output(&mut self.terminal, &mut self.host, &bytes)?;
-        if !response.is_empty()
-            && let Some(recording) = &mut self.recording
-        {
-            recording.input(InputOrigin::Host, &response)?;
+        if !response.is_empty() {
+            self.record_input(InputOrigin::Host, &response)?;
         }
         self.last_output = Some(Instant::now());
         Ok(())
@@ -1568,10 +1588,11 @@ fn request(name: &str, operation: Request) -> Result<Response> {
             | Request::ResizePane { .. }
             | Request::ToggleZoom { .. }
     );
-    if requires_layout_command {
-        require_layout_command_protocol(&request(name, Request::Ping)?)?;
-    }
-    let response = implementation::request(socket_path(name)?, &operation)?;
+    let response = if requires_layout_command {
+        implementation::request_layout_command(name, &operation)?
+    } else {
+        implementation::request(socket_path(name)?, &operation)?
+    };
     if requires_pane_protocol {
         require_pane_protocol(&response)?;
     }
@@ -1625,8 +1646,8 @@ mod implementation {
     use anyhow::{Context, Result, bail};
 
     use super::{
-        ATTACH_PROTOCOL_VERSION, ATTACHED_TERMINAL_ERROR, NamedSessionStatus, PruneKind, Request,
-        Response, Session, SessionState, UnavailableReason,
+        ATTACH_PROTOCOL_VERSION, ATTACHED_TERMINAL_ERROR, LAYOUT_COMMAND_PROTOCOL_VERSION,
+        NamedSessionStatus, PruneKind, Request, Response, Session, SessionState, UnavailableReason,
     };
     use crate::shot::{self, Options};
     use crate::workspace::{Workspace, WorkspaceAttachmentOptions, WorkspaceTerminal};
@@ -1917,6 +1938,30 @@ mod implementation {
         request_with_timeout(socket, request, None)
     }
 
+    pub fn request_layout_command(name: &str, operation: &Request) -> Result<Response> {
+        let runtime = runtime_dir()?;
+        request_layout_command_in(&runtime, name, operation)
+    }
+
+    fn request_layout_command_in(
+        runtime: &Path,
+        name: &str,
+        operation: &Request,
+    ) -> Result<Response> {
+        let _lock = StartLock::acquire(&runtime.join(format!("{name}.lock")))?;
+        let socket = runtime.join(format!("{name}.sock"));
+        let response = request(socket.clone(), &Request::Ping)?;
+        if let Some(error) = response.error {
+            bail!(error);
+        }
+        if response.protocol_version < LAYOUT_COMMAND_PROTOCOL_VERSION {
+            bail!(
+                "running workspace predates pane startup commands; restart it with the current termctrl"
+            );
+        }
+        request(socket, operation)
+    }
+
     fn request_with_timeout(
         socket: PathBuf,
         request: &Request,
@@ -2111,8 +2156,7 @@ mod implementation {
             let resize = thread::spawn(move || {
                 while resize_flag.load(Ordering::Relaxed) {
                     if let Ok((cols, rows)) = crossterm::terminal::size()
-                        && cols > 0
-                        && rows > 0
+                        && super::valid_workspace_attachment_size(cols, rows)
                         && (cols, rows) != last_size
                         && Instant::now() >= retry_after
                     {
@@ -2408,33 +2452,44 @@ mod implementation {
             )?;
             let mut terminal = WorkspaceTerminal::detached();
             let mut active_until = Instant::now();
-            'workspace: loop {
-                let running = terminal.tick(&mut workspace)?;
-                loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            let finished = handle_workspace(stream, &mut workspace, &mut terminal)?;
-                            active_until = Instant::now() + DETACHED_WORKSPACE_ACTIVE;
-                            if finished {
-                                break 'workspace;
+            let run_result = (|| {
+                'workspace: loop {
+                    let running = terminal.tick(&mut workspace)?;
+                    loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                let finished =
+                                    handle_workspace(stream, &mut workspace, &mut terminal)?;
+                                active_until = Instant::now() + DETACHED_WORKSPACE_ACTIVE;
+                                if finished {
+                                    break 'workspace;
+                                }
                             }
+                            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                            Err(error) => return Err(error).context("accept workspace request"),
                         }
-                        Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                        Err(error) => return Err(error).context("accept workspace request"),
+                    }
+                    if !running || terminal.finished() {
+                        break;
+                    }
+                    if terminal.is_attached() {
+                        thread::sleep(ATTACHED_WORKSPACE_POLL);
+                    } else if Instant::now() < active_until {
+                        thread::sleep(Duration::from_millis(5));
+                    } else {
+                        wait_for_workspace_request(&listener, DETACHED_WORKSPACE_POLL)?;
                     }
                 }
-                if !running || terminal.finished() {
-                    break;
-                }
-                if terminal.is_attached() {
-                    thread::sleep(ATTACHED_WORKSPACE_POLL);
-                } else if Instant::now() < active_until {
-                    thread::sleep(Duration::from_millis(5));
-                } else {
-                    wait_for_workspace_request(&listener, DETACHED_WORKSPACE_POLL)?;
-                }
+                Ok(())
+            })();
+            let stop_result = workspace.try_stop();
+            match (run_result, stop_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                (Err(error), Err(stop_error)) => Err(error).context(format!(
+                    "workspace finalization also failed: {stop_error:#}"
+                )),
             }
-            Ok(())
         })();
         let _ = fs::remove_file(&socket);
         result
@@ -2662,7 +2717,7 @@ mod implementation {
             let stop = matches!(request, Request::Stop);
             let response = respond_workspace(workspace, request, terminal)
                 .unwrap_or_else(|error| Response::error(format!("{error:#}")));
-            let finished = stop || (response.error.is_none() && workspace.is_empty());
+            let finished = response.error.is_none() && (stop || workspace.is_empty());
             (response, finished)
         })
     }
@@ -3103,7 +3158,7 @@ mod implementation {
                 cell_width,
                 cell_height,
             } => terminal.resize_attachment(workspace, id, cols, rows, cell_width, cell_height)?,
-            Request::Stop => workspace.stop(),
+            Request::Stop => workspace.try_stop()?,
         }
         Ok(response)
     }
@@ -3154,6 +3209,19 @@ mod implementation {
             let listener = UnixListener::bind(&socket).unwrap();
             fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
             drop(listener);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match request(socket.clone(), &Request::Ping) {
+                    Err(error) if stale_socket_error(&error) => break,
+                    Err(_) => {}
+                    Ok(_) => panic!("closed test socket unexpectedly returned a response"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "test socket did not become stale"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
 
             assert_eq!(
                 prune_in(&runtime, "stale", true).unwrap(),
@@ -3165,6 +3233,33 @@ mod implementation {
                 Some(PruneKind::Stale)
             );
             assert!(!socket.exists());
+            let _ = fs::remove_dir_all(runtime);
+        }
+
+        #[test]
+        fn layout_command_capability_check_holds_the_name_lifecycle_lock() {
+            let runtime = std::env::temp_dir().join(format!(
+                "termctrl-layout-lock-test-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::create_dir_all(&runtime).unwrap();
+            let held = StartLock::acquire(&runtime.join("workspace.lock")).unwrap();
+
+            let error = request_layout_command_in(
+                &runtime,
+                "workspace",
+                &Request::Layout {
+                    columns: 2,
+                    rows: 1,
+                    command: vec!["nvim".to_owned()],
+                },
+            )
+            .err()
+            .unwrap();
+
+            assert!(error.to_string().contains("already starting this name"));
+            drop(held);
             let _ = fs::remove_dir_all(runtime);
         }
     }
@@ -3209,6 +3304,9 @@ mod implementation {
     pub fn request(_: PathBuf, _: &Request) -> Result<Response> {
         bail!("persistent sessions require Unix sockets")
     }
+    pub fn request_layout_command(_: &str, _: &Request) -> Result<Response> {
+        bail!("persistent sessions require Unix sockets")
+    }
 
     pub fn attach(_: PathBuf, _: &str, _: &Options) -> Result<()> {
         bail!("workspace attachment requires Unix sockets")
@@ -3251,6 +3349,12 @@ mod tests {
         assert!(error.contains("workspace \"editor\""));
         assert!(error.contains("ctrl-b d"));
         assert!(error.contains("termctrl run NAME"));
+    }
+
+    #[test]
+    fn transient_one_row_attachment_sizes_are_not_sent() {
+        assert!(!valid_workspace_attachment_size(80, 1));
+        assert!(valid_workspace_attachment_size(80, 2));
     }
 
     #[test]

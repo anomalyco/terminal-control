@@ -6,6 +6,8 @@ use crate::frame::{Cell, Frame, Underline};
 
 mod box_drawing;
 
+const MAX_PNG_PIXELS: u64 = 64 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub cell_width: f32,
@@ -87,11 +89,25 @@ impl PngRenderer {
     }
 
     pub fn render(&self, svg: &str, path: &Path, pixel_ratio: f32) -> Result<()> {
+        if !pixel_ratio.is_finite() || pixel_ratio <= 0.0 {
+            anyhow::bail!("PNG pixel ratio must be finite and greater than zero");
+        }
         let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &self.options)
             .context("parse rendered SVG")?;
         let size = tree.size().to_int_size();
-        let width = ((size.width() as f32) * pixel_ratio).ceil() as u32;
-        let height = ((size.height() as f32) * pixel_ratio).ceil() as u32;
+        let width = ((size.width() as f64) * f64::from(pixel_ratio)).ceil();
+        let height = ((size.height() as f64) * f64::from(pixel_ratio)).ceil();
+        if width > f64::from(u32::MAX) || height > f64::from(u32::MAX) {
+            anyhow::bail!("PNG dimensions exceed the supported range");
+        }
+        let width = width as u32;
+        let height = height as u32;
+        let pixels = u64::from(width)
+            .checked_mul(u64::from(height))
+            .context("PNG pixel count overflow")?;
+        if pixels > MAX_PNG_PIXELS {
+            anyhow::bail!("PNG would contain {pixels} pixels; limit is {MAX_PNG_PIXELS}");
+        }
         let mut pixmap =
             resvg::tiny_skia::Pixmap::new(width, height).context("allocate PNG canvas")?;
         resvg::render(
@@ -331,6 +347,21 @@ fn xml(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::frame::{Attributes, Color, Frame, Underline};
+
+    #[test]
+    fn rejects_png_allocations_above_the_pixel_limit() {
+        let path = std::env::temp_dir().join("termctrl-oversized-png-test.png");
+        let error = PngRenderer::new()
+            .render(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#,
+                &path,
+                10_000.0,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("limit"));
+        assert!(!path.exists());
+    }
 
     #[test]
     fn emits_background_and_text_styles_in_svg() {

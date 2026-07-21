@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -62,6 +62,7 @@ pub enum InputOrigin {
 pub struct Writer {
     file: fs::File,
     started: Instant,
+    poisoned: bool,
 }
 
 impl Writer {
@@ -109,7 +110,11 @@ impl Writer {
         .context("write recording header")?;
         file.write_all(b"\n").context("write recording newline")?;
         file.flush().context("flush recording header")?;
-        Ok(Self { file, started })
+        Ok(Self {
+            file,
+            started,
+            poisoned: false,
+        })
     }
 
     pub fn output(&mut self, at_ms: u64, bytes: &[u8]) -> Result<()> {
@@ -159,11 +164,30 @@ impl Writer {
     }
 
     fn write(&mut self, entry: Entry) -> Result<()> {
-        serde_json::to_writer(&mut self.file, &entry).context("write recording event")?;
-        self.file
-            .write_all(b"\n")
-            .context("write recording newline")?;
-        self.file.flush().context("flush recording event")
+        if self.poisoned {
+            bail!("recording writer is unavailable after a failed rollback");
+        }
+        let mut line = serde_json::to_vec(&entry).context("encode recording event")?;
+        line.push(b'\n');
+        let offset = self
+            .file
+            .stream_position()
+            .context("checkpoint recording event")?;
+        let result = self
+            .file
+            .write_all(&line)
+            .context("write recording event")
+            .and_then(|()| self.file.flush().context("flush recording event"));
+        if let Err(error) = result {
+            if self.file.set_len(offset).is_err()
+                || self.file.seek(std::io::SeekFrom::Start(offset)).is_err()
+            {
+                self.poisoned = true;
+                return Err(error).context("recording append failed and could not be rolled back");
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 }
 

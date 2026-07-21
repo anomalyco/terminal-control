@@ -19,6 +19,7 @@ use crate::terminal_theme::TerminalTheme;
 pub type PaneId = u32;
 pub type WindowId = u32;
 type PaneRevisions = Vec<(PaneId, u64)>;
+type CapturedInput = Vec<(recording::InputOrigin, Vec<u8>)>;
 
 const DEFAULT_WINDOW_NAME: &str = "main";
 
@@ -46,6 +47,7 @@ pub(crate) struct Workspace {
     rows: u16,
     chrome_generation: u64,
     recording: Option<WorkspaceRecording>,
+    pending_input: CapturedInput,
 }
 
 struct WorkspaceRecording {
@@ -72,6 +74,7 @@ pub(crate) struct Window {
     cached_frame: Option<(PaneRevisions, Frame)>,
     frame_generation: u64,
     activity: bool,
+    capture_input: bool,
 }
 
 struct WindowIdentity {
@@ -97,6 +100,13 @@ pub struct WindowStatus {
 struct Pane {
     id: PaneId,
     session: Session,
+}
+
+fn stop_pane(mut pane: Pane, pending_input: &mut CapturedInput) -> Result<()> {
+    pending_input.extend(pane.session.take_captured_input());
+    let result = pane.session.stop();
+    pending_input.extend(pane.session.take_captured_input());
+    result
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -414,9 +424,9 @@ impl Workspace {
             0,
             command,
             cwd,
-            None,
             &content_options,
             theme,
+            record.is_some(),
         )?;
         let mut launch = main.panes[0].session.status()?.launch;
         launch.rows = options.rows;
@@ -448,6 +458,7 @@ impl Workspace {
             rows: options.rows,
             chrome_generation: 0,
             recording,
+            pending_input: Vec::new(),
         })
     }
 
@@ -550,7 +561,13 @@ impl Workspace {
         let next_pane_id = first_new_id
             .checked_add(u32::try_from(added).unwrap_or(u32::MAX))
             .context("workspace exhausted stable pane ids")?;
-        self.windows[index].set_grid(columns, rows, first_new_id, command)?;
+        self.windows[index].set_grid(
+            columns,
+            rows,
+            first_new_id,
+            command,
+            &mut self.pending_input,
+        )?;
         self.next_pane_id = next_pane_id;
         self.chrome_generation = self.chrome_generation.wrapping_add(1);
         self.windows[index].panes()
@@ -633,9 +650,9 @@ impl Workspace {
             pane_id,
             command,
             cwd.or(Some(source_cwd.as_path())),
-            None,
             &source_options,
             source_theme,
+            self.recording.is_some(),
         )?;
         self.windows.push(window);
         self.next_window_id = next_window_id;
@@ -718,7 +735,9 @@ impl Workspace {
             let active = self.windows[index].active;
             let _ = self.windows[index].send_focus(active, false);
         }
-        self.windows.remove(index);
+        let mut window = self.windows.remove(index);
+        window.stop(&mut self.pending_input);
+        self.flush_input(None)?;
         self.chrome_generation = self.chrome_generation.wrapping_add(1);
         if self.windows.is_empty() {
             return Ok(());
@@ -764,14 +783,42 @@ impl Workspace {
     }
 
     pub(crate) fn pump(&mut self) -> Result<()> {
-        for window in &mut self.windows {
-            let changed = window.pump()?;
-            if changed && window.id != self.active_window && !window.activity {
-                window.activity = true;
+        for index in 0..self.windows.len() {
+            let changed = self.windows[index].pump(&mut self.pending_input)?;
+            if changed
+                && self.windows[index].id != self.active_window
+                && !self.windows[index].activity
+            {
+                self.windows[index].activity = true;
                 self.chrome_generation = self.chrome_generation.wrapping_add(1);
             }
         }
+        self.flush_input(Some(recording::InputOrigin::Client))?;
         self.record_frame()?;
+        self.flush_input(Some(recording::InputOrigin::Host))?;
+        Ok(())
+    }
+
+    fn flush_input(&mut self, only: Option<recording::InputOrigin>) -> Result<()> {
+        let Some(recording) = &mut self.recording else {
+            self.pending_input.clear();
+            return Ok(());
+        };
+        let mut remaining = Vec::new();
+        let mut pending = std::mem::take(&mut self.pending_input).into_iter();
+        while let Some((origin, bytes)) = pending.next() {
+            if only.is_none_or(|only| only == origin) {
+                if let Err(error) = recording.writer.input(origin, &bytes) {
+                    remaining.push((origin, bytes));
+                    remaining.extend(pending);
+                    self.pending_input = remaining;
+                    return Err(error);
+                }
+            } else {
+                remaining.push((origin, bytes));
+            }
+        }
+        self.pending_input = remaining;
         Ok(())
     }
 
@@ -806,8 +853,10 @@ impl Workspace {
     pub(crate) fn remove_observed_exits(&mut self) -> Result<bool> {
         let mut removed = false;
         for window in &mut self.windows {
-            removed |= window.remove_observed_exits(window.id == self.active_window)?;
+            removed |= window
+                .remove_observed_exits(window.id == self.active_window, &mut self.pending_input)?;
         }
+        self.flush_input(None)?;
         let empty = self
             .windows
             .iter()
@@ -844,7 +893,8 @@ impl Workspace {
         let next_pane_id = pane
             .checked_add(1)
             .context("workspace exhausted stable pane ids")?;
-        let result = self.selected_window_mut()?.split(axis, pane);
+        let window = self.window_index_or_active(None)?;
+        let result = self.windows[window].split(axis, pane, &mut self.pending_input);
         if result.is_ok() || self.pane_window_index(pane).is_some() {
             self.next_pane_id = next_pane_id;
             self.chrome_generation = self.chrome_generation.wrapping_add(1);
@@ -866,7 +916,8 @@ impl Workspace {
             .pane_window_index(pane)
             .ok_or_else(|| anyhow::anyhow!("workspace has no pane {pane}"))?;
         let focused = self.windows[window].id == self.active_window;
-        self.windows[window].close_pane(pane, focused)?;
+        self.windows[window].close_pane(pane, focused, &mut self.pending_input)?;
+        self.flush_input(None)?;
         if self.windows[window].is_empty() {
             self.close_window_index(window)?;
         } else {
@@ -1294,10 +1345,16 @@ impl Workspace {
     }
 
     pub(crate) fn stop(&mut self) {
+        let _ = self.try_stop();
+    }
+
+    pub(crate) fn try_stop(&mut self) -> Result<()> {
         for window in &mut self.windows {
-            window.stop();
+            window.stop(&mut self.pending_input);
         }
+        let result = self.flush_input(None);
         self.windows.clear();
+        result
     }
 
     fn active_id(&self) -> Option<PaneId> {
@@ -1560,16 +1617,19 @@ impl Window {
         pane_id: PaneId,
         command: &[String],
         cwd: Option<&Path>,
-        record: Option<&Path>,
         options: &Options,
         theme: TerminalTheme,
+        capture_input: bool,
     ) -> Result<Self> {
         let cwd = cwd
             .map(Path::to_owned)
             .unwrap_or(std::env::current_dir().context("resolve workspace directory")?);
         let shell = shell_command();
         let command = if command.is_empty() { &shell } else { command };
-        let session = Session::start_with_theme(command, Some(&cwd), record, options, theme)?;
+        let mut session = Session::start_with_theme(command, Some(&cwd), None, options, theme)?;
+        if capture_input {
+            session.capture_input();
+        }
         Ok(Self {
             id: identity.id,
             name: identity.name,
@@ -1602,6 +1662,7 @@ impl Window {
             cached_frame: None,
             frame_generation: 0,
             activity: false,
+            capture_input,
         })
     }
 
@@ -1638,12 +1699,13 @@ impl Window {
         Ok(())
     }
 
-    pub(crate) fn pump(&mut self) -> Result<bool> {
+    pub(crate) fn pump(&mut self, pending_input: &mut CapturedInput) -> Result<bool> {
         let mut changed = false;
         for pane in &mut self.panes {
             let before = pane.session.frame_revision();
             pane.session.pump()?;
             changed |= before != pane.session.frame_revision();
+            pending_input.extend(pane.session.take_captured_input());
         }
         Ok(changed)
     }
@@ -1656,7 +1718,11 @@ impl Window {
         Ok(exited)
     }
 
-    fn remove_observed_exits(&mut self, focused: bool) -> Result<bool> {
+    fn remove_observed_exits(
+        &mut self,
+        focused: bool,
+        pending_input: &mut CapturedInput,
+    ) -> Result<bool> {
         let exited = self
             .panes
             .iter()
@@ -1669,7 +1735,11 @@ impl Window {
         let active_removed = self.active.is_some_and(|active| exited.contains(&active));
         for id in &exited {
             self.remove_layout_pane(*id);
-            self.panes.retain(|pane| pane.id != *id);
+            let index = self
+                .pane_index(*id)
+                .context("observed exited pane is missing")?;
+            let mut pane = self.panes.remove(index);
+            pending_input.extend(pane.session.take_captured_input());
             if self.paste.is_some_and(|(target, _)| target == *id) {
                 self.paste = None;
             }
@@ -1693,7 +1763,12 @@ impl Window {
         Ok(true)
     }
 
-    fn split(&mut self, axis: SplitAxis, new_id: PaneId) -> Result<()> {
+    fn split(
+        &mut self,
+        axis: SplitAxis,
+        new_id: PaneId,
+        pending_input: &mut CapturedInput,
+    ) -> Result<()> {
         let active = self
             .active
             .ok_or_else(|| anyhow::anyhow!("workspace has no pane to split"))?;
@@ -1714,8 +1789,8 @@ impl Window {
         let pane = self.spawn_pane(new_id, rect, None)?;
         self.panes.push(pane);
         if let Err(error) = self.apply_geometry(geometry) {
-            if let Some(mut pane) = self.panes.pop() {
-                let _ = pane.session.stop();
+            if let Some(pane) = self.panes.pop() {
+                let _ = stop_pane(pane, pending_input);
             }
             return Err(error);
         }
@@ -1729,6 +1804,7 @@ impl Window {
         rows: u16,
         first_new_id: PaneId,
         command: Option<&[String]>,
+        pending_input: &mut CapturedInput,
     ) -> Result<()> {
         if !(1..=2).contains(&columns) || !(1..=2).contains(&rows) {
             bail!("workspace grids support one or two columns and rows");
@@ -1767,14 +1843,22 @@ impl Window {
                 .find(|pane| pane.id == id)
                 .map(|pane| pane.rect)
                 .context("new pane has no layout rectangle")?;
-            added.push(self.spawn_pane(id, rect, command.take())?);
+            match self.spawn_pane(id, rect, command.take()) {
+                Ok(pane) => added.push(pane),
+                Err(error) => {
+                    for pane in added {
+                        let _ = stop_pane(pane, pending_input);
+                    }
+                    return Err(error);
+                }
+            }
         }
         let added_len = added.len();
         self.panes.extend(added);
         if let Err(error) = self.apply_geometry(geometry) {
             for _ in 0..added_len {
-                if let Some(mut pane) = self.panes.pop() {
-                    let _ = pane.session.stop();
+                if let Some(pane) = self.panes.pop() {
+                    let _ = stop_pane(pane, pending_input);
                 }
             }
             return Err(error);
@@ -1914,7 +1998,12 @@ impl Window {
         Some((pane, local_x, local_y))
     }
 
-    fn close_pane(&mut self, pane: PaneId, focused: bool) -> Result<()> {
+    fn close_pane(
+        &mut self,
+        pane: PaneId,
+        focused: bool,
+        pending_input: &mut CapturedInput,
+    ) -> Result<()> {
         let index = self.resolve_pane(Some(pane))?;
         let closing_active = self.active == Some(pane);
         if closing_active && focused {
@@ -1924,8 +2013,8 @@ impl Window {
         if self.paste.is_some_and(|(target, _)| target == pane) {
             self.paste = None;
         }
-        let mut pane = self.panes.remove(index);
-        pane.session.stop()?;
+        let pane = self.panes.remove(index);
+        stop_pane(pane, pending_input)?;
         if self.panes.is_empty() {
             self.active = None;
             self.layout = None;
@@ -2191,14 +2280,13 @@ impl Window {
         self.panes[index].session.logs(ansi)
     }
 
-    pub(crate) fn stop(&mut self) {
+    pub(crate) fn stop(&mut self, pending_input: &mut CapturedInput) {
         self.paste = None;
         self.zoomed = None;
         self.invalidate_frame();
-        for pane in &mut self.panes {
-            let _ = pane.session.stop();
+        for pane in self.panes.drain(..) {
+            let _ = stop_pane(pane, pending_input);
         }
-        self.panes.clear();
         self.active = None;
         self.layout = None;
         self.applied = AppliedLayout::Ready(WorkspaceGeometry {
@@ -2264,16 +2352,17 @@ impl Window {
         let mut options = self.options.clone();
         options.cols = rect.cols;
         options.rows = rect.rows;
-        Ok(Pane {
-            id,
-            session: Session::start_with_theme(
-                command.unwrap_or(&self.shell),
-                Some(&self.cwd),
-                None,
-                &options,
-                self.theme,
-            )?,
-        })
+        let mut session = Session::start_with_theme(
+            command.unwrap_or(&self.shell),
+            Some(&self.cwd),
+            None,
+            &options,
+            self.theme,
+        )?;
+        if self.capture_input {
+            session.capture_input();
+        }
+        Ok(Pane { id, session })
     }
 
     fn remove_layout_pane(&mut self, pane: PaneId) {
@@ -2329,7 +2418,7 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        self.stop();
+        self.stop(&mut Vec::new());
     }
 }
 
@@ -2356,6 +2445,14 @@ fn content_rows(rows: u16) -> Result<u16> {
     rows.checked_sub(TAB_STRIP_ROWS)
         .filter(|rows| *rows > 0)
         .context("workspace needs at least two rows for content and tabs")
+}
+
+fn uncaptured_tab_position(
+    position: Option<(u16, u16)>,
+    rows: u16,
+    mouse_target: Option<PaneId>,
+) -> Option<(u16, u16)> {
+    position.filter(|(_, y)| mouse_target.is_none() && *y == rows.saturating_sub(TAB_STRIP_ROWS))
 }
 
 fn validate_window_name(name: &str) -> Result<()> {
@@ -3276,7 +3373,7 @@ impl WorkspaceTerminal {
                                         workspace.close_window_index(index)?;
                                     }
                                 }
-                                Some(ArmedAction::Quit) => workspace.stop(),
+                                Some(ArmedAction::Quit) => workspace.try_stop()?,
                                 None => self.ui.notice("canceled", Duration::from_millis(1_000)),
                             }
                             if workspace.is_empty() {
@@ -3370,8 +3467,8 @@ impl WorkspaceTerminal {
                         captured_event,
                         capture_end,
                     } => {
-                        if let Some((x, y)) = position
-                            && y == workspace.rows - TAB_STRIP_ROWS
+                        if let Some((x, y)) =
+                            uncaptured_tab_position(position, workspace.rows, self.mouse_target)
                         {
                             self.mouse_target = None;
                             if primary_press && let Some(index) = workspace.tab_index_at(x, y) {
@@ -4561,7 +4658,7 @@ mod tests {
             &[
                 "sh".to_owned(),
                 "-c".to_owned(),
-                "printf LEFT; cat".to_owned(),
+                "printf '\\033[5nLEFT'; cat".to_owned(),
             ],
             None,
             Some(&record),
@@ -4597,9 +4694,35 @@ mod tests {
             assert!(Instant::now() < deadline, "workspace output did not arrive");
             std::thread::sleep(Duration::from_millis(10));
         }
+        workspace.send(Some(0), b"CLIENT\n").unwrap();
         workspace.rename_window("other", "renamed").unwrap();
         workspace.mark_recording("composed").unwrap();
         assert!(workspace.status().unwrap().recording);
+        workspace.send(Some(1), b"PANE-CLOSE\n").unwrap();
+        workspace.close_pane(1).unwrap();
+        workspace.send(Some(2), b"WINDOW-CLOSE\n").unwrap();
+        workspace.close_window("renamed").unwrap();
+        workspace
+            .create_window(
+                Some("short"),
+                &[
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "IFS= read -r line; printf '\\033[5n'".to_owned(),
+                ],
+                None,
+            )
+            .unwrap();
+        workspace.send(Some(3), b"EXIT\n").unwrap();
+        workspace.select_window("main").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while workspace.windows().len() > 1 {
+            workspace.observe_exits().unwrap();
+            workspace.remove_observed_exits().unwrap();
+            assert!(Instant::now() < deadline, "short window did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        workspace.send(Some(0), b"FINAL\n").unwrap();
         drop(workspace);
 
         let replayed = crate::recording::shot_at(&record, None, Some("composed")).unwrap();
@@ -4609,6 +4732,44 @@ mod tests {
         assert!(text.contains("[0:main 2p]"), "{text:?}");
         assert!(text.contains("1:renamed*"), "{text:?}");
         assert_eq!((replayed.frame.cols, replayed.frame.rows), (31, 7));
+        let recording = crate::recording::read(&record).unwrap();
+        assert!(recording.events.iter().any(|entry| matches!(
+            entry,
+            crate::recording::Entry::Input {
+                origin: recording::InputOrigin::Client,
+                bytes,
+                ..
+            } if bytes == b"CLIENT\n"
+        )));
+        for expected in [
+            b"PANE-CLOSE\n".as_slice(),
+            b"WINDOW-CLOSE\n".as_slice(),
+            b"EXIT\n".as_slice(),
+        ] {
+            assert!(recording.events.iter().any(|entry| matches!(
+                entry,
+                crate::recording::Entry::Input {
+                    origin: recording::InputOrigin::Client,
+                    bytes,
+                    ..
+                } if bytes == expected
+            )));
+        }
+        assert!(recording.events.iter().any(|entry| matches!(
+            entry,
+            crate::recording::Entry::Input {
+                origin: recording::InputOrigin::Client,
+                bytes,
+                ..
+            } if bytes == b"FINAL\n"
+        )));
+        assert!(recording.events.iter().any(|entry| matches!(
+            entry,
+            crate::recording::Entry::Input {
+                origin: recording::InputOrigin::Host,
+                ..
+            }
+        )));
         let _ = std::fs::remove_file(record);
     }
 
@@ -5150,6 +5311,14 @@ mod tests {
             .find(|tab| tab.index == 1)
             .unwrap();
         assert_eq!(workspace.tab_index_at(logs.start, 6), Some(1));
+        assert_eq!(
+            uncaptured_tab_position(Some((logs.start, 6)), 7, None),
+            Some((logs.start, 6))
+        );
+        assert_eq!(
+            uncaptured_tab_position(Some((logs.start, 6)), 7, Some(0)),
+            None
+        );
         workspace.select_window_index(1).unwrap();
         assert!(!workspace.windows()[1].activity);
         assert!(workspace.frame().unwrap().text().contains("[1:logs]"));

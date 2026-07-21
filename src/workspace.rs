@@ -51,7 +51,6 @@ pub enum ActivityKind {
     Output,
     Bell,
     Exit,
-    Match,
 }
 
 impl ActivityKind {
@@ -60,7 +59,6 @@ impl ActivityKind {
             Self::Output => '+',
             Self::Bell => '!',
             Self::Exit => 'x',
-            Self::Match => '=',
         }
     }
 }
@@ -106,8 +104,6 @@ pub(crate) struct Window {
     cached_frame: Option<(PaneRevisions, Frame)>,
     frame_generation: u64,
     activity_kinds: BTreeSet<ActivityKind>,
-    match_rules: Vec<String>,
-    pinned: bool,
     capture_input: bool,
 }
 
@@ -130,10 +126,6 @@ pub struct WindowStatus {
     pub activity: bool,
     #[serde(default)]
     pub activity_kinds: Vec<ActivityKind>,
-    #[serde(default)]
-    pub match_rules: Vec<String>,
-    #[serde(default)]
-    pub pinned: bool,
     pub cols: u16,
     pub rows: u16,
 }
@@ -610,8 +602,6 @@ impl Workspace {
                 zoomed_pane: window.zoomed,
                 activity: !window.activity_kinds.is_empty(),
                 activity_kinds: window.activity_kinds.iter().copied().collect(),
-                match_rules: window.match_rules.clone(),
-                pinned: window.pinned,
                 cols: self.cols,
                 rows: self.rows,
             })
@@ -657,9 +647,6 @@ impl Workspace {
         if index == target {
             return Ok(());
         }
-        if self.windows[index].pinned != self.windows[target].pinned {
-            bail!("pin or unpin the window before moving it across the pinned boundary");
-        }
         let window = self.windows.remove(index);
         self.windows.insert(target, window);
         self.chrome_generation = self.chrome_generation.wrapping_add(1);
@@ -675,64 +662,9 @@ impl Workspace {
             return Ok(false);
         }
         let target = usize::try_from(target).unwrap_or(current);
-        if self.windows[current].pinned != self.windows[target].pinned {
-            return Ok(false);
-        }
         let name = self.windows[current].name.clone();
         self.move_window(&name, target)?;
         Ok(true)
-    }
-
-    pub(crate) fn set_window_pinned(&mut self, name: &str, pinned: bool) -> Result<()> {
-        let index = self.window_index(name)?;
-        if self.windows[index].pinned == pinned {
-            return Ok(());
-        }
-        let mut window = self.windows.remove(index);
-        window.pinned = pinned;
-        let pinned_count = self
-            .windows
-            .iter()
-            .take_while(|window| window.pinned)
-            .count();
-        self.windows.insert(pinned_count, window);
-        self.chrome_generation = self.chrome_generation.wrapping_add(1);
-        Ok(())
-    }
-
-    fn toggle_active_pinned(&mut self) -> Result<bool> {
-        let index = self
-            .active_window_index()
-            .context("workspace has no active window")?;
-        let name = self.windows[index].name.clone();
-        let pinned = !self.windows[index].pinned;
-        self.set_window_pinned(&name, pinned)?;
-        Ok(pinned)
-    }
-
-    pub(crate) fn add_match_rule(&mut self, name: &str, pattern: String) -> Result<()> {
-        if pattern.is_empty() {
-            bail!("activity match pattern cannot be empty");
-        }
-        let index = self.window_index(name)?;
-        if !self.windows[index].match_rules.contains(&pattern) {
-            self.windows[index].match_rules.push(pattern);
-            self.chrome_generation = self.chrome_generation.wrapping_add(1);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn remove_match_rule(&mut self, name: &str, pattern: &str) -> Result<()> {
-        let index = self.window_index(name)?;
-        let before = self.windows[index].match_rules.len();
-        self.windows[index]
-            .match_rules
-            .retain(|candidate| candidate != pattern);
-        if self.windows[index].match_rules.len() == before {
-            bail!("window {name:?} has no activity match rule {pattern:?}");
-        }
-        self.chrome_generation = self.chrome_generation.wrapping_add(1);
-        Ok(())
     }
 
     pub(crate) fn panes_in(&mut self, name: Option<&str>) -> Result<Vec<PaneStatus>> {
@@ -1030,18 +962,11 @@ impl Workspace {
     pub(crate) fn pump(&mut self) -> Result<()> {
         for index in 0..self.windows.len() {
             let changed = self.windows[index].pump(&mut self.pending_input)?;
-            if changed {
-                let matched = self.windows[index].matches_visible_rule()?;
-                if self.windows[index].id == self.active_window {
-                    continue;
-                }
-                let mut activity_changed = self.windows[index].mark_activity(ActivityKind::Output);
-                if matched {
-                    activity_changed |= self.windows[index].mark_activity(ActivityKind::Match);
-                }
-                if activity_changed {
-                    self.chrome_generation = self.chrome_generation.wrapping_add(1);
-                }
+            if changed
+                && self.windows[index].id != self.active_window
+                && self.windows[index].mark_activity(ActivityKind::Output)
+            {
+                self.chrome_generation = self.chrome_generation.wrapping_add(1);
             }
         }
         self.flush_input(Some(recording::InputOrigin::Client))?;
@@ -1854,7 +1779,6 @@ impl Workspace {
             .iter()
             .enumerate()
             .map_while(|(index, window)| {
-                let pin = if window.pinned { "^" } else { "" };
                 let badges = window
                     .activity_kinds
                     .iter()
@@ -1872,7 +1796,7 @@ impl Workspace {
                     String::new()
                 };
                 let zoom = if window.zoomed.is_some() { " Z" } else { "" };
-                let label = format!("{index}:{pin}{}{activity}{panes}{zoom}", window.name);
+                let label = format!("{index}:{}{activity}{panes}{zoom}", window.name);
                 let text = if window.id == selected {
                     format!("[{label}]")
                 } else {
@@ -1980,8 +1904,6 @@ impl Window {
             cached_frame: None,
             frame_generation: 0,
             activity_kinds: BTreeSet::new(),
-            match_rules: Vec::new(),
-            pinned: false,
             capture_input,
         })
     }
@@ -2036,14 +1958,6 @@ impl Window {
 
     fn clear_activity(&mut self) {
         self.activity_kinds.clear();
-    }
-
-    fn matches_visible_rule(&mut self) -> Result<bool> {
-        if self.match_rules.is_empty() {
-            return Ok(false);
-        }
-        let text = self.frame()?.text();
-        Ok(self.match_rules.iter().any(|rule| text.contains(rule)))
     }
 
     pub(crate) fn observe_exits(&mut self) -> Result<bool> {
@@ -3128,7 +3042,6 @@ enum InputAction {
     PreviousWindow,
     Palette,
     MoveWindow(isize),
-    TogglePin,
     ToggleTabPosition,
     SelectWindow(usize),
     WindowList,
@@ -3278,7 +3191,6 @@ impl PrefixDecoder {
                     b'p' => InputAction::Palette,
                     b'<' => InputAction::MoveWindow(-1),
                     b'>' => InputAction::MoveWindow(1),
-                    b'P' => InputAction::TogglePin,
                     b't' => InputAction::ToggleTabPosition,
                     b'0'..=b'9' => InputAction::SelectWindow(usize::from(byte - b'0')),
                     b'w' => InputAction::WindowList,
@@ -3444,7 +3356,6 @@ enum PaletteCommand {
     SelectWindow(WindowId),
     FocusPane(PaneId),
     ToggleTabPosition,
-    TogglePin,
     MoveWindow(isize),
     NewWindow,
     Detach,
@@ -3642,10 +3553,6 @@ fn palette_items(workspace: &Workspace, query: &str) -> Vec<PaletteItem> {
             command: PaletteCommand::ToggleTabPosition,
         },
         PaletteItem {
-            label: "window toggle pin".to_owned(),
-            command: PaletteCommand::TogglePin,
-        },
-        PaletteItem {
             label: "window move left".to_owned(),
             command: PaletteCommand::MoveWindow(-1),
         },
@@ -3698,12 +3605,9 @@ fn apply_palette_command(
             };
             workspace.set_tab_position(position);
         }
-        PaletteCommand::TogglePin => {
-            workspace.toggle_active_pinned()?;
-        }
         PaletteCommand::MoveWindow(offset) => {
             if !workspace.move_active_window(offset)? {
-                bail!("window cannot move across this boundary");
+                bail!("window cannot move any farther");
             }
         }
         PaletteCommand::NewWindow => {
@@ -4232,22 +4136,10 @@ impl WorkspaceTerminal {
                         } else {
                             attachment.screen.bell()?;
                             self.ui.notice(
-                                "window cannot move across this boundary",
+                                "window cannot move any farther",
                                 Duration::from_millis(1_200),
                             );
                         }
-                    }
-                    InputAction::TogglePin => {
-                        self.ui.clear_armed();
-                        let pinned = workspace.toggle_active_pinned()?;
-                        self.ui.notice(
-                            if pinned {
-                                "window pinned"
-                            } else {
-                                "window unpinned"
-                            },
-                            Duration::from_millis(1_000),
-                        );
                     }
                     InputAction::ToggleTabPosition => {
                         self.ui.clear_armed();
@@ -4330,7 +4222,7 @@ impl WorkspaceTerminal {
                     InputAction::Help => {
                         self.ui.clear_armed();
                         self.ui.notice(
-                            "^B p palette  l last  n next  </> move  P pin  t tabs  c new  0-9 select  %/\" split  H/J/K/L resize  z zoom  d detach",
+                            "^B p palette  l last  n next  </> move  t tabs  c new  0-9 select  %/\" split  H/J/K/L resize  z zoom  d detach",
                             Duration::from_secs(4),
                         );
                     }
@@ -5134,7 +5026,6 @@ mod tests {
         assert_eq!(decoder.push(&[PREFIX, b'l']), [InputAction::PreviousWindow]);
         assert_eq!(decoder.push(&[PREFIX, b'<']), [InputAction::MoveWindow(-1)]);
         assert_eq!(decoder.push(&[PREFIX, b'>']), [InputAction::MoveWindow(1)]);
-        assert_eq!(decoder.push(&[PREFIX, b'P']), [InputAction::TogglePin]);
         assert_eq!(
             decoder.push(&[PREFIX, b't']),
             [InputAction::ToggleTabPosition]
@@ -6111,31 +6002,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn tab_badges_compose_activity_kinds_and_match_rules_are_exact() {
+    fn tab_badges_compose_activity_kinds() {
         let command = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
         let mut workspace = Workspace::start(&command, None, None, &Options::default()).unwrap();
         workspace
             .create_window(Some("logs"), &command, None)
             .unwrap();
         workspace.select_window("main").unwrap();
-        workspace
-            .add_match_rule("logs", "FAILED".to_owned())
-            .unwrap();
-        workspace
-            .add_match_rule("logs", "FAILED".to_owned())
-            .unwrap();
-        assert_eq!(workspace.windows()[1].match_rules, ["FAILED"]);
-        for kind in [
-            ActivityKind::Output,
-            ActivityKind::Bell,
-            ActivityKind::Exit,
-            ActivityKind::Match,
-        ] {
+        for kind in [ActivityKind::Output, ActivityKind::Bell, ActivityKind::Exit] {
             workspace.windows[1].mark_activity(kind);
         }
-        assert!(workspace.frame().unwrap().text().contains("logs {+!x=}"));
-        workspace.remove_match_rule("logs", "FAILED").unwrap();
-        assert!(workspace.remove_match_rule("logs", "FAILED").is_err());
+        assert!(workspace.frame().unwrap().text().contains("logs {+!x}"));
         workspace.select_window("logs").unwrap();
         assert!(workspace.windows()[1].activity_kinds.is_empty());
         workspace.stop();
@@ -6143,19 +6020,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn hidden_activity_detects_output_bell_match_and_surviving_pane_exit() {
+    fn hidden_activity_detects_output_bell_and_surviving_pane_exit() {
         let command = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
         let delayed_activity = [
             "sh".to_owned(),
             "-c".to_owned(),
-            r"sleep 0.2; printf '\aFAILED'; cat".to_owned(),
+            r"sleep 0.2; printf '\aOUTPUT'; cat".to_owned(),
         ];
         let mut workspace = Workspace::start(&command, None, None, &Options::default()).unwrap();
         workspace
             .create_window(Some("logs"), &delayed_activity, None)
-            .unwrap();
-        workspace
-            .add_match_rule("logs", "FAILED".to_owned())
             .unwrap();
         workspace.select_window("main").unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -6163,13 +6037,9 @@ mod tests {
             workspace.pump().unwrap();
             workspace.take_bells();
             let kinds = &workspace.windows[1].activity_kinds;
-            if [
-                ActivityKind::Output,
-                ActivityKind::Bell,
-                ActivityKind::Match,
-            ]
-            .iter()
-            .all(|kind| kinds.contains(kind))
+            if [ActivityKind::Output, ActivityKind::Bell]
+                .iter()
+                .all(|kind| kinds.contains(kind))
             {
                 break;
             }
@@ -6241,7 +6111,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn runtime_tab_position_reorder_pin_and_context_share_authoritative_state() {
+    fn runtime_tab_position_reorder_and_context_share_authoritative_state() {
         let command = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
         let mut workspace = Workspace::start_named_with_theme(
             "identity-test",
@@ -6261,7 +6131,7 @@ mod tests {
             .unwrap();
         let two_pane = workspace.windows()[2].active_pane.unwrap();
 
-        workspace.set_window_pinned("one", true).unwrap();
+        workspace.move_window("one", 0).unwrap();
         workspace.move_window("two", 1).unwrap();
         workspace.set_tab_position(TabPosition::Top);
 
@@ -6273,8 +6143,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["one", "two", "main"]
         );
-        assert!(windows[0].pinned);
-        assert!(workspace.move_window("one", 2).is_err());
+        assert!(workspace.move_window("one", 3).is_err());
         let context = workspace.context(Some(two_pane)).unwrap();
         assert_eq!(context.session, "identity-test");
         assert_eq!(context.workspace, "identity-test");

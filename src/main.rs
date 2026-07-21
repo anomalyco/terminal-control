@@ -72,8 +72,8 @@ default name `workspace`. Supply a command after -- to replace the first shell w
 NAME to expose a stable explicit control socket. If NAME already exists, no command may be supplied.
 
 Each workspace starts with a `main` window. Use ctrl-b p for the command palette, ctrl-b l for the
-last window, ctrl-b n for the next window, and 0-9 to select by index. Use ctrl-b P to pin, ctrl-b
-</> or tab dragging to reorder, and ctrl-b t to move tabs. Use ctrl-b % to split left/right, ctrl-b
+last window, ctrl-b n for the next window, and 0-9 to select by index. Use ctrl-b </> or tab dragging
+to reorder, and ctrl-b t to move tabs. Use ctrl-b % to split left/right, ctrl-b
 \" to split top/bottom, arrow keys or h/j/k to focus, ctrl-b H/J/K/L to resize, ctrl-b z to zoom,
 ctrl-b q to show pane ids, ctrl-b d to detach, ctrl-b ? for help, and ctrl-b ctrl-b to send a literal ctrl-b. Destructive ctrl-b x (pane), ctrl-b
 & (window), and ctrl-b Q (workspace) actions require y/n confirmation. Agents can target hidden
@@ -85,7 +85,6 @@ Examples:
   termctrl windows workspace
   termctrl current --json
   termctrl tab-position workspace top
-  termctrl pin-window workspace editor
   termctrl move-window workspace editor --index 0
   termctrl show workspace --window editor
   termctrl panes workspace
@@ -218,16 +217,8 @@ enum Command {
     Current(CurrentArgs),
     /// Move a live workspace tab strip between the top and bottom.
     TabPosition(TabPositionArgs),
-    /// Reorder one workspace window within its pinned or unpinned group.
+    /// Reorder one workspace window.
     MoveWindow(MoveWindowArgs),
-    /// Keep one workspace window at the front of the tab strip.
-    PinWindow(WindowActionArgs),
-    /// Return one pinned workspace window to normal tab ordering.
-    UnpinWindow(WindowActionArgs),
-    /// Add a literal hidden-window activity match.
-    AddWindowMatch(WindowMatchArgs),
-    /// Remove a literal hidden-window activity match.
-    RemoveWindowMatch(WindowMatchArgs),
     /// Create and select a named workspace window.
     NewWindow(NewWindowArgs),
     /// Select one named workspace window for the attached terminal.
@@ -591,19 +582,9 @@ struct MoveWindowArgs {
     name: String,
     /// Exact window name returned by `termctrl windows`.
     window: String,
-    /// Final zero-based tab index within the same pin group.
+    /// Final zero-based tab index.
     #[arg(long)]
     index: usize,
-}
-
-#[derive(Args)]
-struct WindowMatchArgs {
-    /// Name of a running workspace.
-    name: String,
-    /// Exact window name returned by `termctrl windows`.
-    window: String,
-    /// Literal visible text that marks matching hidden output.
-    pattern: String,
 }
 
 #[derive(Args)]
@@ -982,24 +963,6 @@ fn main() -> Result<()> {
         }
         Command::MoveWindow(args) => {
             let windows = session::move_workspace_window(&args.name, args.window, args.index)?;
-            print_windows(&windows, true)?;
-        }
-        Command::PinWindow(args) => {
-            let windows = session::set_workspace_window_pinned(&args.name, args.window, true)?;
-            print_windows(&windows, true)?;
-        }
-        Command::UnpinWindow(args) => {
-            let windows = session::set_workspace_window_pinned(&args.name, args.window, false)?;
-            print_windows(&windows, true)?;
-        }
-        Command::AddWindowMatch(args) => {
-            let windows =
-                session::add_workspace_window_match(&args.name, args.window, args.pattern)?;
-            print_windows(&windows, true)?;
-        }
-        Command::RemoveWindowMatch(args) => {
-            let windows =
-                session::remove_workspace_window_match(&args.name, args.window, args.pattern)?;
             print_windows(&windows, true)?;
         }
         Command::NewWindow(args) => {
@@ -1611,14 +1574,13 @@ fn print_windows(windows: &[session::WindowStatus], json: bool) -> Result<()> {
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "{}\t{}\t{}\t{} panes\t{}x{}\t{}\t{}",
+            "{}\t{}\t{}\t{} panes\t{}x{}\t{}",
             window.index,
             if window.active { "active" } else { "" },
             window.name,
             window.pane_count,
             window.cols,
             window.rows,
-            if window.pinned { "pinned" } else { "" },
             activity,
         );
     }
@@ -1989,28 +1951,6 @@ mod tests {
                 "editor",
                 "--index",
                 "0"
-            ])
-            .is_ok()
-        );
-        assert!(Cli::try_parse_from(["termctrl", "pin-window", "workspace", "editor"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "unpin-window", "workspace", "editor"]).is_ok());
-        assert!(
-            Cli::try_parse_from([
-                "termctrl",
-                "add-window-match",
-                "workspace",
-                "editor",
-                "FAILED"
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "termctrl",
-                "remove-window-match",
-                "workspace",
-                "editor",
-                "FAILED"
             ])
             .is_ok()
         );

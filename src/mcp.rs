@@ -234,25 +234,8 @@ struct TabPositionRequest {
 struct MoveWindowRequest {
     name: String,
     window: String,
-    #[schemars(description = "Final zero-based tab index within the same pin group")]
+    #[schemars(description = "Final zero-based tab index")]
     index: usize,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct PinWindowRequest {
-    name: String,
-    window: String,
-    pinned: bool,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct WindowMatchRequest {
-    name: String,
-    window: String,
-    #[schemars(description = "Literal visible text that marks matching hidden output")]
-    pattern: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -376,8 +359,6 @@ struct WindowSummary {
     zoomed_pane: Option<u32>,
     activity: bool,
     activity_kinds: Vec<String>,
-    match_rules: Vec<String>,
-    pinned: bool,
     cols: u16,
     rows: u16,
 }
@@ -551,55 +532,13 @@ impl TerminalControl {
         .await
     }
 
-    #[tool(description = "Reorder one workspace window within its pinned or unpinned tab group")]
+    #[tool(description = "Reorder one workspace window by final zero-based tab index")]
     async fn move_workspace_window(
         &self,
         Parameters(request): Parameters<MoveWindowRequest>,
     ) -> Result<Json<WindowList>, String> {
         blocking(move || {
             session::move_workspace_window(&request.name, request.window, request.index)
-                .map(window_list)
-                .map(Json)
-                .map_err(format_error)
-        })
-        .await
-    }
-
-    #[tool(description = "Pin or unpin one workspace window at the front of the tab strip")]
-    async fn set_workspace_window_pinned(
-        &self,
-        Parameters(request): Parameters<PinWindowRequest>,
-    ) -> Result<Json<WindowList>, String> {
-        blocking(move || {
-            session::set_workspace_window_pinned(&request.name, request.window, request.pinned)
-                .map(window_list)
-                .map(Json)
-                .map_err(format_error)
-        })
-        .await
-    }
-
-    #[tool(description = "Add a literal hidden-window activity match rule")]
-    async fn add_workspace_window_match(
-        &self,
-        Parameters(request): Parameters<WindowMatchRequest>,
-    ) -> Result<Json<WindowList>, String> {
-        blocking(move || {
-            session::add_workspace_window_match(&request.name, request.window, request.pattern)
-                .map(window_list)
-                .map(Json)
-                .map_err(format_error)
-        })
-        .await
-    }
-
-    #[tool(description = "Remove a literal hidden-window activity match rule")]
-    async fn remove_workspace_window_match(
-        &self,
-        Parameters(request): Parameters<WindowMatchRequest>,
-    ) -> Result<Json<WindowList>, String> {
-        blocking(move || {
-            session::remove_workspace_window_match(&request.name, request.window, request.pattern)
                 .map(window_list)
                 .map(Json)
                 .map_err(format_error)
@@ -972,8 +911,6 @@ fn window_list(windows: Vec<session::WindowStatus>) -> WindowList {
                     .into_iter()
                     .map(|kind| format!("{kind:?}").to_ascii_lowercase())
                     .collect(),
-                match_rules: window.match_rules,
-                pinned: window.pinned,
                 cols: window.cols,
                 rows: window.rows,
             })
@@ -1139,7 +1076,6 @@ mod tests {
         assert_eq!(
             names,
             [
-                "add_workspace_window_match",
                 "close_workspace_pane",
                 "close_workspace_window",
                 "create_workspace_window",
@@ -1153,7 +1089,6 @@ mod tests {
                 "list_windows",
                 "move_workspace_pane",
                 "move_workspace_window",
-                "remove_workspace_window_match",
                 "rename_workspace_window",
                 "resize_session",
                 "resize_workspace_pane",
@@ -1162,7 +1097,6 @@ mod tests {
                 "send_input",
                 "set_workspace_layout",
                 "set_workspace_tab_position",
-                "set_workspace_window_pinned",
                 "stop_session",
                 "toggle_workspace_zoom",
             ]
@@ -1242,8 +1176,6 @@ mod tests {
             "zoomedPane",
             "activity",
             "activityKinds",
-            "matchRules",
-            "pinned",
             "cols",
             "rows",
         ] {

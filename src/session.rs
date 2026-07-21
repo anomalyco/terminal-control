@@ -908,18 +908,6 @@ enum Request {
         name: String,
         index: usize,
     },
-    SetWindowPinned {
-        name: String,
-        pinned: bool,
-    },
-    AddWindowMatch {
-        name: String,
-        pattern: String,
-    },
-    RemoveWindowMatch {
-        name: String,
-        pattern: String,
-    },
     CreateWindow {
         name: Option<String>,
         command: Vec<String>,
@@ -1302,42 +1290,6 @@ pub fn move_workspace_window(
 }
 
 #[doc(hidden)]
-pub fn set_workspace_window_pinned(
-    workspace: &str,
-    name: String,
-    pinned: bool,
-) -> Result<Vec<WindowStatus>> {
-    window_response(request(
-        workspace,
-        Request::SetWindowPinned { name, pinned },
-    )?)
-}
-
-#[doc(hidden)]
-pub fn add_workspace_window_match(
-    workspace: &str,
-    name: String,
-    pattern: String,
-) -> Result<Vec<WindowStatus>> {
-    window_response(request(
-        workspace,
-        Request::AddWindowMatch { name, pattern },
-    )?)
-}
-
-#[doc(hidden)]
-pub fn remove_workspace_window_match(
-    workspace: &str,
-    name: String,
-    pattern: String,
-) -> Result<Vec<WindowStatus>> {
-    window_response(request(
-        workspace,
-        Request::RemoveWindowMatch { name, pattern },
-    )?)
-}
-
-#[doc(hidden)]
 pub fn panes_in_window(
     workspace: &str,
     window: Option<String>,
@@ -1681,9 +1633,6 @@ fn request(name: &str, operation: Request) -> Result<Response> {
             | Request::WorkspaceContext { .. }
             | Request::SetTabPosition { .. }
             | Request::MoveWindow { .. }
-            | Request::SetWindowPinned { .. }
-            | Request::AddWindowMatch { .. }
-            | Request::RemoveWindowMatch { .. }
             | Request::CreateWindow { .. }
             | Request::SelectWindow { .. }
             | Request::RenameWindow { .. }
@@ -1703,9 +1652,6 @@ fn request(name: &str, operation: Request) -> Result<Response> {
         Request::WorkspaceContext { .. }
             | Request::SetTabPosition { .. }
             | Request::MoveWindow { .. }
-            | Request::SetWindowPinned { .. }
-            | Request::AddWindowMatch { .. }
-            | Request::RemoveWindowMatch { .. }
     );
     let response = if requires_layout_command {
         implementation::request_layout_command(name, &operation)?
@@ -2996,9 +2942,6 @@ mod implementation {
             | Request::WorkspaceContext { .. }
             | Request::SetTabPosition { .. }
             | Request::MoveWindow { .. }
-            | Request::SetWindowPinned { .. }
-            | Request::AddWindowMatch { .. }
-            | Request::RemoveWindowMatch { .. }
             | Request::CreateWindow { .. }
             | Request::SelectWindow { .. }
             | Request::RenameWindow { .. }
@@ -3103,18 +3046,6 @@ mod implementation {
             }
             Request::MoveWindow { name, index } => {
                 workspace.move_window(&name, index)?;
-                response.windows = Some(workspace.windows());
-            }
-            Request::SetWindowPinned { name, pinned } => {
-                workspace.set_window_pinned(&name, pinned)?;
-                response.windows = Some(workspace.windows());
-            }
-            Request::AddWindowMatch { name, pattern } => {
-                workspace.add_match_rule(&name, pattern)?;
-                response.windows = Some(workspace.windows());
-            }
-            Request::RemoveWindowMatch { name, pattern } => {
-                workspace.remove_match_rule(&name, &pattern)?;
                 response.windows = Some(workspace.windows());
             }
             Request::CreateWindow { name, command, cwd } => {
@@ -3576,9 +3507,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!(!window.pinned);
         assert!(window.activity_kinds.is_empty());
-        assert!(window.match_rules.is_empty());
         assert!(
             require_pane_protocol(&response)
                 .unwrap_err()
@@ -3631,18 +3560,6 @@ mod tests {
             Request::MoveWindow {
                 name: "editor".to_owned(),
                 index: 0,
-            },
-            Request::SetWindowPinned {
-                name: "editor".to_owned(),
-                pinned: true,
-            },
-            Request::AddWindowMatch {
-                name: "editor".to_owned(),
-                pattern: "DONE".to_owned(),
-            },
-            Request::RemoveWindowMatch {
-                name: "editor".to_owned(),
-                pattern: "DONE".to_owned(),
             },
             Request::CreateWindow {
                 name: Some("editor".to_owned()),

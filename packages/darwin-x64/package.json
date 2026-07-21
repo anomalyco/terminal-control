@@ -1,6 +1,6 @@
 {
   "name": "@kitlangton/terminal-control-darwin-x64",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Native termctrl binary for Terminal Control on macOS x64",
   "license": "MIT",
   "repository": "https://github.com/anomalyco/terminal-control",

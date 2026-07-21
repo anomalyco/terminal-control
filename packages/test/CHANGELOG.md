@@ -1,5 +1,18 @@
 # @kitlangton/terminal-control
 
+## 0.5.0
+
+### Minor Changes
+
+- cc0be0e: Add persistent, reattachable workspaces with named windows, reorderable tabs, movable split panes, pane
+  zoom, a command palette, and workspace-wide pane IDs that remain stable for the workspace lifetime.
+  Agents can inspect and control hidden windows and panes through typed CLI and MCP operations, capture
+  pane/window/workspace PNGs, record the composed workspace, and discover their current pane context.
+
+### Patch Changes
+
+- 033f0d7: Replace the terminal state engine with Ghostty for accurate reflow, Unicode, attributes, and PTY responses.
+
 ## 0.4.1
 
 ### Patch Changes

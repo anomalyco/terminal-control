@@ -1,6 +1,6 @@
 {
   "name": "@kitlangton/terminal-control-linux-x64-gnu",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Native termctrl binary for Terminal Control on Linux x64 GNU",
   "license": "MIT",
   "repository": "https://github.com/anomalyco/terminal-control",

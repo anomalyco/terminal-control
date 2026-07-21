@@ -1,6 +1,6 @@
 [package]
 name = "terminal-control"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.93"
 description = "Control and test terminal applications through stable visible state"

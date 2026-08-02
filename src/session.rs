@@ -3546,14 +3546,396 @@ mod implementation {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 mod implementation {
-    use super::{NamedSessionStatus, Options, PruneKind, Request, Response, TabPosition};
-    use anyhow::{Result, bail};
+    use std::fs;
+    use std::io::{ErrorKind, Read, Write};
     use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use anyhow::{Context, Result, bail};
+    use interprocess::ConnectWaitMode;
+    use interprocess::local_socket::{
+        ConnectOptions, GenericNamespaced, ListenerNonblockingMode, ListenerOptions, ToNsName,
+        prelude::{LocalSocketListener, LocalSocketStream},
+        traits::Listener,
+    };
+
+    use super::{
+        NamedSessionStatus, Options, PruneKind, Request, Response, Session, SessionState,
+        TabPosition, UnavailableReason,
+    };
+    use crate::shot;
+
+    const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+    const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+    const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+
+    fn marker_path(name: &str) -> Result<PathBuf> {
+        Ok(runtime_dir()?.join(format!("{name}.sock")))
+    }
+
+    fn pipe_name(path: &Path) -> Result<interprocess::local_socket::Name<'static>> {
+        let name = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("invalid Windows session endpoint {}", path.display()))?
+            .to_owned();
+        Ok(name.to_ns_name::<GenericNamespaced>()?.into_owned())
+    }
+
+    fn stream(path: &Path) -> Result<LocalSocketStream> {
+        let name = pipe_name(path)?;
+        ConnectOptions::new()
+            .name(name)
+            .wait_mode(ConnectWaitMode::Timeout(CONTROL_TIMEOUT))
+            .connect_sync()
+            .context("connect to Windows named pipe")
+    }
+
+    fn listener(path: &Path) -> Result<LocalSocketListener> {
+        let name = pipe_name(path)?;
+        ListenerOptions::new()
+            .name(name)
+            .nonblocking(ListenerNonblockingMode::Accept)
+            .create_sync()
+            .context("create Windows named-pipe listener")
+    }
 
     pub fn runtime_dir() -> Result<PathBuf> {
-        bail!("persistent sessions require Unix sockets")
+        let path = std::env::var_os("TERMCTRL_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("termctrl"));
+        if !path.is_absolute() {
+            bail!(
+                "TERMCTRL_RUNTIME_DIR must be an absolute path: {}",
+                path.display()
+            );
+        }
+        fs::create_dir_all(&path).with_context(|| {
+            format!(
+                "create Windows session runtime directory {}",
+                path.display()
+            )
+        })?;
+        Ok(path)
+    }
+
+    pub fn start(
+        name: &str,
+        command: &[String],
+        cwd: Option<&Path>,
+        record: Option<&Path>,
+        options: &Options,
+    ) -> Result<()> {
+        if command.is_empty() {
+            bail!("provide a command after --");
+        }
+        let socket = marker_path(name)?;
+        if socket.exists() && request(socket.clone(), &Request::Ping).is_ok() {
+            bail!("session {name:?} is already running");
+        }
+        let _ = fs::remove_file(&socket);
+        let mut daemon =
+            Command::new(std::env::current_exe().context("locate termctrl executable")?);
+        daemon
+            .arg("__serve")
+            .arg("--name")
+            .arg(name)
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--cols")
+            .arg(options.cols.to_string())
+            .arg("--rows")
+            .arg(options.rows.to_string())
+            .arg("--cell-width")
+            .arg(options.cell_width.to_string())
+            .arg("--cell-height")
+            .arg(options.cell_height.to_string())
+            .arg("--max-bytes")
+            .arg(options.max_bytes.to_string());
+        if options.opentui_host {
+            daemon.arg("--opentui-host");
+        }
+        match options.color {
+            shot::ColorMode::Auto => {}
+            shot::ColorMode::Always => {
+                daemon.arg("--color").arg("always");
+            }
+            shot::ColorMode::Never => {
+                daemon.arg("--color").arg("never");
+            }
+        }
+        if let Some(cwd) = cwd {
+            daemon.arg("--cwd").arg(cwd);
+        }
+        if let Some(record) = record {
+            daemon.arg("--record").arg(record);
+        }
+        daemon
+            .arg("--")
+            .args(command)
+            .env_remove("TERMCTRL_WORKSPACE")
+            .env_remove("TERMCTRL_PANE_ID")
+            .env_remove("TERMCTRL_LAUNCH_WINDOW_ID")
+            .env("TERMCTRL_SESSION", name)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut daemon = daemon.spawn().context("start Windows session daemon")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if request(socket.clone(), &Request::Ping).is_ok() {
+                return Ok(());
+            }
+            if let Some(status) = daemon.try_wait().context("poll Windows session daemon")? {
+                bail!("session daemon exited before becoming ready: {status}");
+            }
+            if Instant::now() >= deadline {
+                let _ = daemon.kill();
+                bail!("timed out starting session {name:?}");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn restart(
+        name: &str,
+        command: &[String],
+        cwd: Option<&Path>,
+        record: Option<&Path>,
+        options: &Options,
+    ) -> Result<()> {
+        let socket = marker_path(name)?;
+        if request(socket.clone(), &Request::Stop).is_ok() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while request(socket.clone(), &Request::Ping).is_ok() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        start(name, command, cwd, record, options)
+    }
+
+    pub fn request(socket: PathBuf, request: &Request) -> Result<Response> {
+        let mut stream = stream(&socket).with_context(|| {
+            format!("connect to session at {}; is it running?", socket.display())
+        })?;
+        let request_bytes = serde_json::to_vec(request).context("encode session request")?;
+        if request_bytes.len() as u64 > MAX_REQUEST_BYTES {
+            bail!("session request exceeds 1 MiB");
+        }
+        stream
+            .write_all(&request_bytes)
+            .context("write session request")?;
+        stream.write_all(b"\n").context("finish session request")?;
+        stream.flush().context("flush session request")?;
+        let mut bytes = Vec::new();
+        stream
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .context("read session response")?;
+        serde_json::from_slice(&bytes).context("decode session response")
+    }
+
+    pub fn request_layout_command(_: &str, operation: &Request) -> Result<Response> {
+        if operation.requirements().hold_name_lock {
+            bail!("workspace layout commands are not supported on Windows yet");
+        }
+        unreachable!()
+    }
+
+    pub fn serve(
+        name: String,
+        socket: PathBuf,
+        command: Vec<String>,
+        cwd: Option<PathBuf>,
+        record: Option<PathBuf>,
+        mut options: Options,
+    ) -> Result<()> {
+        if command.is_empty() {
+            bail!("provide a command after --");
+        }
+        options.env.insert("TERMCTRL_SESSION".to_owned(), name);
+        let listener = listener(&socket)?;
+        fs::write(&socket, b"named-pipe")?;
+        let mut session = Session::start(&command, cwd.as_deref(), record.as_deref(), &options)?;
+        let result = run(&listener, &mut session);
+        let _ = session.stop();
+        let _ = fs::remove_file(&socket);
+        result
+    }
+
+    fn run(listener: &LocalSocketListener, session: &mut Session) -> Result<()> {
+        loop {
+            session.consume_batch()?;
+            match listener.accept() {
+                Ok(mut stream) => {
+                    let stopped = handle(&mut stream, session)?;
+                    if stopped {
+                        return Ok(());
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => return Err(error).context("accept Windows session request"),
+            }
+        }
+    }
+
+    fn handle(stream: &mut LocalSocketStream, session: &mut Session) -> Result<bool> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let length = stream.read(&mut chunk)?;
+            if length == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..length]);
+            if bytes.contains(&b'\n') {
+                break;
+            }
+            if bytes.len() as u64 > MAX_REQUEST_BYTES {
+                bail!("session request exceeds 1 MiB");
+            }
+        }
+        let request = serde_json::from_slice::<Request>(
+            bytes
+                .split(|byte| *byte == b'\n')
+                .next()
+                .unwrap_or_default(),
+        )?;
+        let stop = matches!(request, Request::Stop);
+        let response =
+            respond(session, request).unwrap_or_else(|error| Response::error(format!("{error:#}")));
+        serde_json::to_writer(&mut *stream, &response)?;
+        stream.flush()?;
+        Ok(stop)
+    }
+
+    fn respond(session: &mut Session, request: Request) -> Result<Response> {
+        let mut response = Response::default();
+        match request {
+            Request::Ping => {}
+            Request::Status => response.status = Some(session.status()?),
+            Request::Send {
+                input,
+                pace_ms,
+                pane,
+            } => {
+                if pane.is_some_and(|pane| pane != 0) {
+                    bail!("single sessions only contain pane 0");
+                }
+                session.send_all(&input, Duration::from_millis(pace_ms))?;
+            }
+            Request::Wait {
+                text,
+                timeout_ms,
+                pane,
+            } => {
+                if pane.is_some_and(|pane| pane != 0) {
+                    bail!("single sessions only contain pane 0");
+                }
+                session.wait_for_text(&text, Duration::from_millis(timeout_ms))?;
+            }
+            Request::Show {
+                settle_ms,
+                deadline_ms,
+                pane,
+            } => {
+                if pane.is_some_and(|pane| pane != 0) {
+                    bail!("single sessions only contain pane 0");
+                }
+                response.captured = Some(
+                    session
+                        .capture(
+                            Duration::from_millis(settle_ms),
+                            Duration::from_millis(deadline_ms),
+                        )?
+                        .shot,
+                );
+                response.status = Some(session.status()?);
+            }
+            Request::Logs { ansi } => response.logs = Some(session.logs(ansi)?),
+            Request::Resize {
+                cols,
+                rows,
+                cell_width,
+                cell_height,
+            } => session.resize(
+                cols,
+                rows,
+                cell_width.unwrap_or(9),
+                cell_height.unwrap_or(18),
+            )?,
+            Request::Stop => {}
+            _ => bail!("this session operation is not supported on Windows single sessions"),
+        }
+        Ok(response)
+    }
+
+    pub fn list() -> Result<Vec<NamedSessionStatus>> {
+        let mut sessions = Vec::new();
+        for entry in fs::read_dir(runtime_dir()?)? {
+            let path = entry?.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("sock") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|x| x.to_str()).map(str::to_owned) else {
+                continue;
+            };
+            match request(path, &Request::Status) {
+                Ok(response) => sessions.push(NamedSessionStatus {
+                    name,
+                    status: response.status,
+                    error: response.error,
+                    unavailable: None,
+                }),
+                Err(error) => sessions.push(NamedSessionStatus {
+                    name,
+                    status: None,
+                    error: Some(format!("{error:#}")),
+                    unavailable: Some(UnavailableReason::Stale),
+                }),
+            }
+        }
+        sessions.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(sessions)
+    }
+
+    pub fn prune(name: &str, dry_run: bool) -> Result<Option<PruneKind>> {
+        let socket = marker_path(name)?;
+        if !socket.exists() {
+            return Ok(None);
+        }
+        match request(socket.clone(), &Request::Status) {
+            Ok(response)
+                if response
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.state == SessionState::Exited) =>
+            {
+                if !dry_run {
+                    let _ = request(socket.clone(), &Request::Stop);
+                    let _ = fs::remove_file(socket);
+                }
+                Ok(Some(PruneKind::Exited))
+            }
+            Err(_) => {
+                if !dry_run {
+                    fs::remove_file(socket)?;
+                }
+                Ok(Some(PruneKind::Stale))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn attach(_: PathBuf, _: &str, _: &Options) -> Result<()> {
+        bail!("workspace attachment is not supported on Windows yet")
     }
     pub fn serve_workspace(
         _: String,
@@ -3564,51 +3946,7 @@ mod implementation {
         _: Options,
         _: TabPosition,
     ) -> Result<()> {
-        bail!("persistent workspaces require Unix sockets")
-    }
-    pub fn start(
-        _: &str,
-        _: &[String],
-        _: Option<&Path>,
-        _: Option<&Path>,
-        _: &Options,
-    ) -> Result<()> {
-        bail!("persistent sessions require Unix sockets")
-    }
-    pub fn restart(
-        _: &str,
-        _: &[String],
-        _: Option<&Path>,
-        _: Option<&Path>,
-        _: &Options,
-    ) -> Result<()> {
-        bail!("persistent sessions require Unix sockets")
-    }
-    pub fn request(_: PathBuf, _: &Request) -> Result<Response> {
-        bail!("persistent sessions require Unix sockets")
-    }
-    pub fn request_layout_command(_: &str, _: &Request) -> Result<Response> {
-        bail!("persistent sessions require Unix sockets")
-    }
-
-    pub fn attach(_: PathBuf, _: &str, _: &Options) -> Result<()> {
-        bail!("workspace attachment requires Unix sockets")
-    }
-    pub fn list() -> Result<Vec<NamedSessionStatus>> {
-        bail!("persistent sessions require Unix sockets")
-    }
-    pub fn prune(_: &str, _: bool) -> Result<Option<PruneKind>> {
-        bail!("persistent sessions require Unix sockets")
-    }
-    pub fn serve(
-        _: String,
-        _: PathBuf,
-        _: Vec<String>,
-        _: Option<PathBuf>,
-        _: Option<PathBuf>,
-        _: Options,
-    ) -> Result<()> {
-        bail!("persistent sessions require Unix sockets")
+        bail!("persistent workspaces are not supported on Windows yet")
     }
     pub fn run_foreground(
         _: &str,
@@ -3618,7 +3956,81 @@ mod implementation {
         _: &Options,
         _: TabPosition,
     ) -> Result<()> {
-        bail!("persistent sessions require Unix sockets")
+        bail!("workspace attachment is not supported on Windows yet")
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod implementation {
+    use super::{NamedSessionStatus, Options, PruneKind, Request, Response, TabPosition};
+    use anyhow::{Result, bail};
+    use std::path::{Path, PathBuf};
+    pub fn runtime_dir() -> Result<PathBuf> {
+        bail!("persistent sessions require a local IPC transport")
+    }
+    pub fn serve_workspace(
+        _: String,
+        _: PathBuf,
+        _: Vec<String>,
+        _: Option<PathBuf>,
+        _: Option<PathBuf>,
+        _: Options,
+        _: TabPosition,
+    ) -> Result<()> {
+        bail!("persistent workspaces require a local IPC transport")
+    }
+    pub fn start(
+        _: &str,
+        _: &[String],
+        _: Option<&Path>,
+        _: Option<&Path>,
+        _: &Options,
+    ) -> Result<()> {
+        bail!("persistent sessions require a local IPC transport")
+    }
+    pub fn restart(
+        _: &str,
+        _: &[String],
+        _: Option<&Path>,
+        _: Option<&Path>,
+        _: &Options,
+    ) -> Result<()> {
+        bail!("persistent sessions require a local IPC transport")
+    }
+    pub fn request(_: PathBuf, _: &Request) -> Result<Response> {
+        bail!("persistent sessions require a local IPC transport")
+    }
+    pub fn request_layout_command(_: &str, _: &Request) -> Result<Response> {
+        bail!("persistent sessions require a local IPC transport")
+    }
+    pub fn attach(_: PathBuf, _: &str, _: &Options) -> Result<()> {
+        bail!("workspace attachment requires a local IPC transport")
+    }
+    pub fn list() -> Result<Vec<NamedSessionStatus>> {
+        bail!("persistent sessions require a local IPC transport")
+    }
+    pub fn prune(_: &str, _: bool) -> Result<Option<PruneKind>> {
+        bail!("persistent sessions require a local IPC transport")
+    }
+    pub fn serve(
+        _: String,
+        _: PathBuf,
+        _: Vec<String>,
+        _: Option<PathBuf>,
+        _: Option<PathBuf>,
+        _: Options,
+    ) -> Result<()> {
+        bail!("persistent sessions require a local IPC transport")
+    }
+    pub fn run_foreground(
+        _: &str,
+        _: &[String],
+        _: Option<&Path>,
+        _: Option<&Path>,
+        _: &Options,
+        _: TabPosition,
+    ) -> Result<()> {
+        bail!("workspace attachment requires a local IPC transport")
     }
 }
 

@@ -4353,8 +4353,18 @@ fn attachment_closed(error: &anyhow::Error) -> bool {
                 | std::io::ErrorKind::TimedOut
                 | std::io::ErrorKind::WouldBlock
                 | std::io::ErrorKind::UnexpectedEof
-        ) || error.raw_os_error() == Some(libc::EIO)
+        ) || is_eio(error)
     })
+}
+
+#[cfg(unix)]
+fn is_eio(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EIO)
+}
+
+#[cfg(not(unix))]
+fn is_eio(_: &std::io::Error) -> bool {
+    false
 }
 
 fn add_overlay(frame: &mut Frame, text: &str) {

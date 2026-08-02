@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::semantic;
 
 const OPENTUI_QUERY: &[u8] = b"\x1b]10;?\x07\x1b]11;?\x07";
+const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
 #[cfg(test)]
 const PALETTE_QUERY: &[u8] = b"\x1b]4;0;?\x07";
 const KITTY_QUERY: &[u8] = b"\x1b_Gi=31337";
@@ -197,6 +198,11 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
             libc::kill(-process_group, libc::SIGKILL);
         }
     }
+    // On Windows, ConPTY owns a hidden conhost process behind the master handle. Closing the
+    // master before waiting for the child lets that host observe the PTY shutdown instead of
+    // surviving as an orphan after a one-shot capture.
+    #[cfg(windows)]
+    drop(pair.master);
     let _ = child.kill();
     drop(receive);
     let teardown_deadline = Instant::now() + Duration::from_secs(1);
@@ -573,6 +579,7 @@ pub(crate) struct Host {
     opentui_replied: bool,
     kitty_replied: bool,
     probe: Vec<u8>,
+    cursor_position_probe: Vec<u8>,
     color_probe: Vec<u8>,
     pixel_width: u32,
     pixel_height: u32,
@@ -595,6 +602,7 @@ impl Host {
             opentui_replied: false,
             kitty_replied: false,
             probe: Vec::new(),
+            cursor_position_probe: Vec::new(),
             color_probe: Vec::new(),
             pixel_width: u32::from(options.cols) * u32::from(options.cell_width),
             pixel_height: u32::from(options.rows) * u32::from(options.cell_height),
@@ -636,7 +644,11 @@ impl Host {
         }
         let mut response = Vec::new();
         self.probe.extend_from_slice(output);
+        self.cursor_position_probe.extend_from_slice(output);
         self.color_probe.extend_from_slice(output);
+        for _ in 0..take_queries(&mut self.cursor_position_probe, CURSOR_POSITION_QUERY) {
+            response.extend_from_slice(b"\x1b[1;1R");
+        }
         for query in take_color_queries(&mut self.color_probe) {
             match query {
                 ColorQuery::Foreground => {
@@ -690,6 +702,22 @@ impl Host {
         }
         Ok(response)
     }
+}
+
+fn take_queries(probe: &mut Vec<u8>, query: &[u8]) -> usize {
+    let mut count = 0;
+    let mut offset = 0;
+    while let Some(index) = probe[offset..]
+        .windows(query.len())
+        .position(|window| window == query)
+    {
+        count += 1;
+        offset += index + query.len();
+    }
+    let keep = query.len().saturating_sub(1);
+    let drain = probe.len().saturating_sub(keep);
+    probe.drain(..drain);
+    count
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -984,6 +1012,24 @@ mod tests {
         assert!(output.contains("\x1b[4;480;900t"));
         assert!(output.contains("\x1b]4;0;rgb:0000/0000/0000\x1b\\"));
         assert!(output.contains("\x1b_Gi=31337;EINVAL:graphics unavailable\x1b\\"));
+    }
+
+    #[test]
+    fn responds_to_standalone_cursor_position_queries() {
+        let result = Arc::new(Mutex::new(Vec::new()));
+        let mut host = Host::new(
+            Box::new(Writer(result.clone())),
+            &Options {
+                opentui_host: true,
+                ..Options::default()
+            },
+        );
+
+        host.respond(b"\x1b[").unwrap();
+        host.respond(b"6n").unwrap();
+
+        let output = result.lock().unwrap().clone();
+        assert_eq!(output, b"\x1b[1;1R");
     }
 
     #[test]

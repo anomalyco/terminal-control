@@ -333,7 +333,7 @@ See [docs/typescript-client.md](docs/typescript-client.md) for artifacts, record
 
 ## Notes
 
-- Persistent sessions use owner-only local Unix sockets and are supported on macOS and Linux.
+- Persistent sessions use owner-only Unix sockets on macOS/Linux and Windows named pipes on Windows.
 - `--host opentui` provides `TERMCTRL_SEMANTIC_SOCKET` and answers startup probes needed by current OpenTUI applications.
 - Terminal state and reflow use the statically linked Ghostty terminal core; renderers export PNG, SVG, JSON, text, and raw ANSI artifacts.
 - Run `termctrl <command> --help` for dimensions, timing, color, rendering, and output options.

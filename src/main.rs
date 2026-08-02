@@ -54,8 +54,8 @@ Examples:
 const START_HELP: &str = "\
 Start creates one background PTY session and returns once its local control socket is available.
 The application stays alive until `termctrl stop NAME`, so later commands interact with the
-same screen and application state. Persistent sessions currently require macOS or Linux. Session
-sockets are local control endpoints protected for the current user; recordings contain terminal
+same screen and application state. Persistent sessions use Unix sockets on macOS/Linux and named
+pipes on Windows. Session endpoints are local control endpoints protected for the current user; recordings contain terminal
 output plus client and automatic host input, so treat them as sensitive artifacts.
 
 Example:

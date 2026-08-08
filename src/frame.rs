@@ -61,7 +61,6 @@ pub struct Cursor {
     pub y: u16,
     pub color: Color,
     pub blinking: bool,
-    #[serde(default)]
     pub style: CursorStyle,
 }
 
@@ -284,16 +283,6 @@ mod tests {
                 b: 128
             }
         );
-    }
-
-    #[test]
-    fn reads_v1_cursor_as_block_style() {
-        let cursor = serde_json::from_str::<Cursor>(
-            r#"{"x":0,"y":0,"color":{"r":1,"g":2,"b":3},"blinking":false}"#,
-        )
-        .unwrap();
-
-        assert_eq!(cursor.style, CursorStyle::Block);
     }
 
     #[test]

@@ -995,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn ghostty_ansi_shots_preserve_frame_v1_colors_and_attributes() {
+    fn ghostty_ansi_shots_preserve_frame_colors_and_attributes() {
         let shot = from_ansi(
             b"\x1b[1;3;4;38;5;214;48;2;30;34;42mwide: ".to_vec(),
             2,

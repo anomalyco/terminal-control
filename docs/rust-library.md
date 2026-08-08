@@ -57,6 +57,6 @@ No connected provider returns `termctrl-semantic-snapshot-v1` with an empty `nod
 
 ## Versioned Structured Output
 
-- A `save --format json` capture is a `Frame` object with `version: 1`, described by `schemas/frame-v1.schema.json`.
+- A `save --format json` capture is a `Frame` object with `version: 2`, described by `schemas/frame-v2.schema.json`.
 - A `.termctrl` recording is JSON Lines: its first line is a versioned header and subsequent lines are timed output, input, resize, or marker entries, each described by `schemas/recording-entry-v1.schema.json`.
 - Recording byte arrays contain the original terminal or input bytes as integers from `0` to `255`; recordings can contain sensitive text or input.

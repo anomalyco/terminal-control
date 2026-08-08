@@ -3022,6 +3022,7 @@ fn compose_workspace(
                     y: placed.rect.y + cursor.y,
                     color: cursor.color,
                     blinking: cursor.blinking,
+                    style: cursor.style,
                 })
             })
         });
@@ -4806,6 +4807,7 @@ mod tests {
                 y,
                 color: DEFAULT_FOREGROUND,
                 blinking: false,
+                style: crate::frame::CursorStyle::Block,
             }),
             cells: vec![Cell {
                 x: 0,

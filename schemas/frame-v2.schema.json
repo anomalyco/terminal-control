@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anomalyco/terminal-control/schemas/frame-v2.schema.json",
+  "title": "Terminal Control structured terminal frame v2",
+  "type": "object",
+  "required": ["version", "cols", "rows", "foreground", "background", "cursor", "cells"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 2 },
+    "cols": { "$ref": "#/$defs/terminalDimension" },
+    "rows": { "$ref": "#/$defs/terminalDimension" },
+    "foreground": { "$ref": "#/$defs/color" },
+    "background": { "$ref": "#/$defs/color" },
+    "cursor": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/cursor" }
+      ]
+    },
+    "cells": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/cell" }
+    }
+  },
+  "$defs": {
+    "dimension": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "terminalDimension": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "channel": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "color": {
+      "type": "object",
+      "required": ["r", "g", "b"],
+      "additionalProperties": false,
+      "properties": {
+        "r": { "$ref": "#/$defs/channel" },
+        "g": { "$ref": "#/$defs/channel" },
+        "b": { "$ref": "#/$defs/channel" }
+      }
+    },
+    "attributes": {
+      "type": "object",
+      "required": ["bold", "italic", "faint", "invisible", "strikethrough", "overline", "underline"],
+      "additionalProperties": false,
+      "properties": {
+        "bold": { "type": "boolean" },
+        "italic": { "type": "boolean" },
+        "faint": { "type": "boolean" },
+        "invisible": { "type": "boolean" },
+        "strikethrough": { "type": "boolean" },
+        "overline": { "type": "boolean" },
+        "underline": {
+          "oneOf": [
+            { "type": "null" },
+            { "enum": ["single"] }
+          ]
+        }
+      }
+    },
+    "cursor": {
+      "type": "object",
+      "required": ["x", "y", "color", "blinking", "style"],
+      "additionalProperties": false,
+      "properties": {
+        "x": { "$ref": "#/$defs/dimension" },
+        "y": { "$ref": "#/$defs/dimension" },
+        "color": { "$ref": "#/$defs/color" },
+        "blinking": { "type": "boolean" },
+        "style": { "enum": ["block", "hollow", "underline", "bar"] }
+      }
+    },
+    "cell": {
+      "type": "object",
+      "required": ["x", "y", "text", "width", "foreground", "background", "attributes"],
+      "additionalProperties": false,
+      "properties": {
+        "x": { "$ref": "#/$defs/dimension" },
+        "y": { "$ref": "#/$defs/dimension" },
+        "text": { "type": "string" },
+        "width": { "type": "integer", "minimum": 1, "maximum": 2 },
+        "foreground": { "$ref": "#/$defs/color" },
+        "background": { "$ref": "#/$defs/color" },
+        "attributes": { "$ref": "#/$defs/attributes" }
+      }
+    }
+  }
+}

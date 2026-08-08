@@ -9,7 +9,7 @@ use libghostty_vt::style::{PaletteIndex, RgbColor, Underline as GhosttyUnderline
 use libghostty_vt::{RenderState, Terminal, TerminalOptions, terminal::Mode};
 
 use crate::frame::{
-    Attributes, Cell, Color, Cursor, FORMAT_VERSION, Frame, Underline, indexed_color,
+    Attributes, Cell, Color, Cursor, CursorStyle, FORMAT_VERSION, Frame, Underline, indexed_color,
 };
 use crate::terminal_theme::TerminalTheme;
 
@@ -166,7 +166,13 @@ impl TerminalCore {
             .update(&self.terminal)
             .context("update Ghostty render state")?;
         let dirty = snapshot.dirty().context("read Ghostty dirty state")?;
+        let next_cursor_style = snapshot
+            .cursor_visual_style()
+            .context("read Ghostty cursor style")?;
+        let cursor_style_changed = self.cursor_style != next_cursor_style;
+        self.cursor_style = next_cursor_style;
         if dirty == Dirty::Clean
+            && !cursor_style_changed
             && let Some(frame) = &self.cached_frame
         {
             return Ok(frame.clone());
@@ -176,9 +182,6 @@ impl TerminalCore {
         let colors = snapshot.colors().context("read Ghostty colors")?;
         let foreground = from_ghostty_color(colors.foreground);
         let background = from_ghostty_color(colors.background);
-        self.cursor_style = snapshot
-            .cursor_visual_style()
-            .context("read Ghostty cursor style")?;
         let cursor = if snapshot
             .cursor_visible()
             .context("read Ghostty cursor visibility")?
@@ -191,6 +194,7 @@ impl TerminalCore {
                     y: cursor.y,
                     color: from_ghostty_color(colors.cursor.unwrap_or(colors.foreground)),
                     blinking: snapshot.cursor_blinking().unwrap_or(false),
+                    style: frame_cursor_style(self.cursor_style),
                 })
         } else {
             None
@@ -353,10 +357,20 @@ fn from_ghostty_color(color: RgbColor) -> Color {
     }
 }
 
+fn frame_cursor_style(style: CursorVisualStyle) -> CursorStyle {
+    match style {
+        CursorVisualStyle::Block => CursorStyle::Block,
+        CursorVisualStyle::BlockHollow => CursorStyle::Hollow,
+        CursorVisualStyle::Underline => CursorStyle::Underline,
+        CursorVisualStyle::Bar => CursorStyle::Bar,
+        _ => CursorStyle::Block,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::TerminalCore;
-    use crate::frame::Color;
+    use crate::frame::{Color, CursorStyle};
     use crate::terminal_theme::TerminalTheme;
 
     #[test]
@@ -374,6 +388,17 @@ mod tests {
         assert_eq!(terminal.title().unwrap(), "editor");
         assert_eq!(terminal.take_bells(), 1);
         assert_eq!(terminal.take_bells(), 0);
+    }
+
+    #[test]
+    fn updates_cursor_style_without_cell_changes() {
+        let mut terminal = TerminalCore::new(1, 20, 0).unwrap();
+        terminal.frame().unwrap();
+
+        terminal.apply_output(b"\x1b[6 q");
+        let frame = terminal.frame().unwrap();
+
+        assert_eq!(frame.cursor.unwrap().style, CursorStyle::Bar);
     }
 
     #[test]
@@ -447,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_wide_graphemes_in_frame_v1() {
+    fn preserves_wide_graphemes_in_structured_frames() {
         let mut terminal = TerminalCore::new(1, 10, 0).unwrap();
         let _responses = terminal.apply_output("A界e\u{301}".as_bytes());
         let frame = terminal.frame().unwrap();

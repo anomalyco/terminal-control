@@ -49,6 +49,8 @@ describe("isolated terminal sessions", () => {
     await session.resize({ cols: 30, rows: 5 })
 
     const capture = await session.screen.capture({ settleMs: 10, deadlineMs: 2_000 })
+    expect(capture.frame.version).toBe(2)
+    expect(capture.frame.cursor?.style).toBe("block")
     expect(capture.frame.cols).toBe(30)
     expect(capture.text).toMatchInlineSnapshot(`
       "readyhello

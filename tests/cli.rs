@@ -88,13 +88,15 @@ fn wait_for_logs(session: &NamedSession, expected_len: usize) -> Output {
 #[test]
 fn named_session_survives_launcher_process_group_hangup() {
     let session = NamedSession::new("daemon-detach", "detach-test");
+    let ready = session.runtime.join("launcher-ready");
     let mut launcher = Command::new("/bin/sh");
     launcher
         .arg("-c")
-        .arg("\"$1\" start \"$2\" -- /bin/sh -c 'printf READY; sleep 30'; kill -HUP -- -$$")
+        .arg("\"$1\" start \"$2\" -- /bin/sh -c 'printf READY; sleep 30' && : > \"$3\" && sleep 30")
         .arg("termctrl-launcher")
         .arg(session.binary)
         .arg(session.name)
+        .arg(&ready)
         .env("TERMCTRL_RUNTIME_DIR", &session.runtime)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -108,7 +110,20 @@ fn named_session_survives_launcher_process_group_hangup() {
         });
     }
 
-    let status = launcher.status().unwrap();
+    let mut launcher = launcher.spawn().unwrap();
+    let process_group = launcher.id() as libc::pid_t;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            launcher.try_wait().unwrap().is_none(),
+            "launcher exited before starting the named session"
+        );
+        assert!(Instant::now() < deadline, "launcher did not become ready");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(unsafe { libc::killpg(process_group, libc::SIGHUP) }, 0);
+
+    let status = launcher.wait().unwrap();
     assert_eq!(status.signal(), Some(libc::SIGHUP));
 
     let output = session.output(&["status", session.name, "--json"]);

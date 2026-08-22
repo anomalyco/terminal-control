@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, anyhow, bail};
 use terminal_control::{session, shot};
@@ -13,6 +17,10 @@ use super::{mouse_click, mouse_drag, session_input};
 const MAX_TAPE_BYTES: usize = 1024 * 1024;
 const MAX_DURATION_MS: u64 = 10 * 60 * 1000;
 const MAX_DIAGNOSTIC_CHARS: usize = 4000;
+const DEFAULT_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_ACTION_OUTPUT_BYTES: usize = 64 * 1024;
+const ACTION_POLL: Duration = Duration::from_millis(10);
+const ACTION_TERMINATION_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 struct Located<T> {
@@ -36,8 +44,16 @@ struct Tape {
     env: BTreeMap<String, String>,
     opentui_host: bool,
     color: shot::ColorMode,
+    setup: Vec<Located<ActionSpec>>,
     launch: Located<Vec<String>>,
     steps: Vec<Step>,
+    cleanup: Vec<Located<ActionSpec>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ActionSpec {
+    command: Vec<String>,
+    timeout: Duration,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -79,7 +95,7 @@ enum Step {
     },
     Action {
         line: usize,
-        command: Vec<String>,
+        action: ActionSpec,
     },
     Stop {
         line: usize,
@@ -163,8 +179,10 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
     let mut host: Option<Located<bool>> = None;
     let mut color: Option<Located<shot::ColorMode>> = None;
     let mut env = BTreeMap::new();
+    let mut setup = Vec::new();
     let mut launch: Option<Located<Vec<String>>> = None;
     let mut steps = Vec::new();
+    let mut cleanup = Vec::new();
     let mut stopped = false;
     let mut markers = HashSet::new();
 
@@ -299,6 +317,20 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
                     }
                 };
                 set_once(source, &mut color, line, "Color", value)?;
+            }
+            "Setup" => {
+                require_header(source, line, command, before_launch)?;
+                setup.push(Located {
+                    line,
+                    value: parse_action(source, line, &tokens, "Setup")?,
+                });
+            }
+            "Cleanup" => {
+                require_header(source, line, command, before_launch)?;
+                cleanup.push(Located {
+                    line,
+                    value: parse_action(source, line, &tokens, "Cleanup")?,
+                });
             }
             "Launch" => {
                 require_header(source, line, command, before_launch)?;
@@ -452,11 +484,9 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
             }
             "Action" => {
                 require_step(source, line, command, before_launch)?;
-                at_least_args(source, line, &tokens, 1, "Action PROGRAM [ARG ...]")?;
-                validate_argv(source, line, &tokens[1..])?;
                 steps.push(Step::Action {
                     line,
-                    command: tokens[1..].to_vec(),
+                    action: parse_action(source, line, &tokens, "Action")?,
                 });
             }
             "Stop" => {
@@ -509,8 +539,10 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
         env,
         opentui_host: host.is_some_and(|value| value.value),
         color: color.map_or(shot::ColorMode::Auto, |value| value.value),
+        setup,
         launch,
         steps,
+        cleanup,
     })
 }
 
@@ -532,36 +564,84 @@ fn execute(tape: Tape) -> Result<()> {
         inherit_env: true,
         pointer_recording: tape.pointer_recording,
     };
-    session::start(
-        &tape.name,
-        &tape.launch.value,
-        Some(&tape.cwd),
-        tape.record.as_deref(),
-        &options,
-    )
-    .map_err(|error| located_error(&tape.source, tape.launch.line, "Launch failed", error))?;
-
-    let mut owned = OwnedSession::new(tape.name.clone());
-    for step in &tape.steps {
-        let result = execute_step(&tape, step, &mut owned);
-        if let Err(error) = result {
-            let error = located_error(
+    let mut primary = None;
+    let mut additional = Vec::new();
+    for setup in &tape.setup {
+        if let Err(error) = run_action(&tape, &setup.value) {
+            primary = Some(located_error(
                 &tape.source,
-                step.line(),
-                format!("{} failed", step.name()),
+                setup.line,
+                "Setup failed",
                 error,
-            );
-            if let Err(cleanup) = owned.stop() {
-                return Err(error.context(format!(
-                    "also failed to stop owned session {:?}: {cleanup:#}",
-                    tape.name
-                )));
-            }
-            return Err(error);
+            ));
+            break;
         }
     }
-    debug_assert!(!owned.active);
-    Ok(())
+
+    let mut owned = None;
+    if primary.is_none() {
+        match session::start(
+            &tape.name,
+            &tape.launch.value,
+            Some(&tape.cwd),
+            tape.record.as_deref(),
+            &options,
+        ) {
+            Ok(()) => owned = Some(OwnedSession::new(tape.name.clone())),
+            Err(error) => {
+                primary = Some(located_error(
+                    &tape.source,
+                    tape.launch.line,
+                    "Launch failed",
+                    error,
+                ));
+            }
+        }
+    }
+
+    if primary.is_none() {
+        let owned = owned.as_mut().expect("successful launch owns a session");
+        for step in &tape.steps {
+            if let Err(error) = execute_step(&tape, step, owned) {
+                primary = Some(located_error(
+                    &tape.source,
+                    step.line(),
+                    format!("{} failed", step.name()),
+                    error,
+                ));
+                break;
+            }
+        }
+    }
+
+    let mut cleanup_safe = true;
+    if let Some(owned) = &mut owned
+        && owned.active
+        && let Err(error) = owned.stop()
+    {
+        additional.push(anyhow!(
+            "failed to stop owned session {:?}: {error:#}",
+            tape.name
+        ));
+        cleanup_safe = false;
+    }
+    if cleanup_safe {
+        for cleanup in tape.cleanup.iter().rev() {
+            if let Err(error) = run_action(&tape, &cleanup.value) {
+                additional.push(located_error(
+                    &tape.source,
+                    cleanup.line,
+                    "Cleanup failed",
+                    error,
+                ));
+            }
+        }
+    } else if !tape.cleanup.is_empty() {
+        additional.push(anyhow!(
+            "skipped Cleanup because the owned session could not be confirmed stopped"
+        ));
+    }
+    finish_lifecycle(primary, additional)
 }
 
 fn execute_step(tape: &Tape, step: &Step, owned: &mut OwnedSession) -> Result<()> {
@@ -620,35 +700,192 @@ fn execute_step(tape: &Tape, step: &Step, owned: &mut OwnedSession) -> Result<()
         }
         Step::Mark { name, .. } => session::mark(&tape.name, name.clone())?,
         Step::Sleep { duration, .. } => thread::sleep(*duration),
-        Step::Action { command, .. } => run_action(tape, command)?,
+        Step::Action { action, .. } => run_action(tape, action)?,
         Step::Stop { .. } => owned.stop()?,
     }
     Ok(())
 }
 
-fn run_action(tape: &Tape, command: &[String]) -> Result<()> {
-    let output = Command::new(&command[0])
+fn finish_lifecycle(
+    primary: Option<anyhow::Error>,
+    mut additional: Vec<anyhow::Error>,
+) -> Result<()> {
+    let primary = match primary {
+        Some(error) => error,
+        None if additional.is_empty() => return Ok(()),
+        None => additional.remove(0),
+    };
+    if additional.is_empty() {
+        return Err(primary);
+    }
+    let detail = additional
+        .iter()
+        .map(|error| format!("- {error:#}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(anyhow!(
+        "{primary:#}\nadditional lifecycle failures:\n{detail}"
+    ))
+}
+
+fn run_action(tape: &Tape, action: &ActionSpec) -> Result<()> {
+    let command = &action.command;
+    let mut process = Command::new(&command[0]);
+    process
         .args(&command[1..])
         .current_dir(&tape.cwd)
         .envs(&tape.env)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        process.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = process
+        .spawn()
         .with_context(|| format!("run host action argv {command:?}"))?;
-    if output.status.success() {
+    let stdout = child.stdout.take().context("capture host action stdout")?;
+    let stderr = child.stderr.take().context("capture host action stderr")?;
+    let stdout = thread::spawn(move || read_action_output(stdout));
+    let stderr = thread::spawn(move || read_action_output(stderr));
+    let outcome = wait_for_action(&mut child, action.timeout);
+    if outcome.is_err() {
+        let _ = terminate_action_group(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let stdout = stdout
+        .join()
+        .map_err(|_| anyhow!("host action stdout reader panicked"))??;
+    let stderr = stderr
+        .join()
+        .map_err(|_| anyhow!("host action stderr reader panicked"))??;
+    let (status, timed_out) = outcome?;
+    if timed_out {
+        bail!(
+            "host action argv {command:?} timed out after {}; output:\n{}",
+            display_duration(action.timeout),
+            action_output(&stdout, &stderr)
+        );
+    }
+    if status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let detail = if !stderr.trim().is_empty() {
-        diagnostic_text(&stderr)
-    } else if !stdout.trim().is_empty() {
-        diagnostic_text(&stdout)
-    } else {
-        "<no output>".to_owned()
-    };
     bail!(
-        "host action argv {command:?} exited with {}; output:\n{detail}",
-        output.status
+        "host action argv {command:?} exited with {status}; output:\n{}",
+        action_output(&stdout, &stderr)
     )
+}
+
+struct ActionOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_action_output(mut reader: impl Read) -> std::io::Result<ActionOutput> {
+    let mut bytes = Vec::with_capacity(MAX_ACTION_OUTPUT_BYTES);
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_ACTION_OUTPUT_BYTES.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+        truncated |= read > remaining;
+    }
+    Ok(ActionOutput { bytes, truncated })
+}
+
+fn action_output(stdout: &ActionOutput, stderr: &ActionOutput) -> String {
+    let mut sections = Vec::new();
+    for (name, output) in [("stderr", stderr), ("stdout", stdout)] {
+        if output.bytes.is_empty() && !output.truncated {
+            continue;
+        }
+        let mut text = diagnostic_text(&String::from_utf8_lossy(&output.bytes));
+        if output.truncated && !text.ends_with("<truncated>") {
+            text.push_str("\n<truncated>");
+        }
+        sections.push(format!("{name}:\n{text}"));
+    }
+    if sections.is_empty() {
+        "<no output>".to_owned()
+    } else {
+        sections.join("\n")
+    }
+}
+
+fn wait_for_action(child: &mut Child, timeout: Duration) -> Result<(ExitStatus, bool)> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("wait for host action")? {
+            terminate_action_group(child.id())?;
+            return Ok((status, false));
+        }
+        if Instant::now() >= deadline {
+            terminate_action_group(child.id())?;
+            let status = child.wait().context("reap timed-out host action")?;
+            return Ok((status, true));
+        }
+        thread::sleep(ACTION_POLL);
+    }
+}
+
+#[cfg(unix)]
+fn terminate_action_group(id: u32) -> Result<()> {
+    let group = id as libc::pid_t;
+    if !process_group_exists(group)? {
+        return Ok(());
+    }
+    signal_process_group(group, libc::SIGTERM)?;
+    let deadline = Instant::now() + ACTION_TERMINATION_GRACE;
+    while Instant::now() < deadline {
+        if !process_group_exists(group)? {
+            return Ok(());
+        }
+        thread::sleep(ACTION_POLL);
+    }
+    signal_process_group(group, libc::SIGKILL)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_group_exists(group: libc::pid_t) -> Result<bool> {
+    if unsafe { libc::killpg(group, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(error).context("inspect host action process group")
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(group: libc::pid_t, signal: libc::c_int) -> Result<()> {
+    if unsafe { libc::killpg(group, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error).context("terminate host action process group")
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_action_group(_id: u32) -> Result<()> {
+    bail!("tape actions require Unix process-group control")
 }
 
 struct OwnedSession {
@@ -793,6 +1030,33 @@ fn paced_values(
         return Ok((tokens[1..tokens.len() - 2].to_vec(), pace));
     }
     Ok((tokens[1..].to_vec(), Duration::ZERO))
+}
+
+fn parse_action(source: &Path, line: usize, tokens: &[String], name: &str) -> Result<ActionSpec> {
+    at_least_args(
+        source,
+        line,
+        tokens,
+        1,
+        &format!("{name} PROGRAM [ARG ...] [Timeout DURATION]"),
+    )?;
+    if tokens.last().is_some_and(|token| token == "Timeout") {
+        return line_error(
+            source,
+            line,
+            format!("usage: {name} PROGRAM [ARG ...] [Timeout DURATION]"),
+        );
+    }
+    let (command, timeout) = if tokens.len() >= 4 && tokens[tokens.len() - 2] == "Timeout" {
+        (
+            tokens[1..tokens.len() - 2].to_vec(),
+            duration(source, line, &tokens[tokens.len() - 1], false)?,
+        )
+    } else {
+        (tokens[1..].to_vec(), DEFAULT_ACTION_TIMEOUT)
+    };
+    validate_argv(source, line, &command)?;
+    Ok(ActionSpec { command, timeout })
 }
 
 fn duration(source: &Path, line: usize, value: &str, allow_zero: bool) -> Result<Duration> {
@@ -991,6 +1255,8 @@ Env DEMO_VALUE "quoted # value\nnext"
 Record "artifacts/demo.termctrl"
 Host opentui
 Color always
+Setup "/usr/bin/touch" "fixture ready" Timeout 2s
+Cleanup "/usr/bin/rm" "-f" "fixture ready"
 Launch "demo-app" "--mode" 'literal # argument'
 
 Wait "Ready #1" Timeout 2s
@@ -1000,7 +1266,7 @@ Click 12 4
 Drag 12 4 30 4 Pace 0ms Steps 6
 Mark "after-input"
 Sleep 250ms
-Action "/usr/bin/touch" "fixture ready"
+Action "/usr/bin/touch" "fixture ready" Timeout 3s
 Stop
 "#;
 
@@ -1019,6 +1285,10 @@ Stop
             tape.launch.value,
             ["demo-app", "--mode", "literal # argument"]
         );
+        assert_eq!(tape.setup.len(), 1);
+        assert_eq!(tape.setup[0].value.timeout, Duration::from_secs(2));
+        assert_eq!(tape.cleanup.len(), 1);
+        assert_eq!(tape.cleanup[0].value.timeout, DEFAULT_ACTION_TIMEOUT);
         assert_eq!(tape.steps.len(), 9);
         assert!(matches!(
             &tape.steps[1],
@@ -1029,6 +1299,10 @@ Stop
             &tape.steps[4],
             Step::Drag { steps, pace, .. }
                 if *steps == 6 && pace.is_zero()
+        ));
+        assert!(matches!(
+            &tape.steps[7],
+            Step::Action { action, .. } if action.timeout == Duration::from_secs(3)
         ));
     }
 
@@ -1075,6 +1349,13 @@ Stop
             parse(
                 Path::new("demo.tape"),
                 "Session demo\nViewport 80 24\nLaunch app\nStop\nSleep 1s\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                Path::new("demo.tape"),
+                "Session demo\nViewport 80 24\nSetup touch Timeout nope\nLaunch app\nStop\n"
             )
             .is_err()
         );

@@ -339,6 +339,8 @@ fn tape_play_validates_before_launch_or_action_side_effects() {
         r#"Session tape-validate-test
 Viewport 80 24
 Cwd "."
+Setup "/usr/bin/touch" "setup-ran"
+Cleanup "/usr/bin/touch" "cleanup-ran"
 Launch "/usr/bin/touch" "launched"
 Action "/usr/bin/touch" "acted"
 Stop extra
@@ -348,7 +350,9 @@ Stop extra
 
     let output = session.output(&["play", tape.to_str().unwrap()]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid.tape:6: usage: Stop"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid.tape:8: usage: Stop"));
+    assert!(!session.runtime.join("setup-ran").exists());
+    assert!(!session.runtime.join("cleanup-ran").exists());
     assert!(!session.runtime.join("launched").exists());
     assert!(!session.runtime.join("acted").exists());
 }
@@ -374,5 +378,115 @@ Stop
     assert!(stderr.contains("timeout.tape:4: Wait failed"), "{stderr}");
     assert!(stderr.contains("last visible screen"), "{stderr}");
     assert!(stderr.contains("ACTUAL"), "{stderr}");
+    assert!(!session.output(&["status", session.name]).status.success());
+}
+
+#[test]
+fn tape_setup_and_cleanup_make_repeat_runs_begin_clean() {
+    let session = NamedSession::new("tape-repeat", "tape-repeat-test");
+    let tape = session.runtime.join("repeat.tape");
+    let fixture = session.runtime.join("repeat.fixture");
+    fs::write(
+        &tape,
+        r#"Session tape-repeat-test
+Viewport 80 24
+Cwd "."
+Setup "/usr/bin/test" "!" "-e" "repeat.fixture"
+Setup "/usr/bin/touch" "repeat.fixture"
+Cleanup "/usr/bin/rm" "-f" "repeat.fixture"
+Launch "/bin/sh" "-c" "test -e repeat.fixture && printf READY; sleep 30"
+Wait READY Timeout 2s
+Stop
+"#,
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        assert_success(&session.output(&["play", tape.to_str().unwrap()]));
+        assert!(!fixture.exists(), "cleanup must restore the fixture");
+    }
+}
+
+#[test]
+fn tape_failure_stops_session_then_cleans_up_without_masking_primary_error() {
+    let session = NamedSession::new("tape-cleanup", "tape-cleanup-test");
+    let tape = session.runtime.join("cleanup.tape");
+    let fixture = session.runtime.join("failure.fixture");
+    fs::write(
+        &tape,
+        r#"Session tape-cleanup-test
+Viewport 80 24
+Cwd "."
+Setup "/usr/bin/touch" "failure.fixture"
+Cleanup "/bin/sh" "-c" "alive=0; kill -0 \"$(cat app.pid)\" 2>/dev/null && alive=1; rm -f failure.fixture app.pid; if [ \"$alive\" -eq 1 ]; then echo session-alive >&2; exit 8; fi; echo cleanup-deliberate >&2; exit 7"
+Launch "/bin/sh" "-c" "echo $$ > app.pid; printf ACTUAL; sleep 30"
+Wait MISSING Timeout 20ms
+Stop
+"#,
+    )
+    .unwrap();
+
+    let output = session.output(&["play", tape.to_str().unwrap()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let primary = stderr.find("cleanup.tape:7: Wait failed").unwrap();
+    let additional = stderr.find("additional lifecycle failures").unwrap();
+    assert!(primary < additional, "{stderr}");
+    assert!(
+        stderr.contains("cleanup.tape:5: Cleanup failed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("cleanup-deliberate"), "{stderr}");
+    assert!(!stderr.contains("stderr:\nsession-alive"), "{stderr}");
+    assert!(!fixture.exists(), "cleanup must restore the fixture");
+    assert!(!session.output(&["status", session.name]).status.success());
+}
+
+#[test]
+fn tape_action_timeout_kills_process_group_and_bounds_noisy_diagnostics() {
+    let session = NamedSession::new("tape-action-timeout", "tape-action-timeout-test");
+    let tape = session.runtime.join("action-timeout.tape");
+    let child_pid = session.runtime.join("action-child.pid");
+    fs::write(
+        &tape,
+        r#"Session tape-action-timeout-test
+Viewport 80 24
+Cwd "."
+Launch "/bin/sh" "-c" "printf READY; sleep 30"
+Wait READY Timeout 2s
+Action "/bin/sh" "-c" "sleep 30 & echo $! > action-child.pid; exec /usr/bin/yes noisy" Timeout 50ms
+Stop
+"#,
+    )
+    .unwrap();
+
+    let output = session.output(&["play", tape.to_str().unwrap()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Action failed"), "{stderr}");
+    assert!(stderr.contains("timed out after 50ms"), "{stderr}");
+    assert!(stderr.contains("<truncated>"), "{stderr}");
+    assert!(
+        stderr.len() < 10_000,
+        "diagnostic was not bounded: {}",
+        stderr.len()
+    );
+    let pid = fs::read_to_string(child_pid)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let result = unsafe { libc::kill(pid, 0) };
+        if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "action descendant {pid} survived timeout"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     assert!(!session.output(&["status", session.name]).status.success());
 }

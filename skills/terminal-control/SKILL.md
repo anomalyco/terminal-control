@@ -37,10 +37,12 @@ termctrl play demos/app.tape
 
 `play` validates the complete source before launching its named session. Tape steps reuse the normal
 `wait`, paced text/key input, click, drag, marker, recording, and stop behavior. Prefer `Wait` for
-state transitions and use `Sleep` only for a deliberate presentation hold. An `Action` is an explicit
-argv-based host command for controlled fixture changes; it does not invoke a shell, but the tape is
-still executable input and must be trusted. Relative paths resolve from the tape directory. A failed
-play stops the session it owns. The `.tape` authoring source is distinct from any private `.termctrl`
+state transitions and use `Sleep` only for a deliberate presentation hold. `Setup`, `Action`, and
+`Cleanup` are explicit argv-based host commands for controlled fixture changes; they do not
+implicitly invoke a shell, default to a 30-second timeout, and retain bounded diagnostics. Setup runs
+before Launch and reverse-order cleanup runs only after the owned session is confirmed stopped,
+including safe failure paths. Relative paths resolve from the tape directory. The `.tape` authoring
+source is distinct from any private `.termctrl`
 recording it creates; inspect that recording and run `video --edit` as a separate phase.
 Add `Pointer on` only when the demo needs structured click and drag overlays. It requires `Record`,
 writes opt-in recording version 2, and is rendered only with `--pointer`; ordinary recordings remain

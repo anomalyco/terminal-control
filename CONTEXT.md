@@ -64,10 +64,12 @@ Agents inspect marker names with `termctrl markers` and inspect exact recording 
 
 A UTF-8, line-oriented `.tape` source program for a deterministic demo. The complete tape is parsed
 and validated before its named session is launched. Header directives fix viewport, launch argv,
-working directory, environment, host profile, recording path, and resource limits; ordered steps use
-visible-text waits, paced text or key input, click and drag controls, markers, presentation holds,
-argv-based host actions, and a required clean stop. Relative paths resolve from the tape directory,
-and failures identify the source line and clean up the session owned by that play invocation.
+working directory, environment, host profile, recording path, and resource limits. Repeatable setup
+actions run before launch; ordered steps use visible-text waits, paced text or key input, click and
+drag controls, markers, presentation holds, bounded argv-based host actions, and a required clean
+stop. Reverse-order cleanup runs only after the owned session is confirmed stopped, on both success
+and safe failure paths. Relative paths resolve from the tape directory, failures identify the source
+line, and cleanup failures follow rather than mask the primary failure.
 
 A tape is executable authoring input and should be reviewed before use. It is not a recording:
 `.termctrl` remains the timestamped observed timeline, and `video --edit` remains a separate explicit

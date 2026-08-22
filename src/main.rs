@@ -80,11 +80,14 @@ Play validates an entire UTF-8 .tape file, then runs its deterministic named-ses
 files are line-oriented source programs; they are distinct from the private .termctrl recording
 timelines they may produce. Relative Cwd and Record paths resolve from the tape's directory.
 
-Use Wait for application readiness and Sleep only for deliberate presentation holds. Action runs
-an explicit argv vector on the host with the tape cwd and environment; it never invokes a shell.
+Use Wait for application readiness and Sleep only for deliberate presentation holds. Setup, Action,
+and Cleanup run explicit argv vectors with a finite 30-second default timeout and bounded output;
+they never implicitly invoke a shell. Setup runs before Launch. Cleanup runs in reverse declaration
+order after the owned session stops, including failure paths where session shutdown is confirmed.
 `Pointer on` requires Record and captures structured click and drag events for optional rendering.
-Any failed step reports its tape line and stops the session owned by this play invocation. Video
-rendering remains a separate `termctrl video RECORDING --edit PLAN` phase.
+Add `Timeout DURATION` to any host action when the default is unsuitable. Cleanup errors are reported
+after the primary playback error. Video rendering remains a separate
+`termctrl video RECORDING --edit PLAN` phase.
 
 Example:
   termctrl play demos/opencode.tape";

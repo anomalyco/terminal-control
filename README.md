@@ -160,6 +160,8 @@ Cwd ".."
 Env TTT_FIXTURE "demo game"
 Record "captures/ttt.termctrl"
 Pointer on
+Setup "/usr/bin/cp" "fixtures/empty.json" "fixtures/game.json"
+Cleanup "/usr/bin/rm" "-f" "fixtures/game.json"
 Launch "cargo" "run" "--release" "--bin" "ttt"
 
 Wait "Choose a square" Timeout 10s
@@ -179,10 +181,13 @@ termctrl video demos/captures/ttt.termctrl --edit demos/captures/ttt-edit.json \
 ```
 
 A `.tape` file is readable authoring source, not a `.termctrl` recording. Relative `Cwd` and `Record`
-paths use the tape directory; `Action` uses the configured cwd. Prefer state-aware `Wait` steps;
-reserve `Sleep` for a deliberate presentation hold. `Action` runs an explicit argv vector without a
-shell for controlled fixture changes, so play only tapes you trust. A failed step reports its file and
-line, includes the last visible screen for wait timeouts, and stops the session it launched. Video
+paths use the tape directory; host actions use the configured cwd and environment. Prefer state-aware
+`Wait` steps; reserve `Sleep` for a deliberate presentation hold. `Setup`, `Action`, and `Cleanup`
+run explicit argv vectors without implicit shell evaluation. They default to a finite 30-second
+timeout, accept a trailing `Timeout DURATION`, and retain bounded diagnostics. Setup runs before
+Launch; cleanup runs in reverse order after session stop on success or safe failure paths. Cleanup
+errors do not mask the primary failure. A failed step reports its file and line, and wait timeouts
+include the last visible screen. Video
 selection and editing remain an explicit phase after the recording exists. See
 [docs/tape-scripting.md](docs/tape-scripting.md) for the complete format.
 

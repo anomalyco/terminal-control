@@ -50,10 +50,11 @@ Steps follow `Launch` in order:
 
 | Step | Meaning |
 | --- | --- |
-| `Wait TEXT [Timeout DURATION]` | Wait for visible text; timeout defaults to five seconds. |
+| `Wait TEXT [Match MODE] [Timeout DURATION]` | Wait for visible text; MODE is `substring` or `line`, and defaults to substring. Timeout defaults to five seconds. |
 | `Type TEXT [Pace DURATION]` | Send text, optionally one Unicode scalar at a time. |
 | `Key KEY [KEY ...] [Pace DURATION]` | Send supported named keys in order. |
 | `Click X Y` | Send a primary click at a zero-based application cell. |
+| `RightClick X Y` | Send a secondary click at a zero-based application cell. |
 | `Move X Y [Steps N] [Pace DURATION]` | Move the unpressed pointer; defaults to 10 points at 8 ms. |
 | `Drag X1 Y1 X2 Y2 [Steps N] [Pace DURATION]` | Send primary drag events; defaults to 10 steps at 8 ms. |
 | `Mark NAME` | Add a unique recording marker; requires `Record`. |
@@ -61,15 +62,23 @@ Steps follow `Launch` in order:
 | `Action PROGRAM [ARG ...] [Timeout DURATION]` | Run an in-session host action using exact argv. |
 | `Stop` | Required final command; stop the owned named session cleanly. |
 
-`Type` and `Key` accept the same named-key vocabulary as `termctrl send`. `Click`, `Move`, and `Drag`
+`Type` and `Key` accept the same input parser as `termctrl send`, including modifier chords such as
+`shift+enter`. `Click`, `RightClick`, `Move`, and `Drag`
 reuse the normal SGR mouse implementation, so the application must enable the corresponding mouse
 tracking. Coordinates are application-cell coordinates, not screen pixels. The first `Move`
 establishes the tape pointer position with one honest no-button motion event; it does not invent a
 path from an unknown origin. Later Moves interpolate `Steps` events from the authoritative position,
-including the destination. Click sets the position to its target and Drag sets it to its endpoint.
+including the destination. Click and RightClick set the position to their target and Drag sets it to
+its endpoint.
 
-With `Pointer on`, click, move, and drag also produce structured press, move, and release events in an
-opt-in version 2 recording. Render them with `save --recording ... --pointer` or `video --pointer`.
+`Wait` searches for a substring by default. Add `Match line` for equality with one complete visible
+terminal row after trailing cell padding is removed. This prevents `Wait "history entry 1" Match line`
+from succeeding on `history entry 10`. `Match substring` is an explicit spelling of the default;
+`Match` and `Timeout` modifiers may appear in either order.
+
+With `Pointer on`, clicks, move, and drag also produce structured press, move, and release events in
+an opt-in version 2 recording. RightClick events include `button: "secondary"`; the optional field is
+omitted for primary events. Render them with `save --recording ... --pointer` or `video --pointer`.
 Without that directive, tape recordings remain version 1 and existing Click/Drag behavior is
 unchanged; Move still sends its explicit no-button input to the application. `Pointer on` controls
 capture only. Bare `--pointer` uses the fading renderer, while `--pointer=persistent` keeps the most
@@ -104,15 +113,20 @@ Wait "Choose a square" Timeout 10s
 Move 8 8
 Move 12 8 Steps 8 Pace 16ms
 Click 12 8
+RightClick 20 8
 Wait "Your turn"
 Type "middle" Pace 35ms
-Key enter
+Key shift+enter
 Action "/usr/bin/touch" "fixtures/opponent-ready" Timeout 2s
 Wait "You won"
 Mark result
 Sleep 750ms
 Stop
 ```
+
+On success, `termctrl play FILE.tape` prints the canonical tape path and recording path, if any.
+Use `--json` for the stable fields `status`, `tape`, `session`, and `recording`, or `--quiet` when a
+caller requires empty stdout.
 
 Host actions intentionally support external fixture mutation without shell parsing. They can still
 run arbitrary executables, so treat tapes as executable project code. If shell behavior is genuinely the

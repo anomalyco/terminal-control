@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::frame::Frame;
-use crate::recording::{self, InputOrigin, PointerPhase};
+use crate::recording::{self, InputOrigin, PointerButton, PointerPhase};
 use crate::semantic;
 use crate::shot::{self, Host, Options, Shot, respond_to_output};
 use crate::terminal_core::{InputModes, SCROLLBACK_ROWS, TerminalCore};
@@ -30,7 +30,8 @@ const LAYOUT_COMMAND_PROTOCOL_VERSION: u8 = 4;
 const WORKSPACE_CONTROL_PROTOCOL_VERSION: u8 = 5;
 const SEMANTIC_PROTOCOL_VERSION: u8 = 6;
 const POINTER_PROTOCOL_VERSION: u8 = 7;
-const CURRENT_PROTOCOL_VERSION: u8 = POINTER_PROTOCOL_VERSION;
+const POINTER_BUTTON_PROTOCOL_VERSION: u8 = 8;
+const CURRENT_PROTOCOL_VERSION: u8 = POINTER_BUTTON_PROTOCOL_VERSION;
 const ATTACHED_TERMINAL_ERROR: &str = "workspace already has an attached terminal";
 
 fn attachment_rejection(name: &str, error: &str) -> anyhow::Error {
@@ -176,6 +177,12 @@ pub struct MouseInput {
     pub x: u16,
     pub y: u16,
     pub phase: PointerPhase,
+    #[serde(default, skip_serializing_if = "is_primary_pointer_button")]
+    pub button: PointerButton,
+}
+
+fn is_primary_pointer_button(button: &PointerButton) -> bool {
+    *button == PointerButton::Primary
 }
 
 /// One named daemon session discovered in the local runtime directory.
@@ -458,7 +465,7 @@ impl Session {
                 .recording
                 .as_mut()
                 .context("session has no active pointer recording")?;
-            recording.pointer(event.x, event.y, event.phase)?;
+            recording.pointer_with_button(event.x, event.y, event.phase, event.button)?;
             let at_ms = self.started.elapsed().as_millis() as u64;
             self.pointer = Some(recording::PointerState::apply(
                 self.pointer,
@@ -1125,6 +1132,7 @@ enum ProtocolCapability {
     WorkspaceControl,
     Semantic,
     Pointer,
+    PointerButton,
 }
 
 impl ProtocolCapability {
@@ -1137,6 +1145,7 @@ impl ProtocolCapability {
             Self::WorkspaceControl => WORKSPACE_CONTROL_PROTOCOL_VERSION,
             Self::Semantic => SEMANTIC_PROTOCOL_VERSION,
             Self::Pointer => POINTER_PROTOCOL_VERSION,
+            Self::PointerButton => POINTER_BUTTON_PROTOCOL_VERSION,
         }
     }
 
@@ -1162,6 +1171,9 @@ impl ProtocolCapability {
             }
             Self::Pointer => {
                 "running session predates structured pointer recording; restart it with the current termctrl"
+            }
+            Self::PointerButton => {
+                "running session predates structured pointer button recording; restart it with the current termctrl"
             }
         }
     }
@@ -1214,6 +1226,13 @@ impl Request {
             | Self::ClosePane { .. } => ProtocolCapability::Pane,
             Self::Attach { .. } | Self::ResizeAttachment { .. } => ProtocolCapability::Attachment,
             Self::SemanticSnapshot { .. } => ProtocolCapability::Semantic,
+            Self::Mouse { input, .. }
+                if input
+                    .iter()
+                    .any(|event| event.button != PointerButton::Primary) =>
+            {
+                ProtocolCapability::PointerButton
+            }
             Self::Mouse { .. } => ProtocolCapability::Pointer,
             Self::Ping
             | Self::Status
@@ -1918,6 +1937,13 @@ pub fn infer_name(command: &[String]) -> Result<String> {
 fn request(name: &str, operation: Request) -> Result<Response> {
     validate_name(name)?;
     let requirements = operation.requirements();
+    if requirements.capability == Some(ProtocolCapability::PointerButton) {
+        let response = implementation::request(socket_path(name)?, &Request::Ping)?;
+        ProtocolCapability::PointerButton.require(&response)?;
+        if let Some(error) = response.error {
+            bail!(error);
+        }
+    }
     let response = if requirements.hold_name_lock {
         implementation::request_layout_command(name, &operation)?
     } else {
@@ -3883,9 +3909,16 @@ mod tests {
                 .to_string()
                 .contains("predates structured pointer recording")
         );
+        assert!(
+            ProtocolCapability::PointerButton
+                .require(&response)
+                .unwrap_err()
+                .to_string()
+                .contains("predates structured pointer button recording")
+        );
         assert_eq!(
             Response::default().protocol_version,
-            POINTER_PROTOCOL_VERSION
+            POINTER_BUTTON_PROTOCOL_VERSION
         );
     }
 
@@ -3948,6 +3981,21 @@ mod tests {
                     pane: None,
                 },
                 Some(ProtocolCapability::Pointer),
+                false,
+            ),
+            (
+                Request::Mouse {
+                    input: vec![MouseInput {
+                        bytes: b"secondary".to_vec(),
+                        x: 1,
+                        y: 2,
+                        phase: PointerPhase::Press,
+                        button: PointerButton::Secondary,
+                    }],
+                    pace_ms: 0,
+                    pane: None,
+                },
+                Some(ProtocolCapability::PointerButton),
                 false,
             ),
             (Request::Status, None, false),

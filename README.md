@@ -114,7 +114,7 @@ termctrl save demo --format png --out captures/help.png
 termctrl stop demo
 ```
 
-- `send` accepts `text:<value>`, named keys (`enter`, `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, `page-down`), and `ctrl-a` through `ctrl-z`. Pipe exact bytes with `--stdin`.
+- `send` accepts `text:<value>`, named keys (`enter`, `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, `page-down`), modifier chords including `shift+enter`, and `ctrl-a` through `ctrl-z`. Pipe exact bytes with `--stdin`.
 - `click NAME X Y` sends a primary-button press and release. `drag NAME FROM_X FROM_Y TO_X TO_Y`
   sends a primary press, interpolated held-button motion, and release; `--steps` controls the motion
   event count and `--pace-ms` controls their interval. Coordinates are zero-based application cells:
@@ -168,9 +168,10 @@ Wait "Choose a square" Timeout 10s
 Move 8 8
 Move 12 8 Steps 8 Pace 16ms
 Click 12 8
+RightClick 20 8
 Wait "Your turn"
 Type "middle" Pace 35ms
-Key enter
+Key shift+enter
 Mark result
 Sleep 750ms
 Stop
@@ -204,7 +205,17 @@ first structured pointer event. Capture policy (`Pointer on`) and render persist
 
 Tape `Move X Y [Steps N] [Pace DURATION]` emits unpressed SGR motion. The first Move establishes the
 authoritative position with one event; later Moves interpolate from it, defaulting to 10 points at
-8 ms. Click and Drag update that position so subsequent motion remains continuous.
+8 ms. Click, RightClick, and Drag update that position so subsequent motion remains continuous.
+`RightClick X Y` emits a secondary SGR press and release. With `Pointer on`, its version 2 pointer
+events add `button: "secondary"`; primary events retain their original representation and default
+recordings remain version 1.
+
+`Wait TEXT` keeps substring matching for compatibility. Add `Match line` when the visible text must
+equal a complete trimmed terminal row, so `Wait "history entry 1" Match line` does not match
+`history entry 10`. `Timeout DURATION` and `Match line` may appear in either order.
+
+Successful `play` prints the canonical tape path and any recording path. Use `--json` for a stable
+receipt containing `status`, `tape`, `session`, and `recording`, or `--quiet` to suppress stdout.
 
 ## Semantic UI Snapshots
 

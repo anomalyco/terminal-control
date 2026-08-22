@@ -174,6 +174,24 @@ fn click_and_drag_send_exact_sgr_mouse_events() {
 }
 
 #[test]
+fn live_send_accepts_shift_enter_modifier_chord() {
+    let session = NamedSession::new("modifier-input", "modifier-input-test");
+    assert_success(&session.output(&[
+        "start",
+        session.name,
+        "--",
+        "/bin/sh",
+        "-c",
+        "stty raw -echo; printf READY; od -An -tx1 -v -N 7",
+    ]));
+    assert_success(&session.output(&["wait", session.name, "READY"]));
+    assert_success(&session.output(&["send", session.name, "shift+enter"]));
+
+    let output = wait_for_logs(&session, 7);
+    assert_eq!(parsed_hex(&output.stdout), b"\x1b[13;2u");
+}
+
+#[test]
 fn pointer_enabled_session_records_structured_events_and_renders_live_and_replay() {
     let session = NamedSession::new("pointer-recording", "pointer-recording-test");
     let recording = session.runtime.join("pointer.termctrl");
@@ -349,10 +367,11 @@ Color never
 Launch "/bin/sh" "-c" "stty raw -echo; printf READY:%s:%s \"$DEMO_ENV\" \"$PWD\"; (while [ ! -f action-ready ]; do sleep 0.01; done; printf FIXTURE) & od -An -tx1 -v"
 Wait "READY:quoted # value" Timeout 2s
 Type "hello" Pace 1ms
-Key enter
+Key enter shift+enter
 Move 5 2 Steps 4 Pace 0ms
 Move 9 2 Steps 2 Pace 0ms
 Click 12 4
+RightClick 10 4
 Move 14 4 Steps 2 Pace 0ms
 Drag 0 0 2 0 Steps 2 Pace 0ms
 Move 4 0 Steps 2 Pace 0ms
@@ -367,6 +386,15 @@ Stop
 
     let output = session.output(&["play", tape.to_str().unwrap()]);
     assert_success(&output);
+    let receipt = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        receipt.contains(&format!("played {}", tape.display())),
+        "{receipt}"
+    );
+    assert!(
+        receipt.contains(&format!("recording {}", recording.display())),
+        "{receipt}"
+    );
     assert!(session.runtime.join("action-ready").exists());
     assert!(recording.exists());
     assert!(!session.output(&["status", session.name]).status.success());
@@ -393,25 +421,28 @@ Stop
                 entry["x"].as_u64().unwrap(),
                 entry["y"].as_u64().unwrap(),
                 entry["phase"].as_str().unwrap(),
+                entry["button"].as_str(),
             )
         })
         .collect::<Vec<_>>();
     assert_eq!(
         pointer_events,
         [
-            (5, 2, "move"),
-            (7, 2, "move"),
-            (9, 2, "move"),
-            (12, 4, "press"),
-            (12, 4, "release"),
-            (13, 4, "move"),
-            (14, 4, "move"),
-            (0, 0, "press"),
-            (1, 0, "move"),
-            (2, 0, "move"),
-            (2, 0, "release"),
-            (3, 0, "move"),
-            (4, 0, "move"),
+            (5, 2, "move", None),
+            (7, 2, "move", None),
+            (9, 2, "move", None),
+            (12, 4, "press", None),
+            (12, 4, "release", None),
+            (10, 4, "press", Some("secondary")),
+            (10, 4, "release", Some("secondary")),
+            (12, 4, "move", None),
+            (14, 4, "move", None),
+            (0, 0, "press", None),
+            (1, 0, "move", None),
+            (2, 0, "move", None),
+            (2, 0, "release", None),
+            (3, 0, "move", None),
+            (4, 0, "move", None),
         ]
     );
     let client_input: Vec<u8> = entries
@@ -428,13 +459,15 @@ Stop
     assert_eq!(
         client_input,
         [
-            b"hello\r".as_slice(),
+            b"hello\r\x1b[13;2u".as_slice(),
             b"\x1b[<35;6;3M".as_slice(),
             b"\x1b[<35;8;3M".as_slice(),
             b"\x1b[<35;10;3M".as_slice(),
             b"\x1b[<0;13;5M".as_slice(),
             b"\x1b[<0;13;5m".as_slice(),
-            b"\x1b[<35;14;5M".as_slice(),
+            b"\x1b[<2;11;5M".as_slice(),
+            b"\x1b[<2;11;5m".as_slice(),
+            b"\x1b[<35;13;5M".as_slice(),
             b"\x1b[<35;15;5M".as_slice(),
             b"\x1b[<0;1;1M".as_slice(),
             b"\x1b[<32;2;1M".as_slice(),
@@ -452,10 +485,13 @@ fn tape_move_sends_exact_unpressed_motion_without_pointer_recording() {
     let session = NamedSession::new("tape-move", "tape-move-test");
     let tape = session.runtime.join("move.tape");
     let observed = session.runtime.join("observed.hex");
+    let recording = session.runtime.join("move.termctrl");
     let expected = [
         b"\x1b[<35;2;2M".as_slice(),
         b"\x1b[<35;4;2M".as_slice(),
         b"\x1b[<35;6;2M".as_slice(),
+        b"\x1b[<2;7;2M".as_slice(),
+        b"\x1b[<2;7;2m".as_slice(),
         b"\x1b[<0;3;4M".as_slice(),
         b"\x1b[<0;3;4m".as_slice(),
         b"\x1b[<35;4;4M".as_slice(),
@@ -472,10 +508,12 @@ fn tape_move_sends_exact_unpressed_motion_without_pointer_recording() {
         r#"Session tape-move-test
 Viewport 80 24
 Cwd "."
+Record "move.termctrl"
 Launch "/bin/sh" "-c" "stty raw -echo; printf READY; od -An -tx1 -v -N {} > observed.hex; printf DONE; sleep 30"
 Wait READY Timeout 2s
 Move 1 1 Steps 9 Pace 0ms
 Move 5 1 Steps 2 Pace 0ms
+RightClick 6 1
 Click 2 3
 Move 4 3 Steps 2 Pace 0ms
 Drag 0 0 2 0 Steps 2 Pace 0ms
@@ -489,6 +527,68 @@ Stop
 
     assert_success(&session.output(&["play", tape.to_str().unwrap()]));
     assert_eq!(parsed_hex(&fs::read(observed).unwrap()), expected);
+    let entries = fs::read_to_string(recording).unwrap();
+    assert!(entries.lines().next().unwrap().contains("\"version\":1"));
+    assert!(!entries.contains("\"type\":\"pointer\""));
+}
+
+#[test]
+fn tape_wait_line_match_disambiguates_substrings_and_json_receipt_is_stable() {
+    let substring = NamedSession::new("tape-wait-substring", "tape-wait-substring-test");
+    let substring_tape = substring.runtime.join("substring.tape");
+    fs::write(
+        &substring_tape,
+        r#"Session tape-wait-substring-test
+Viewport 80 8
+Launch "/bin/sh" "-c" "printf 'history entry 10\r\n'; sleep 30"
+Wait "history entry 1" Timeout 200ms
+Stop
+"#,
+    )
+    .unwrap();
+    let output = substring.output(&["play", substring_tape.to_str().unwrap(), "--quiet"]);
+    assert_success(&output);
+    assert!(output.stdout.is_empty());
+
+    let line = NamedSession::new("tape-wait-line", "tape-wait-line-test");
+    let line_tape = line.runtime.join("line.tape");
+    fs::write(
+        &line_tape,
+        r#"Session tape-wait-line-test
+Viewport 80 8
+Launch "/bin/sh" "-c" "printf 'history entry 10\r\n'; sleep 30"
+Wait "history entry 1" Match line Timeout 30ms
+Stop
+"#,
+    )
+    .unwrap();
+    let output = line.output(&["play", line_tape.to_str().unwrap()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("timed out waiting for a visible line exactly matching"),
+        "{stderr}"
+    );
+
+    let exact = NamedSession::new("tape-wait-exact", "tape-wait-exact-test");
+    let exact_tape = exact.runtime.join("exact.tape");
+    fs::write(
+        &exact_tape,
+        r#"Session tape-wait-exact-test
+Viewport 80 8
+Launch "/bin/sh" "-c" "printf 'history entry 10\r\nhistory entry 1\r\n'; sleep 30"
+Wait "history entry 1" Match line Timeout 200ms
+Stop
+"#,
+    )
+    .unwrap();
+    let output = exact.output(&["play", exact_tape.to_str().unwrap(), "--json"]);
+    assert_success(&output);
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["status"], "ok");
+    assert_eq!(receipt["session"], "tape-wait-exact-test");
+    assert_eq!(receipt["tape"], exact_tape.to_str().unwrap());
+    assert!(receipt["recording"].is_null());
 }
 
 #[test]

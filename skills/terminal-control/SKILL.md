@@ -48,7 +48,10 @@ Add `Pointer on` only when the demo needs structured click, move, and drag overl
 writes opt-in recording version 2, and is rendered only with `--pointer`; ordinary recordings remain
 version 1. Pointer capture currently applies to direct named sessions, not composed workspaces.
 Use `Move X Y [Steps N] [Pace DURATION]` for smooth unpressed travel. The first Move establishes the
-position; later Moves interpolate, and Click/Drag update the same position. Bare `--pointer` fades as
+position; later Moves interpolate, and Click/RightClick/Drag update the same position. `RightClick X Y`
+emits a secondary click and retains button evidence when `Pointer on` is enabled. `Key` accepts the
+same input spellings as live `send`, including `shift+enter`. Use `Wait TEXT Match line` when a complete
+visible row must match rather than a substring. Bare `--pointer` fades as
 before. Use `--pointer=persistent` when a long presentation hold should retain the latest position;
 click feedback remains brief and no pointer appears before the first event. Do not confuse this
 render choice with the tape's `Pointer on` capture policy.
@@ -114,6 +117,7 @@ output is a rendered snapshot; pane-targeted ANSI is the original pane stream.
 - Use `--record-pointer` plus `--pointer` only when graphical mouse causality is part of the evidence.
 - Use persistent pointer rendering only when the latest target must remain legible through idle holds.
 - Use `play` when a repeatable interaction belongs in a reviewed `.tape` source file.
+- Use `play --json` when a caller needs stable success fields, or `--quiet` when it needs no stdout.
 
 Do not treat logs as the visible state of an alternate-screen TUI.
 

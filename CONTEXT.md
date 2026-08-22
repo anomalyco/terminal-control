@@ -23,7 +23,8 @@ Direct named sessions may explicitly enable structured pointer recording. That p
 version 2 press, move, and release events and exposes the current pointer state to opt-in live SVG or
 PNG rendering. Bare pointer rendering fades after inactivity; persistent rendering retains the last
 position at full opacity while keeping click feedback transient. Neither mode renders before the first
-event. Default direct and composed-workspace recordings remain version 1.
+event. Secondary clicks add an optional button field to their version 2 structured events; primary
+events keep the earlier representation. Default direct and composed-workspace recordings remain version 1.
 
 ### Workspace
 
@@ -73,8 +74,11 @@ stop. Reverse-order cleanup runs only after the owned session is confirmed stopp
 and safe failure paths. Relative paths resolve from the tape directory, failures identify the source
 line, and cleanup failures follow rather than mask the primary failure.
 Tape pointer position is execution state, not recording policy. The first unpressed Move establishes
-it with one no-button SGR event; subsequent Moves interpolate from it, and Click or Drag updates it.
+it with one no-button SGR event; subsequent Moves interpolate from it, and Click, RightClick, or Drag updates it.
 `Pointer on` only decides whether those inputs are also retained as structured v2 events.
+Tape Key uses the live CLI input parser, including `shift+enter`. Wait remains substring-based unless
+`Match line` requests equality with a complete visible row. Successful playback has human, JSON, and
+quiet receipt modes.
 
 A tape is executable authoring input and should be reviewed before use. It is not a recording:
 `.termctrl` remains the timestamped observed timeline, and `video --edit` remains a separate explicit

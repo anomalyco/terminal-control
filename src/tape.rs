@@ -12,7 +12,7 @@ use std::os::unix::process::CommandExt;
 use anyhow::{Context, Result, anyhow, bail};
 use terminal_control::{session, shot};
 
-use super::{mouse_click, mouse_drag, session_input};
+use super::{mouse_click, mouse_drag, mouse_secondary_click, session_input};
 
 const MAX_TAPE_BYTES: usize = 1024 * 1024;
 const MAX_DURATION_MS: u64 = 10 * 60 * 1000;
@@ -56,12 +56,26 @@ struct ActionSpec {
     timeout: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitMatch {
+    Substring,
+    Line,
+}
+
+#[derive(Debug)]
+pub(super) struct PlayReceipt {
+    pub source: PathBuf,
+    pub session: String,
+    pub recording: Option<PathBuf>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Step {
     Wait {
         line: usize,
         text: String,
         timeout: Duration,
+        match_kind: WaitMatch,
     },
     Type {
         line: usize,
@@ -74,6 +88,11 @@ enum Step {
         pace: Duration,
     },
     Click {
+        line: usize,
+        x: u16,
+        y: u16,
+    },
+    RightClick {
         line: usize,
         x: u16,
         y: u16,
@@ -115,6 +134,7 @@ impl Step {
             | Self::Type { line, .. }
             | Self::Key { line, .. }
             | Self::Click { line, .. }
+            | Self::RightClick { line, .. }
             | Self::Move { line, .. }
             | Self::Drag { line, .. }
             | Self::Mark { line, .. }
@@ -130,6 +150,7 @@ impl Step {
             Self::Type { .. } => "Type",
             Self::Key { .. } => "Key",
             Self::Click { .. } => "Click",
+            Self::RightClick { .. } => "RightClick",
             Self::Move { .. } => "Move",
             Self::Drag { .. } => "Drag",
             Self::Mark { .. } => "Mark",
@@ -140,7 +161,7 @@ impl Step {
     }
 }
 
-pub(super) fn play(path: &Path) -> Result<()> {
+pub(super) fn play(path: &Path) -> Result<PlayReceipt> {
     if path.extension().and_then(|extension| extension.to_str()) != Some("tape") {
         bail!(
             "tape source must use the .tape extension; .termctrl is reserved for recording output"
@@ -155,7 +176,13 @@ pub(super) fn play(path: &Path) -> Result<()> {
         .with_context(|| format!("tape {} is not valid UTF-8", source.display()))?;
     let tape = parse(&source, &text)?;
     tape.validate_paths()?;
-    execute(tape)
+    let receipt = PlayReceipt {
+        source: tape.source.clone(),
+        session: tape.name.clone(),
+        recording: tape.record.clone(),
+    };
+    execute(tape)?;
+    Ok(receipt)
 }
 
 impl Tape {
@@ -351,24 +378,22 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
             }
             "Wait" => {
                 require_step(source, line, command, before_launch)?;
-                if tokens.len() != 2 && tokens.len() != 4 {
-                    return line_error(source, line, "usage: Wait TEXT [Timeout DURATION]");
+                if tokens.len() < 2 {
+                    return line_error(
+                        source,
+                        line,
+                        "usage: Wait TEXT [Match substring|line] [Timeout DURATION]",
+                    );
                 }
                 if tokens[1].is_empty() {
                     return line_error(source, line, "Wait text must not be empty");
                 }
-                let timeout = if tokens.len() == 4 {
-                    if tokens[2] != "Timeout" {
-                        return line_error(source, line, "usage: Wait TEXT [Timeout DURATION]");
-                    }
-                    duration(source, line, &tokens[3], false)?
-                } else {
-                    Duration::from_secs(5)
-                };
+                let (match_kind, timeout) = wait_options(source, line, &tokens)?;
                 steps.push(Step::Wait {
                     line,
                     text: tokens[1].clone(),
                     timeout,
+                    match_kind,
                 });
             }
             "Type" => {
@@ -402,6 +427,15 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
                 mouse_click(x, y)
                     .map_err(|error| located_error(source, line, "invalid Click", error))?;
                 steps.push(Step::Click { line, x, y });
+            }
+            "RightClick" => {
+                require_step(source, line, command, before_launch)?;
+                exact_args(source, line, &tokens, 2, "RightClick X Y")?;
+                let x = number::<u16>(source, line, &tokens[1], "right-click x")?;
+                let y = number::<u16>(source, line, &tokens[2], "right-click y")?;
+                mouse_secondary_click(x, y)
+                    .map_err(|error| located_error(source, line, "invalid RightClick", error))?;
+                steps.push(Step::RightClick { line, x, y });
             }
             "Move" => {
                 require_step(source, line, command, before_launch)?;
@@ -642,8 +676,17 @@ fn execute_step(
     pointer_position: &mut Option<(u16, u16)>,
 ) -> Result<()> {
     match step {
-        Step::Wait { text, timeout, .. } => {
-            if let Err(error) = session::wait(&tape.name, text.clone(), *timeout) {
+        Step::Wait {
+            text,
+            timeout,
+            match_kind,
+            ..
+        } => {
+            let wait = match match_kind {
+                WaitMatch::Substring => session::wait(&tape.name, text.clone(), *timeout),
+                WaitMatch::Line => wait_for_line(&tape.name, text, *timeout),
+            };
+            if let Err(error) = wait {
                 let screen = session::show(&tape.name, Duration::ZERO, Duration::ZERO)
                     .map(|shot| diagnostic_text(&shot.frame.text()))
                     .unwrap_or_else(|screen_error| {
@@ -673,6 +716,24 @@ fn execute_step(
                 )?;
             } else {
                 session::send(&tape.name, mouse_click(*x, *y)?, Duration::ZERO)?;
+            }
+            *pointer_position = Some((*x, *y));
+        }
+        Step::RightClick { x, y, .. } => {
+            if tape.pointer_recording {
+                session::mouse_to_in(
+                    &tape.name,
+                    None,
+                    None,
+                    super::mouse_click_events_with_button(
+                        *x,
+                        *y,
+                        terminal_control::recording::PointerButton::Secondary,
+                    )?,
+                    Duration::ZERO,
+                )?;
+            } else {
+                session::send(&tape.name, mouse_secondary_click(*x, *y)?, Duration::ZERO)?;
             }
             *pointer_position = Some((*x, *y));
         }
@@ -722,6 +783,23 @@ fn execute_step(
         Step::Stop { .. } => owned.stop()?,
     }
     Ok(())
+}
+
+fn wait_for_line(name: &str, text: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let screen = session::show(name, Duration::ZERO, Duration::ZERO)?;
+        if screen.frame.text().lines().any(|line| line == text) {
+            return Ok(());
+        }
+        if session::status(name)?.state == session::SessionState::Exited {
+            bail!("session ended before a visible line exactly matched {text:?}");
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for a visible line exactly matching {text:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn finish_lifecycle(
@@ -1050,6 +1128,44 @@ fn paced_values(
     Ok((tokens[1..].to_vec(), Duration::ZERO))
 }
 
+fn wait_options(source: &Path, line: usize, tokens: &[String]) -> Result<(WaitMatch, Duration)> {
+    let mut match_kind = WaitMatch::Substring;
+    let mut timeout = Duration::from_secs(5);
+    let mut saw_match = false;
+    let mut saw_timeout = false;
+    let mut option = 2;
+    while option < tokens.len() {
+        if option + 1 >= tokens.len() {
+            return line_error(source, line, "Wait options require a value");
+        }
+        match tokens[option].as_str() {
+            "Match" if !saw_match => {
+                match_kind = match tokens[option + 1].as_str() {
+                    "substring" => WaitMatch::Substring,
+                    "line" => WaitMatch::Line,
+                    _ => {
+                        return line_error(
+                            source,
+                            line,
+                            "Wait Match must be 'substring' or 'line'",
+                        );
+                    }
+                };
+                saw_match = true;
+            }
+            "Timeout" if !saw_timeout => {
+                timeout = duration(source, line, &tokens[option + 1], false)?;
+                saw_timeout = true;
+            }
+            "Match" => return line_error(source, line, "duplicate Wait Match option"),
+            "Timeout" => return line_error(source, line, "duplicate Wait Timeout option"),
+            other => return line_error(source, line, format!("unknown Wait option {other:?}")),
+        }
+        option += 2;
+    }
+    Ok((match_kind, timeout))
+}
+
 fn motion_options(
     source: &Path,
     line: usize,
@@ -1331,12 +1447,13 @@ Setup "/usr/bin/touch" "fixture ready" Timeout 2s
 Cleanup "/usr/bin/rm" "-f" "fixture ready"
 Launch "demo-app" "--mode" 'literal # argument'
 
-Wait "Ready #1" Timeout 2s
+Wait "Ready #1" Match line Timeout 2s
 Type "hello \"tape\"" Pace 35ms
-Key ctrl-p down enter Pace 10ms
+Key ctrl-p down shift+enter Pace 10ms
 Move 4 2 Steps 8 Pace 0ms
 Move 8 2 Steps 2 Pace 4ms
 Click 12 4
+RightClick 13 4
 Drag 12 4 30 4 Pace 0ms Steps 6
 Move 34 4 Steps 2 Pace 0ms
 Mark "after-input"
@@ -1364,7 +1481,15 @@ Stop
         assert_eq!(tape.setup[0].value.timeout, Duration::from_secs(2));
         assert_eq!(tape.cleanup.len(), 1);
         assert_eq!(tape.cleanup[0].value.timeout, DEFAULT_ACTION_TIMEOUT);
-        assert_eq!(tape.steps.len(), 12);
+        assert_eq!(tape.steps.len(), 13);
+        assert!(matches!(
+            &tape.steps[0],
+            Step::Wait {
+                match_kind: WaitMatch::Line,
+                timeout,
+                ..
+            } if *timeout == Duration::from_secs(2)
+        ));
         assert!(matches!(
             &tape.steps[1],
             Step::Type { text, pace, .. }
@@ -1376,12 +1501,12 @@ Stop
                 if *to == (8, 2) && *steps == 2 && *pace == Duration::from_millis(4)
         ));
         assert!(matches!(
-            &tape.steps[6],
+            &tape.steps[7],
             Step::Drag { steps, pace, .. }
                 if *steps == 6 && pace.is_zero()
         ));
         assert!(matches!(
-            &tape.steps[10],
+            &tape.steps[11],
             Step::Action { action, .. } if action.timeout == Duration::from_secs(3)
         ));
     }
@@ -1412,6 +1537,33 @@ Stop
         .unwrap_err();
 
         assert_eq!(error.to_string(), "broken.tape:5: usage: Stop");
+    }
+
+    #[test]
+    fn wait_defaults_to_substring_and_validates_match_modifiers() {
+        let tape = parse(
+            Path::new("demo.tape"),
+            "Session demo\nViewport 80 24\nLaunch app\nWait ready Timeout 2s\nStop\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            &tape.steps[0],
+            Step::Wait {
+                match_kind: WaitMatch::Substring,
+                timeout,
+                ..
+            } if *timeout == Duration::from_secs(2)
+        ));
+
+        for invalid in [
+            "Wait ready Match exact",
+            "Wait ready Match line Match substring",
+            "Wait ready Timeout 1s Timeout 2s",
+            "Wait ready Unknown line",
+        ] {
+            let source = format!("Session demo\nViewport 80 24\nLaunch app\n{invalid}\nStop\n");
+            assert!(parse(Path::new("demo.tape"), &source).is_err(), "{invalid}");
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/anomalyco/terminal-control/schemas/recording-entry-v2.schema.json",
   "title": "Terminal Control recording JSON Lines entry v2",
-  "description": "Version 2 extends the version 1 timeline with opt-in structured pointer events.",
+  "description": "Version 2 extends the version 1 timeline with opt-in structured pointer events, including optional button evidence for secondary clicks.",
   "oneOf": [
     { "$ref": "#/$defs/header" },
     { "$ref": "#/$defs/output" },
@@ -84,7 +84,11 @@
         "at_ms": { "type": "integer", "minimum": 0 },
         "x": { "$ref": "#/$defs/dimension" },
         "y": { "$ref": "#/$defs/dimension" },
-        "phase": { "enum": ["press", "move", "release"] }
+        "phase": { "enum": ["press", "move", "release"] },
+        "button": {
+          "description": "Pointer button when it is not the default primary button. Missing means primary.",
+          "enum": ["primary", "secondary"]
+        }
       }
     }
   }

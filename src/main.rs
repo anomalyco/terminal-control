@@ -89,9 +89,14 @@ they never implicitly invoke a shell. Setup runs before Launch. Cleanup runs in 
 order after the owned session stops, including failure paths where session shutdown is confirmed.
 `Pointer on` requires Record and captures structured click, move, and drag events for rendering.
 Move sends smooth unpressed motion from the last tape pointer position; the first Move establishes it.
+RightClick sends a secondary click and retains its button in pointer-enabled recordings. Key accepts
+the live send vocabulary, including shift+enter. Wait defaults to substring matching; add `Match line`
+when one complete visible row must match exactly.
 Add `Timeout DURATION` to any host action when the default is unsuitable. Cleanup errors are reported
 after the primary playback error. Video rendering remains a separate
 `termctrl video RECORDING --edit PLAN` phase.
+Successful playback prints the canonical tape path and recording path, when present. Use `--json`
+for a stable structured receipt or `--quiet` when stdout must remain empty.
 
 Example:
   termctrl play demos/opencode.tape";
@@ -139,7 +144,8 @@ Example:
 const SEND_HELP: &str = "\
 Send ordered input to a live session. Text uses `text:<value>`; named keys include `enter`,
 `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, and
-`page-down`. Use `ctrl-a` through `ctrl-z` for control input such as `ctrl-c` cancellation.
+`page-down`. Modifier chords include `shift+enter`; use `ctrl-a` through `ctrl-z` for control input
+such as `ctrl-c` cancellation.
 Add `--pace-ms 35` when producing a human-readable recording so typed text appears character by
 character in the terminal instead of as one immediate paste. Use `--stdin` to send exact bytes
 from standard input as one burst.
@@ -501,6 +507,12 @@ struct PlayArgs {
     /// UTF-8 Terminal Control tape source; must use the .tape extension.
     #[arg(value_name = "FILE.tape")]
     input: PathBuf,
+    /// Print a stable JSON success receipt.
+    #[arg(long, conflicts_with = "quiet")]
+    json: bool,
+    /// Suppress the success receipt.
+    #[arg(long)]
+    quiet: bool,
 }
 
 #[derive(Args)]
@@ -1100,7 +1112,27 @@ fn main() -> Result<()> {
             start_session(&args)?;
             println!("{}", args.name);
         }
-        Command::Play(args) => tape::play(&args.input)?,
+        Command::Play(args) => {
+            let receipt = tape::play(&args.input)?;
+            if !args.quiet {
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "status": "ok",
+                            "tape": receipt.source,
+                            "session": receipt.session,
+                            "recording": receipt.recording,
+                        }))?
+                    );
+                } else {
+                    println!("played {}", receipt.source.display());
+                    if let Some(recording) = receipt.recording {
+                        println!("recording {}", recording.display());
+                    }
+                }
+            }
+        }
         Command::Run(args) => run_session(&args)?,
         Command::Attach(args) => attach_session(&args)?,
         Command::Wait(args) => {
@@ -1548,6 +1580,15 @@ fn mouse_click(x: u16, y: u16) -> Result<Vec<Vec<u8>>> {
         .collect())
 }
 
+fn mouse_secondary_click(x: u16, y: u16) -> Result<Vec<Vec<u8>>> {
+    Ok(
+        mouse_click_events_with_button(x, y, recording::PointerButton::Secondary)?
+            .into_iter()
+            .map(|event| event.bytes)
+            .collect(),
+    )
+}
+
 fn mouse_drag(from: (u16, u16), to: (u16, u16), steps: u16) -> Result<Vec<Vec<u8>>> {
     Ok(mouse_drag_events(from, to, steps)?
         .into_iter()
@@ -1563,18 +1604,32 @@ fn mouse_move(from: Option<(u16, u16)>, to: (u16, u16), steps: u16) -> Result<Ve
 }
 
 fn mouse_click_events(x: u16, y: u16) -> Result<Vec<session::MouseInput>> {
+    mouse_click_events_with_button(x, y, recording::PointerButton::Primary)
+}
+
+fn mouse_click_events_with_button(
+    x: u16,
+    y: u16,
+    button: recording::PointerButton,
+) -> Result<Vec<session::MouseInput>> {
+    let sgr_button = match button {
+        recording::PointerButton::Primary => 0,
+        recording::PointerButton::Secondary => 2,
+    };
     Ok(vec![
         session::MouseInput {
-            bytes: sgr_mouse(0, x, y, b'M')?,
+            bytes: sgr_mouse(sgr_button, x, y, b'M')?,
             x,
             y,
             phase: recording::PointerPhase::Press,
+            button,
         },
         session::MouseInput {
-            bytes: sgr_mouse(0, x, y, b'm')?,
+            bytes: sgr_mouse(sgr_button, x, y, b'm')?,
             x,
             y,
             phase: recording::PointerPhase::Release,
+            button,
         },
     ])
 }
@@ -1593,6 +1648,7 @@ fn mouse_drag_events(
         x: from.0,
         y: from.1,
         phase: recording::PointerPhase::Press,
+        button: recording::PointerButton::Primary,
     });
     for step in 1..=steps {
         let x = interpolate(from.0, to.0, step, steps);
@@ -1602,6 +1658,7 @@ fn mouse_drag_events(
             x,
             y,
             phase: recording::PointerPhase::Move,
+            button: recording::PointerButton::Primary,
         });
     }
     input.push(session::MouseInput {
@@ -1609,6 +1666,7 @@ fn mouse_drag_events(
         x: to.0,
         y: to.1,
         phase: recording::PointerPhase::Release,
+        button: recording::PointerButton::Primary,
     });
     Ok(input)
 }
@@ -1640,6 +1698,7 @@ fn mouse_move_events(
                 x,
                 y,
                 phase: recording::PointerPhase::Move,
+                button: recording::PointerButton::Primary,
             })
         })
         .collect()
@@ -2081,8 +2140,9 @@ fn input_event(event: &str) -> Result<Vec<u8>> {
         "end" => b"\x1b[F".to_vec(),
         "page-up" => b"\x1b[5~".to_vec(),
         "page-down" => b"\x1b[6~".to_vec(),
+        "shift+enter" => b"\x1b[13;2u".to_vec(),
         _ => anyhow::bail!(
-            "unsupported input event {event:?}; use text:<value>, ctrl-a through ctrl-z, enter, escape, arrows, tab, shift-tab, backspace, delete, home, end, page-up, or page-down"
+            "unsupported input event {event:?}; use text:<value>, ctrl-a through ctrl-z, shift+enter, enter, escape, arrows, tab, shift-tab, backspace, delete, home, end, page-up, or page-down"
         ),
     })
 }
@@ -2239,6 +2299,28 @@ mod tests {
             ])
             .unwrap(),
             b"\x03\x1b[Z\x1b[3~"
+        );
+    }
+
+    #[test]
+    fn live_and_tape_input_parser_encodes_shift_enter_chord() {
+        assert_eq!(input_event("shift+enter").unwrap(), b"\x1b[13;2u");
+        assert_eq!(
+            session_input(&["shift+enter".to_owned()], false).unwrap(),
+            [b"\x1b[13;2u".to_vec()]
+        );
+    }
+
+    #[test]
+    fn parses_play_receipt_modes() {
+        let cli = Cli::try_parse_from(["termctrl", "play", "demo.tape", "--json"]).unwrap();
+        let Command::Play(args) = cli.command else {
+            panic!("expected play command");
+        };
+        assert!(args.json);
+        assert!(!args.quiet);
+        assert!(
+            Cli::try_parse_from(["termctrl", "play", "demo.tape", "--json", "--quiet"]).is_err()
         );
     }
 
@@ -2730,6 +2812,15 @@ mod tests {
             [b"\x1b[<0;13;5M".to_vec(), b"\x1b[<0;13;5m".to_vec()]
         );
         assert!(mouse_click(u16::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn encodes_secondary_mouse_click_with_zero_based_cells() {
+        assert_eq!(
+            mouse_secondary_click(12, 4).unwrap(),
+            [b"\x1b[<2;13;5M".to_vec(), b"\x1b[<2;13;5m".to_vec()]
+        );
+        assert!(mouse_secondary_click(u16::MAX, 0).is_err());
     }
 
     #[test]

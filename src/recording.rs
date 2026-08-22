@@ -60,6 +60,8 @@ pub enum Entry {
         x: u16,
         y: u16,
         phase: PointerPhase,
+        #[serde(default, skip_serializing_if = "PointerButton::is_primary")]
+        button: PointerButton,
     },
 }
 
@@ -69,6 +71,20 @@ pub enum PointerPhase {
     Press,
     Move,
     Release,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PointerButton {
+    #[default]
+    Primary,
+    Secondary,
+}
+
+impl PointerButton {
+    fn is_primary(&self) -> bool {
+        *self == Self::Primary
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +300,16 @@ impl Writer {
     }
 
     pub fn pointer(&mut self, x: u16, y: u16, phase: PointerPhase) -> Result<()> {
+        self.pointer_with_button(x, y, phase, PointerButton::Primary)
+    }
+
+    pub fn pointer_with_button(
+        &mut self,
+        x: u16,
+        y: u16,
+        phase: PointerPhase,
+        button: PointerButton,
+    ) -> Result<()> {
         if self.version != POINTER_FORMAT_VERSION {
             bail!("structured pointer events require a version 2 recording");
         }
@@ -292,6 +318,7 @@ impl Writer {
             x,
             y,
             phase,
+            button,
         })
     }
 
@@ -558,7 +585,9 @@ fn replay(recording: &Recording, cutoff: Option<u64>) -> Result<Replay> {
                 terminal.resize(*cols, *rows, *cell_width, *cell_height)?;
                 *at_ms
             }
-            Entry::Pointer { at_ms, x, y, phase } => {
+            Entry::Pointer {
+                at_ms, x, y, phase, ..
+            } => {
                 if cutoff.is_some_and(|cutoff| *at_ms > cutoff) {
                     continue;
                 }
@@ -1458,6 +1487,8 @@ mod tests {
         writer.pointer(4, 5, PointerPhase::Release).unwrap();
         drop(writer);
 
+        assert!(!fs::read_to_string(&temp).unwrap().contains("\"button\""));
+
         let recording = read(&temp).unwrap();
         let _ = fs::remove_file(temp);
         assert_eq!(recording.version, POINTER_FORMAT_VERSION);
@@ -1479,6 +1510,42 @@ mod tests {
                 Entry::Pointer {
                     x: 4,
                     y: 5,
+                    phase: PointerPhase::Release,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn secondary_pointer_events_retain_button_evidence() {
+        let temp = std::env::temp_dir().join(format!(
+            "termctrl-recording-secondary-v2-{}",
+            std::process::id()
+        ));
+        let mut writer = Writer::new_with_pointer(&temp, Instant::now(), 20, 10, 9, 18).unwrap();
+        writer
+            .pointer_with_button(6, 7, PointerPhase::Press, PointerButton::Secondary)
+            .unwrap();
+        writer
+            .pointer_with_button(6, 7, PointerPhase::Release, PointerButton::Secondary)
+            .unwrap();
+        drop(writer);
+
+        let text = fs::read_to_string(&temp).unwrap();
+        assert_eq!(text.matches("\"button\":\"secondary\"").count(), 2);
+        let recording = read(&temp).unwrap();
+        let _ = fs::remove_file(temp);
+        assert!(matches!(
+            recording.events.as_slice(),
+            [
+                Entry::Pointer {
+                    button: PointerButton::Secondary,
+                    phase: PointerPhase::Press,
+                    ..
+                },
+                Entry::Pointer {
+                    button: PointerButton::Secondary,
                     phase: PointerPhase::Release,
                     ..
                 }
@@ -1527,12 +1594,14 @@ mod tests {
                     x: 2,
                     y: 3,
                     phase: PointerPhase::Press,
+                    button: PointerButton::Primary,
                 },
                 Entry::Pointer {
                     at_ms: 20,
                     x: 4,
                     y: 5,
                     phase: PointerPhase::Release,
+                    button: PointerButton::Primary,
                 },
                 Entry::Marker {
                     at_ms: 1000,

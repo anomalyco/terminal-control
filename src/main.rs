@@ -1,3 +1,5 @@
+mod tape;
+
 use std::fs;
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +18,7 @@ Examples:
   termctrl show -- my-terminal-app
   termctrl save --format png --out captures/app.png -- my-terminal-app
   termctrl start demo --host opentui -- opencode
+  termctrl play demos/opencode.tape
   termctrl run
   termctrl attach workspace
   termctrl wait demo '/connect' && termctrl send demo text:/connect enter
@@ -69,6 +72,19 @@ Example:
   termctrl show demo
   termctrl save demo --format png --out captures/provider.png
   termctrl stop demo";
+
+const PLAY_HELP: &str = "\
+Play validates an entire UTF-8 .tape file, then runs its deterministic named-session demo. Tape
+files are line-oriented source programs; they are distinct from the private .termctrl recording
+timelines they may produce. Relative Cwd and Record paths resolve from the tape's directory.
+
+Use Wait for application readiness and Sleep only for deliberate presentation holds. Action runs
+an explicit argv vector on the host with the tape cwd and environment; it never invokes a shell.
+Any failed step reports its tape line and stops the session owned by this play invocation. Video
+rendering remains a separate `termctrl video RECORDING --edit PLAN` phase.
+
+Example:
+  termctrl play demos/opencode.tape";
 
 const RUN_HELP: &str = "\
 Run creates or reattaches a visible Terminal Control workspace. With no arguments it uses the
@@ -218,6 +234,9 @@ enum Command {
     /// Start a named persistent terminal application.
     #[command(after_help = START_HELP)]
     Start(StartArgs),
+    /// Play a validated deterministic terminal demo script.
+    #[command(after_help = PLAY_HELP)]
+    Play(PlayArgs),
     /// Enter a visible, agent-controllable terminal workspace.
     #[command(after_help = RUN_HELP)]
     Run(RunArgs),
@@ -447,6 +466,13 @@ struct StartArgs {
     /// Command and arguments to launch, following `--`.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+#[derive(Args)]
+struct PlayArgs {
+    /// UTF-8 Terminal Control tape source; must use the .tape extension.
+    #[arg(value_name = "FILE.tape")]
+    input: PathBuf,
 }
 
 #[derive(Args)]
@@ -1015,6 +1041,7 @@ fn main() -> Result<()> {
             start_session(&args)?;
             println!("{}", args.name);
         }
+        Command::Play(args) => tape::play(&args.input)?,
         Command::Run(args) => run_session(&args)?,
         Command::Attach(args) => attach_session(&args)?,
         Command::Wait(args) => {
@@ -2332,6 +2359,16 @@ mod tests {
 
         assert_eq!(args.name, None);
         assert!(args.command.is_empty());
+    }
+
+    #[test]
+    fn parses_tape_play_command() {
+        let cli = Cli::try_parse_from(["termctrl", "play", "demos/ttt.tape"]).unwrap();
+        let Command::Play(args) = cli.command else {
+            panic!("expected play command");
+        };
+
+        assert_eq!(args.input, PathBuf::from("demos/ttt.tape"));
     }
 
     #[test]

@@ -2068,6 +2068,10 @@ mod implementation {
             .arg(options.cell_height.to_string())
             .arg("--max-bytes")
             .arg(options.max_bytes.to_string());
+        if !options.inherit_env {
+            daemon.env_clear();
+        }
+        daemon.envs(&options.env);
         daemon
             .env_remove("TERMCTRL_WORKSPACE")
             .env_remove("TERMCTRL_PANE_ID")

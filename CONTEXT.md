@@ -51,6 +51,19 @@ A timestamped terminal event timeline containing output, client or automatic hos
 
 Agents inspect marker names with `termctrl markers` and inspect exact recording moments with `termctrl show --recording ... --at-marker ...` or `--at-ms ...` before committing to a video edit plan.
 
+### Tape
+
+A UTF-8, line-oriented `.tape` source program for a deterministic demo. The complete tape is parsed
+and validated before its named session is launched. Header directives fix viewport, launch argv,
+working directory, environment, host profile, recording path, and resource limits; ordered steps use
+visible-text waits, paced text or key input, click and drag controls, markers, presentation holds,
+argv-based host actions, and a required clean stop. Relative paths resolve from the tape directory,
+and failures identify the source line and clean up the session owned by that play invocation.
+
+A tape is executable authoring input and should be reviewed before use. It is not a recording:
+`.termctrl` remains the timestamped observed timeline, and `video --edit` remains a separate explicit
+rendering phase.
+
 ### ANSI/VT Stream
 
 Raw terminal output bytes containing text and terminal control sequences. Files commonly use an `.ansi` suffix, but the suffix does not imply a separate container format.

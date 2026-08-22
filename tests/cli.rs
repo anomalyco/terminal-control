@@ -42,7 +42,7 @@ impl NamedSession {
 
 impl Drop for NamedSession {
     fn drop(&mut self) {
-        let _ = self.command().args(["stop", self.name]).status();
+        let _ = self.command().args(["stop", self.name]).output();
         let _ = fs::remove_dir_all(&self.runtime);
     }
 }
@@ -171,4 +171,127 @@ fn click_and_drag_send_exact_sgr_mouse_events() {
         ]
         .concat()
     );
+}
+
+#[test]
+fn tape_play_runs_state_aware_demo_and_records_exact_input() {
+    let session = NamedSession::new("tape-play", "tape-play-test");
+    let tape = session.runtime.join("demo.tape");
+    let recording = session.runtime.join("demo.termctrl");
+    fs::write(
+        &tape,
+        r#"# comments and quoted # text are both supported
+Session tape-play-test
+Viewport 72 12
+Cell 8 16
+MaxBytes 1048576
+Cwd "."
+Env DEMO_ENV "quoted # value"
+Record "demo.termctrl"
+Color never
+Launch "/bin/sh" "-c" "stty raw -echo; printf READY:%s:%s \"$DEMO_ENV\" \"$PWD\"; od -An -tx1 -v -N 64; while [ ! -f action-ready ]; do sleep 0.01; done; printf FIXTURE; sleep 30"
+Wait "READY:quoted # value" Timeout 2s
+Type "hello" Pace 1ms
+Key enter
+Click 12 4
+Drag 0 0 2 0 Steps 2 Pace 0ms
+Action "/usr/bin/touch" "action-ready"
+Wait FIXTURE Timeout 2s
+Mark complete
+Sleep 10ms
+Stop
+"#,
+    )
+    .unwrap();
+
+    let output = session.output(&["play", tape.to_str().unwrap()]);
+    assert_success(&output);
+    assert!(session.runtime.join("action-ready").exists());
+    assert!(recording.exists());
+    assert!(!session.output(&["status", session.name]).status.success());
+
+    let entries: Vec<serde_json::Value> = fs::read_to_string(&recording)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(entries[0]["type"], "header");
+    assert_eq!(entries[0]["cols"], 72);
+    assert_eq!(entries[0]["rows"], 12);
+    assert!(
+        entries
+            .iter()
+            .any(|entry| { entry["type"] == "marker" && entry["name"] == "complete" })
+    );
+    let client_input: Vec<u8> = entries
+        .iter()
+        .filter(|entry| entry["type"] == "input" && entry["origin"] == "client")
+        .flat_map(|entry| {
+            entry["bytes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|byte| byte.as_u64().unwrap() as u8)
+        })
+        .collect();
+    assert_eq!(
+        client_input,
+        [
+            b"hello\r".as_slice(),
+            b"\x1b[<0;13;5M".as_slice(),
+            b"\x1b[<0;13;5m".as_slice(),
+            b"\x1b[<0;1;1M".as_slice(),
+            b"\x1b[<32;2;1M".as_slice(),
+            b"\x1b[<32;3;1M".as_slice(),
+            b"\x1b[<0;3;1m".as_slice(),
+        ]
+        .concat()
+    );
+}
+
+#[test]
+fn tape_play_validates_before_launch_or_action_side_effects() {
+    let session = NamedSession::new("tape-validate", "tape-validate-test");
+    let tape = session.runtime.join("invalid.tape");
+    fs::write(
+        &tape,
+        r#"Session tape-validate-test
+Viewport 80 24
+Cwd "."
+Launch "/usr/bin/touch" "launched"
+Action "/usr/bin/touch" "acted"
+Stop extra
+"#,
+    )
+    .unwrap();
+
+    let output = session.output(&["play", tape.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid.tape:6: usage: Stop"));
+    assert!(!session.runtime.join("launched").exists());
+    assert!(!session.runtime.join("acted").exists());
+}
+
+#[test]
+fn tape_wait_failure_reports_screen_and_cleans_up_owned_session() {
+    let session = NamedSession::new("tape-timeout", "tape-timeout-test");
+    let tape = session.runtime.join("timeout.tape");
+    fs::write(
+        &tape,
+        r#"Session tape-timeout-test
+Viewport 80 24
+Launch "/bin/sh" "-c" "printf ACTUAL; sleep 30"
+Wait MISSING Timeout 20ms
+Stop
+"#,
+    )
+    .unwrap();
+
+    let output = session.output(&["play", tape.to_str().unwrap()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timeout.tape:4: Wait failed"), "{stderr}");
+    assert!(stderr.contains("last visible screen"), "{stderr}");
+    assert!(stderr.contains("ACTUAL"), "{stderr}");
+    assert!(!session.output(&["status", session.name]).status.success());
 }

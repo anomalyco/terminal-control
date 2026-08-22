@@ -147,6 +147,44 @@ termctrl logs demo --ansi > captures/demo-output.ansi
 
 Full-screen alternate-screen TUIs do not produce useful logs; read their visible screen with `show`.
 
+## Script A Deterministic Demo
+
+`play` validates a complete tape before launching anything, then drives the existing named-session,
+wait, keyboard, mouse, marker, and recording controls:
+
+```text
+# demos/ttt.tape
+Session ttt-demo
+Viewport 80 24
+Cwd ".."
+Env TTT_FIXTURE "demo game"
+Record "captures/ttt.termctrl"
+Launch "cargo" "run" "--release" "--bin" "ttt"
+
+Wait "Choose a square" Timeout 10s
+Click 12 8
+Wait "Your turn"
+Type "middle" Pace 35ms
+Key enter
+Mark result
+Sleep 750ms
+Stop
+```
+
+```bash
+termctrl play demos/ttt.tape
+termctrl video demos/captures/ttt.termctrl --edit demos/captures/ttt-edit.json \
+  --out demos/captures/ttt.mp4
+```
+
+A `.tape` file is readable authoring source, not a `.termctrl` recording. Relative `Cwd` and `Record`
+paths use the tape directory; `Action` uses the configured cwd. Prefer state-aware `Wait` steps;
+reserve `Sleep` for a deliberate presentation hold. `Action` runs an explicit argv vector without a
+shell for controlled fixture changes, so play only tapes you trust. A failed step reports its file and
+line, includes the last visible screen for wait timeouts, and stops the session it launched. Video
+selection and editing remain an explicit phase after the recording exists. See
+[docs/tape-scripting.md](docs/tape-scripting.md) for the complete format.
+
 ## Semantic UI Snapshots
 
 Terminal Control gives applications launched with `--host opentui` a private
@@ -334,6 +372,7 @@ See [docs/typescript-client.md](docs/typescript-client.md) for artifacts, record
 
 ## More Documentation
 
+- [docs/tape-scripting.md](docs/tape-scripting.md) — deterministic `.tape` demo scripts and their safety boundary.
 - [docs/rust-library.md](docs/rust-library.md) — embed the shot engine and sessions in Rust, plus versioned JSON schemas.
 - [docs/driver-protocol.md](docs/driver-protocol.md) — the `termctrl driver` JSON Lines protocol for external tooling.
 - [docs/semantic-protocol.md](docs/semantic-protocol.md) — the application semantic socket handshake and snapshot contract.

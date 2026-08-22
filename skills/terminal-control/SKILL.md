@@ -29,6 +29,20 @@ termctrl stop app
 
 Always stop named sessions after use unless the user explicitly wants the live process retained.
 
+Use a checked-in `.tape` when the interaction itself should be repeatable as a deterministic demo:
+
+```bash
+termctrl play demos/app.tape
+```
+
+`play` validates the complete source before launching its named session. Tape steps reuse the normal
+`wait`, paced text/key input, click, drag, marker, recording, and stop behavior. Prefer `Wait` for
+state transitions and use `Sleep` only for a deliberate presentation hold. An `Action` is an explicit
+argv-based host command for controlled fixture changes; it does not invoke a shell, but the tape is
+still executable input and must be trusted. Relative paths resolve from the tape directory. A failed
+play stops the session it owns. The `.tape` authoring source is distinct from any private `.termctrl`
+recording it creates; inspect that recording and run `video --edit` as a separate phase.
+
 Enter a visible workspace that humans and agents control together:
 
 ```bash
@@ -87,6 +101,7 @@ output is a rendered snapshot; pane-targeted ANSI is the original pane stream.
 - Use `logs` for readable retained output from normal-screen tools and log-like commands.
 - Use `save --format ... --out ...` only when a persisted artifact is required.
 - Use `video` only after explicitly recording a timeline with `--record`.
+- Use `play` when a repeatable interaction belongs in a reviewed `.tape` source file.
 
 Do not treat logs as the visible state of an alternate-screen TUI.
 

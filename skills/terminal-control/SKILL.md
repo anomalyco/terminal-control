@@ -41,9 +41,10 @@ state transitions and use `Sleep` only for a deliberate presentation hold. `Setu
 `Cleanup` are explicit argv-based host commands for controlled fixture changes; they do not
 implicitly invoke a shell, default to a 30-second timeout, and retain bounded diagnostics. Setup runs
 before Launch and reverse-order cleanup runs only after the owned session is confirmed stopped,
-including safe failure paths. Relative paths resolve from the tape directory. The `.tape` authoring
-source is distinct from any private `.termctrl`
-recording it creates; inspect that recording and run `video --edit` as a separate phase.
+including safe failure paths. Action output-pipe drain is also finite; an escaped descendant retaining
+a pipe fails the action rather than blocking cleanup indefinitely. Relative paths resolve from the
+tape directory. The `.tape` authoring source is distinct from any private `.termctrl` recording it
+creates; inspect that recording and run `video --edit` as a separate phase.
 Add `Pointer on` only when the demo needs structured click, move, and drag overlays. It requires `Record`,
 writes opt-in recording version 2, and is rendered only with `--pointer`; ordinary recordings remain
 version 1. Pointer capture currently applies to direct named sessions, not composed workspaces.
@@ -118,6 +119,7 @@ output is a rendered snapshot; pane-targeted ANSI is the original pane stream.
 - Use persistent pointer rendering only when the latest target must remain legible through idle holds.
 - Use `play` when a repeatable interaction belongs in a reviewed `.tape` source file.
 - Use `play --json` when a caller needs stable success fields, or `--quiet` when it needs no stdout.
+  JSON mode requires UTF-8 tape and recording paths and checks them before lifecycle side effects.
 
 Do not treat logs as the visible state of an alternate-screen TUI.
 
@@ -161,6 +163,7 @@ to bottom. For a workspace, coordinates are local to the selected pane or the pa
 `--pane`/`--window`; do not include tab chrome or pane borders. `click` sends a primary press and
 release. `drag` sends a primary press, linearly interpolated held-button motion events including the
 destination, and release; tune the event count with `--steps` and their interval with `--pace-ms`.
+Coordinates are checked against the actual target viewport before input or pointer evidence is sent.
 The application must have enabled mouse tracking.
 
 ## Operate OpenTUI Applications

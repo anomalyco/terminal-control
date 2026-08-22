@@ -69,7 +69,8 @@ tracking. Coordinates are application-cell coordinates, not screen pixels. The f
 establishes the tape pointer position with one honest no-button motion event; it does not invent a
 path from an unknown origin. Later Moves interpolate `Steps` events from the authoritative position,
 including the destination. Click and RightClick set the position to their target and Drag sets it to
-its endpoint.
+its endpoint. Every endpoint is checked against the declared `Viewport` while the complete tape is
+validated, before setup or launch.
 
 `Wait` searches for a substring by default. Add `Match line` for equality with one complete visible
 terminal row after trailing cell padding is removed. This prevents `Wait "history entry 1" Match line`
@@ -87,11 +88,18 @@ event.
 
 `Setup`, `Action`, and `Cleanup` have a finite 30-second default timeout. A trailing
 `Timeout DURATION` overrides it. Each action starts in its own Unix process group; timeout terminates
-the group, and both stdout and stderr are drained with bounded diagnostic retention. Successful
-actions must exit zero. Cleanup runs even after setup, launch, or playback failure when no live owned
-session remains, and all cleanup entries are attempted in reverse declaration order. Cleanup errors
+the group, and both stdout and stderr are drained with bounded diagnostic retention and a finite
+grace. If an escaped process retains either pipe after that grace, the action fails and owned-session
+cleanup proceeds; processes that deliberately create a new Unix session are outside the action's
+owned process group and may remain. Successful actions must exit zero. Cleanup runs even after setup,
+launch, or playback failure when no live owned session remains, and all cleanup entries are attempted
+in reverse declaration order. Cleanup errors
 follow rather than replace the primary error. Write cleanup actions to tolerate partially completed
 setup and repeated use.
+
+Successful `play --json` receipts require UTF-8 tape and recording paths. On Unix, an incompatible
+path is rejected after complete source validation but before Setup or Launch, so receipt encoding
+cannot fail after lifecycle side effects.
 
 ## Example
 

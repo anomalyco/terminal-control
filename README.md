@@ -119,7 +119,9 @@ termctrl stop demo
   sends a primary press, interpolated held-button motion, and release; `--steps` controls the motion
   event count and `--pace-ms` controls their interval. Coordinates are zero-based application cells:
   X increases rightward and Y downward. Workspace coordinates are local to the selected or targeted
-  pane and exclude tab chrome and borders. The application must have mouse tracking enabled.
+  pane and exclude tab chrome and borders. Every coordinate must fit the actual target viewport;
+  invalid clicks and drag endpoints fail before input or pointer evidence is recorded. The application
+  must have mouse tracking enabled.
 - `wait` blocks until text is visible; use it instead of sleeping. It defaults to a five-second
   maximum, so omit `--timeout 5000` and override only when choosing a different limit.
 - `status` reports running/exited state, command, cwd, viewport, and recording path. `list` shows
@@ -189,9 +191,10 @@ paths use the tape directory; host actions use the configured cwd and environmen
 run explicit argv vectors without implicit shell evaluation. They default to a finite 30-second
 timeout, accept a trailing `Timeout DURATION`, and retain bounded diagnostics. Setup runs before
 Launch; cleanup runs in reverse order after session stop on success or safe failure paths. Cleanup
-errors do not mask the primary failure. A failed step reports its file and line, and wait timeouts
-include the last visible screen. Video
-selection and editing remain an explicit phase after the recording exists. See
+errors do not mask the primary failure. Output drain also has a finite grace: an action whose escaped
+descendant retains stdout or stderr fails instead of delaying session cleanup indefinitely. A failed
+step reports its file and line, and wait timeouts include the last visible screen. Video selection
+and editing remain an explicit phase after the recording exists. See
 [docs/tape-scripting.md](docs/tape-scripting.md) for the complete format.
 
 Pointer overlays are opt-in. Start a direct session with `--record ... --record-pointer`, or use
@@ -216,6 +219,7 @@ equal a complete trimmed terminal row, so `Wait "history entry 1" Match line` do
 
 Successful `play` prints the canonical tape path and any recording path. Use `--json` for a stable
 receipt containing `status`, `tape`, `session`, and `recording`, or `--quiet` to suppress stdout.
+On Unix, `--json` requires UTF-8 tape and recording paths; this is rejected before setup or launch.
 
 ## Semantic UI Snapshots
 

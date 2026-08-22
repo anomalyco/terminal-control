@@ -7,9 +7,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
 use terminal_control::{session, shot};
 
 use super::{mouse_click, mouse_drag, mouse_secondary_click, session_input};
@@ -19,8 +22,10 @@ const MAX_DURATION_MS: u64 = 10 * 60 * 1000;
 const MAX_DIAGNOSTIC_CHARS: usize = 4000;
 const DEFAULT_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ACTION_OUTPUT_BYTES: usize = 64 * 1024;
+const ACTION_DRAIN_BURST_BYTES: usize = 64 * 1024;
 const ACTION_POLL: Duration = Duration::from_millis(10);
 const ACTION_TERMINATION_GRACE: Duration = Duration::from_millis(250);
+const ACTION_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 struct Located<T> {
@@ -62,8 +67,10 @@ enum WaitMatch {
     Line,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub(super) struct PlayReceipt {
+    pub status: &'static str,
+    #[serde(rename = "tape")]
     pub source: PathBuf,
     pub session: String,
     pub recording: Option<PathBuf>,
@@ -161,7 +168,7 @@ impl Step {
     }
 }
 
-pub(super) fn play(path: &Path) -> Result<PlayReceipt> {
+pub(super) fn play(path: &Path, json_receipt: bool) -> Result<PlayReceipt> {
     if path.extension().and_then(|extension| extension.to_str()) != Some("tape") {
         bail!(
             "tape source must use the .tape extension; .termctrl is reserved for recording output"
@@ -177,12 +184,36 @@ pub(super) fn play(path: &Path) -> Result<PlayReceipt> {
     let tape = parse(&source, &text)?;
     tape.validate_paths()?;
     let receipt = PlayReceipt {
+        status: "ok",
         source: tape.source.clone(),
         session: tape.name.clone(),
         recording: tape.record.clone(),
     };
+    if json_receipt {
+        receipt.validate_json_paths()?;
+    }
     execute(tape)?;
     Ok(receipt)
+}
+
+impl PlayReceipt {
+    fn validate_json_paths(&self) -> Result<()> {
+        if self.source.to_str().is_none() {
+            bail!(
+                "play --json requires a UTF-8 tape path before lifecycle side effects: {}",
+                self.source.display()
+            );
+        }
+        if let Some(recording) = &self.recording
+            && recording.to_str().is_none()
+        {
+            bail!(
+                "play --json requires a UTF-8 recording path before lifecycle side effects: {}",
+                recording.display()
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Tape {
@@ -528,6 +559,7 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
     let name = required(source, name, "Session")?.value;
     let (cols, rows) = required(source, viewport, "Viewport")?.value;
     let launch = required(source, launch, "Launch")?;
+    validate_mouse_coordinates(source, &steps, cols, rows)?;
     if !stopped {
         bail!("{}: missing required final Stop command", source.display());
     }
@@ -568,6 +600,30 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
         steps,
         cleanup,
     })
+}
+
+fn validate_mouse_coordinates(source: &Path, steps: &[Step], cols: u16, rows: u16) -> Result<()> {
+    for step in steps {
+        let coordinates: &[(&str, (u16, u16))] = match step {
+            Step::Click { x, y, .. } => &[("Click", (*x, *y))],
+            Step::RightClick { x, y, .. } => &[("RightClick", (*x, *y))],
+            Step::Move { to, .. } => &[("Move", *to)],
+            Step::Drag { from, to, .. } => &[("Drag start", *from), ("Drag end", *to)],
+            _ => continue,
+        };
+        for (label, (x, y)) in coordinates {
+            if *x >= cols || *y >= rows {
+                return line_error(
+                    source,
+                    step.line(),
+                    format!(
+                        "{label} coordinate ({x}, {y}) is outside Viewport {cols}x{rows}; coordinates must satisfy X < {cols} and Y < {rows}"
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn execute(tape: Tape) -> Result<()> {
@@ -706,55 +762,39 @@ fn execute_step(
             session::send(&tape.name, session_input(keys, !pace.is_zero())?, *pace)?;
         }
         Step::Click { x, y, .. } => {
-            if tape.pointer_recording {
-                session::mouse_to_in(
-                    &tape.name,
-                    None,
-                    None,
-                    super::mouse_click_events(*x, *y)?,
-                    Duration::ZERO,
-                )?;
-            } else {
-                session::send(&tape.name, mouse_click(*x, *y)?, Duration::ZERO)?;
-            }
+            session::mouse_to_in(
+                &tape.name,
+                None,
+                None,
+                super::mouse_click_events(*x, *y)?,
+                Duration::ZERO,
+            )?;
             *pointer_position = Some((*x, *y));
         }
         Step::RightClick { x, y, .. } => {
-            if tape.pointer_recording {
-                session::mouse_to_in(
-                    &tape.name,
-                    None,
-                    None,
-                    super::mouse_click_events_with_button(
-                        *x,
-                        *y,
-                        terminal_control::recording::PointerButton::Secondary,
-                    )?,
-                    Duration::ZERO,
-                )?;
-            } else {
-                session::send(&tape.name, mouse_secondary_click(*x, *y)?, Duration::ZERO)?;
-            }
+            session::mouse_to_in(
+                &tape.name,
+                None,
+                None,
+                super::mouse_click_events_with_button(
+                    *x,
+                    *y,
+                    terminal_control::recording::PointerButton::Secondary,
+                )?,
+                Duration::ZERO,
+            )?;
             *pointer_position = Some((*x, *y));
         }
         Step::Move {
             to, steps, pace, ..
         } => {
-            if tape.pointer_recording {
-                session::mouse_to_in(
-                    &tape.name,
-                    None,
-                    None,
-                    super::mouse_move_events(*pointer_position, *to, *steps)?,
-                    *pace,
-                )?;
-            } else {
-                session::send(
-                    &tape.name,
-                    super::mouse_move(*pointer_position, *to, *steps)?,
-                    *pace,
-                )?;
-            }
+            session::mouse_to_in(
+                &tape.name,
+                None,
+                None,
+                super::mouse_move_events(*pointer_position, *to, *steps)?,
+                *pace,
+            )?;
             *pointer_position = Some(*to);
         }
         Step::Drag {
@@ -764,17 +804,13 @@ fn execute_step(
             pace,
             ..
         } => {
-            if tape.pointer_recording {
-                session::mouse_to_in(
-                    &tape.name,
-                    None,
-                    None,
-                    super::mouse_drag_events(*from, *to, *steps)?,
-                    *pace,
-                )?;
-            } else {
-                session::send(&tape.name, mouse_drag(*from, *to, *steps)?, *pace)?;
-            }
+            session::mouse_to_in(
+                &tape.name,
+                None,
+                None,
+                super::mouse_drag_events(*from, *to, *steps)?,
+                *pace,
+            )?;
             *pointer_position = Some(*to);
         }
         Step::Mark { name, .. } => session::mark(&tape.name, name.clone())?,
@@ -825,6 +861,9 @@ fn finish_lifecycle(
 }
 
 fn run_action(tape: &Tape, action: &ActionSpec) -> Result<()> {
+    #[cfg(not(unix))]
+    bail!("tape actions require Unix process-group control");
+
     let command = &action.command;
     let mut process = Command::new(&command[0]);
     process
@@ -846,28 +885,45 @@ fn run_action(tape: &Tape, action: &ActionSpec) -> Result<()> {
     let mut child = process
         .spawn()
         .with_context(|| format!("run host action argv {command:?}"))?;
-    let stdout = child.stdout.take().context("capture host action stdout")?;
-    let stderr = child.stderr.take().context("capture host action stderr")?;
-    let stdout = thread::spawn(move || read_action_output(stdout));
-    let stderr = thread::spawn(move || read_action_output(stderr));
-    let outcome = wait_for_action(&mut child, action.timeout);
+    let mut stdout = child.stdout.take().context("capture host action stdout")?;
+    let mut stderr = child.stderr.take().context("capture host action stderr")?;
+    let nonblocking = set_nonblocking(&stdout)
+        .context("bound host action stdout drain")
+        .and_then(|()| set_nonblocking(&stderr).context("bound host action stderr drain"));
+    if let Err(error) = nonblocking {
+        let _ = terminate_action_group(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let mut stdout_output = ActionOutput::default();
+    let mut stderr_output = ActionOutput::default();
+    let outcome = wait_for_action(
+        &mut child,
+        action.timeout,
+        &mut stdout,
+        &mut stderr,
+        &mut stdout_output,
+        &mut stderr_output,
+    );
     if outcome.is_err() {
         let _ = terminate_action_group(child.id());
         let _ = child.kill();
         let _ = child.wait();
     }
-    let stdout = stdout
-        .join()
-        .map_err(|_| anyhow!("host action stdout reader panicked"))??;
-    let stderr = stderr
-        .join()
-        .map_err(|_| anyhow!("host action stderr reader panicked"))??;
-    let (status, timed_out) = outcome?;
+    let (status, timed_out, drain) = outcome?;
     if timed_out {
         bail!(
             "host action argv {command:?} timed out after {}; output:\n{}",
             display_duration(action.timeout),
-            action_output(&stdout, &stderr)
+            action_output(&stdout_output, &stderr_output, drain)
+        );
+    }
+    if drain.incomplete() {
+        bail!(
+            "host action argv {command:?} left output pipes open after {}; detached descendants may still be running; output:\n{}",
+            display_duration(ACTION_DRAIN_GRACE),
+            action_output(&stdout_output, &stderr_output, drain)
         );
     }
     if status.success() {
@@ -875,32 +931,54 @@ fn run_action(tape: &Tape, action: &ActionSpec) -> Result<()> {
     }
     bail!(
         "host action argv {command:?} exited with {status}; output:\n{}",
-        action_output(&stdout, &stderr)
+        action_output(&stdout_output, &stderr_output, drain)
     )
 }
 
+#[derive(Default)]
 struct ActionOutput {
     bytes: Vec<u8>,
     truncated: bool,
 }
 
-fn read_action_output(mut reader: impl Read) -> std::io::Result<ActionOutput> {
-    let mut bytes = Vec::with_capacity(MAX_ACTION_OUTPUT_BYTES);
-    let mut truncated = false;
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        let remaining = MAX_ACTION_OUTPUT_BYTES.saturating_sub(bytes.len());
-        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
-        truncated |= read > remaining;
-    }
-    Ok(ActionOutput { bytes, truncated })
+#[derive(Clone, Copy)]
+struct ActionDrain {
+    stdout_open: bool,
+    stderr_open: bool,
 }
 
-fn action_output(stdout: &ActionOutput, stderr: &ActionOutput) -> String {
+impl ActionDrain {
+    fn incomplete(self) -> bool {
+        self.stdout_open || self.stderr_open
+    }
+}
+
+fn drain_action_output(reader: &mut impl Read, output: &mut ActionOutput) -> std::io::Result<bool> {
+    let mut buffer = [0_u8; 8192];
+    let mut drained = 0;
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => return Ok(false),
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let remaining = MAX_ACTION_OUTPUT_BYTES.saturating_sub(output.bytes.len());
+        output
+            .bytes
+            .extend_from_slice(&buffer[..read.min(remaining)]);
+        if read > remaining {
+            output.truncated = true;
+        }
+        drained += read;
+        if drained >= ACTION_DRAIN_BURST_BYTES {
+            return Ok(true);
+        }
+    }
+}
+
+fn action_output(stdout: &ActionOutput, stderr: &ActionOutput, drain: ActionDrain) -> String {
     let mut sections = Vec::new();
     for (name, output) in [("stderr", stderr), ("stdout", stdout)] {
         if output.bytes.is_empty() && !output.truncated {
@@ -912,6 +990,18 @@ fn action_output(stdout: &ActionOutput, stderr: &ActionOutput) -> String {
         }
         sections.push(format!("{name}:\n{text}"));
     }
+    if drain.incomplete() {
+        let pipes = match (drain.stdout_open, drain.stderr_open) {
+            (true, true) => "stdout and stderr",
+            (true, false) => "stdout",
+            (false, true) => "stderr",
+            (false, false) => unreachable!(),
+        };
+        sections.push(format!(
+            "drain:\n<{pipes} remained open after {}>",
+            display_duration(ACTION_DRAIN_GRACE)
+        ));
+    }
     if sections.is_empty() {
         "<no output>".to_owned()
     } else {
@@ -919,20 +1009,98 @@ fn action_output(stdout: &ActionOutput, stderr: &ActionOutput) -> String {
     }
 }
 
-fn wait_for_action(child: &mut Child, timeout: Duration) -> Result<(ExitStatus, bool)> {
+fn wait_for_action(
+    child: &mut Child,
+    timeout: Duration,
+    stdout: &mut impl Read,
+    stderr: &mut impl Read,
+    stdout_output: &mut ActionOutput,
+    stderr_output: &mut ActionOutput,
+) -> Result<(ExitStatus, bool, ActionDrain)> {
     let deadline = Instant::now() + timeout;
     loop {
+        let stdout_open =
+            drain_action_output(stdout, stdout_output).context("drain host action stdout")?;
+        let stderr_open =
+            drain_action_output(stderr, stderr_output).context("drain host action stderr")?;
         if let Some(status) = child.try_wait().context("wait for host action")? {
             terminate_action_group(child.id())?;
-            return Ok((status, false));
+            let drain = finish_action_drain(
+                stdout,
+                stderr,
+                stdout_output,
+                stderr_output,
+                stdout_open,
+                stderr_open,
+            )?;
+            return Ok((status, false, drain));
         }
         if Instant::now() >= deadline {
             terminate_action_group(child.id())?;
             let status = child.wait().context("reap timed-out host action")?;
-            return Ok((status, true));
+            let drain = finish_action_drain(
+                stdout,
+                stderr,
+                stdout_output,
+                stderr_output,
+                stdout_open,
+                stderr_open,
+            )?;
+            return Ok((status, true, drain));
         }
         thread::sleep(ACTION_POLL);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_action_drain(
+    stdout: &mut impl Read,
+    stderr: &mut impl Read,
+    stdout_output: &mut ActionOutput,
+    stderr_output: &mut ActionOutput,
+    mut stdout_open: bool,
+    mut stderr_open: bool,
+) -> Result<ActionDrain> {
+    let deadline = Instant::now() + ACTION_DRAIN_GRACE;
+    while stdout_open || stderr_open {
+        if stdout_open {
+            stdout_open = drain_action_output(stdout, stdout_output)
+                .context("finish host action stdout drain")?;
+        }
+        if stderr_open {
+            stderr_open = drain_action_output(stderr, stderr_output)
+                .context("finish host action stderr drain")?;
+        }
+        if !stdout_open && !stderr_open || Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(ACTION_POLL);
+    }
+    Ok(ActionDrain {
+        stdout_open,
+        stderr_open,
+    })
+}
+
+#[cfg(unix)]
+fn set_nonblocking(file: &impl AsRawFd) -> std::io::Result<()> {
+    let descriptor = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_nonblocking(_file: &impl Read) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "tape actions require Unix process-group control",
+    ))
 }
 
 #[cfg(unix)]
@@ -1605,5 +1773,25 @@ Stop
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_every_mouse_endpoint_outside_the_declared_viewport() {
+        for (line, label) in [
+            ("Click 2 0", "Click coordinate (2, 0)"),
+            ("RightClick 0 1", "RightClick coordinate (0, 1)"),
+            ("Move 2 0", "Move coordinate (2, 0)"),
+            ("Drag 0 0 2 0", "Drag end coordinate (2, 0)"),
+            ("Drag 0 1 1 0", "Drag start coordinate (0, 1)"),
+        ] {
+            let source = format!("Session demo\nViewport 2 1\nLaunch app\n{line}\nStop\n");
+            let error = parse(Path::new("bounds.tape"), &source).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains(label), "{line}: {message}");
+            assert!(
+                message.contains("outside Viewport 2x1"),
+                "{line}: {message}"
+            );
+        }
     }
 }

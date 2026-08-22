@@ -85,8 +85,9 @@ timelines they may produce. Relative Cwd and Record paths resolve from the tape'
 
 Use Wait for application readiness and Sleep only for deliberate presentation holds. Setup, Action,
 and Cleanup run explicit argv vectors with a finite 30-second default timeout and bounded output;
-they never implicitly invoke a shell. Setup runs before Launch. Cleanup runs in reverse declaration
-order after the owned session stops, including failure paths where session shutdown is confirmed.
+they never implicitly invoke a shell. Output pipes also have a finite drain grace, so an escaped
+descendant cannot block cleanup by retaining them. Setup runs before Launch. Cleanup runs in reverse
+declaration order after the owned session stops, including failure paths where shutdown is confirmed.
 `Pointer on` requires Record and captures structured click, move, and drag events for rendering.
 Move sends smooth unpressed motion from the last tape pointer position; the first Move establishes it.
 RightClick sends a secondary click and retains its button in pointer-enabled recordings. Key accepts
@@ -96,7 +97,8 @@ Add `Timeout DURATION` to any host action when the default is unsuitable. Cleanu
 after the primary playback error. Video rendering remains a separate
 `termctrl video RECORDING --edit PLAN` phase.
 Successful playback prints the canonical tape path and recording path, when present. Use `--json`
-for a stable structured receipt or `--quiet` when stdout must remain empty.
+for a stable structured receipt or `--quiet` when stdout must remain empty. JSON receipt paths must
+be UTF-8 and are checked before setup or launch.
 
 Example:
   termctrl play demos/opencode.tape";
@@ -161,7 +163,7 @@ Click sends a primary mouse press and release using zero-based application-cell 
 the column from left to right and Y is the row from top to bottom. Workspace coordinates are local
 to the targeted pane and exclude workspace chrome and borders. Target the selected pane by default,
 one stable pane with `--pane`, or one named window's active pane with `--window`. The application
-must have mouse tracking enabled.
+must have mouse tracking enabled. X and Y must be inside the actual target viewport.
 Direct sessions started with `--record-pointer` also retain this click as a structured event.
 
 Examples:
@@ -174,6 +176,7 @@ TO. Coordinates use the same zero-based, pane-local convention as `click`. `--st
 number of motion events, including the destination; short drags may emit the same cell more than
 once. Target the selected pane by default, one stable pane with `--pane`, or one named window's
 active pane with `--window`. The application must have mouse tracking enabled.
+Both endpoints must be inside the actual target viewport.
 Direct sessions started with `--record-pointer` also retain structured press, movement, and release.
 
 Examples:
@@ -1113,18 +1116,10 @@ fn main() -> Result<()> {
             println!("{}", args.name);
         }
         Command::Play(args) => {
-            let receipt = tape::play(&args.input)?;
+            let receipt = tape::play(&args.input, args.json)?;
             if !args.quiet {
                 if args.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&serde_json::json!({
-                            "status": "ok",
-                            "tape": receipt.source,
-                            "session": receipt.session,
-                            "recording": receipt.recording,
-                        }))?
-                    );
+                    println!("{}", serde_json::to_string(&receipt)?);
                 } else {
                     println!("played {}", receipt.source.display());
                     if let Some(recording) = receipt.recording {

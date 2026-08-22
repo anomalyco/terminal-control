@@ -1,6 +1,9 @@
 #![cfg(unix)]
 
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -171,6 +174,47 @@ fn click_and_drag_send_exact_sgr_mouse_events() {
         ]
         .concat()
     );
+}
+
+#[test]
+fn live_mouse_rejects_coordinates_outside_the_actual_viewport_before_recording() {
+    let session = NamedSession::new("mouse-bounds", "mouse-bounds-test");
+    let recording = session.runtime.join("mouse-bounds.termctrl");
+    let output = session.output(&[
+        "start",
+        session.name,
+        "--cols",
+        "2",
+        "--rows",
+        "1",
+        "--record",
+        recording.to_str().unwrap(),
+        "--record-pointer",
+        "--",
+        "/bin/sh",
+        "-c",
+        "stty raw -echo; cat >/dev/null",
+    ]);
+    assert_success(&output);
+    thread::sleep(Duration::from_millis(50));
+
+    for args in [
+        vec!["click", session.name, "2", "0"],
+        vec!["drag", session.name, "0", "0", "2", "0", "--pace-ms", "0"],
+    ] {
+        let output = session.output(&args);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("outside target viewport 2x1"),
+            "{args:?}: {stderr}"
+        );
+    }
+
+    assert_success(&session.output(&["stop", session.name]));
+    let entries = fs::read_to_string(recording).unwrap();
+    assert!(!entries.contains("\"type\":\"pointer\""), "{entries}");
+    assert!(!entries.contains("\"origin\":\"client\""), "{entries}");
 }
 
 #[test]
@@ -592,19 +636,59 @@ Stop
 }
 
 #[test]
+fn tape_json_rejects_non_utf8_receipt_paths_before_lifecycle_side_effects() {
+    let session = NamedSession::new("tape-json-path", "tape-json-path-test");
+    let directory = session
+        .runtime
+        .join(OsString::from_vec(b"non-utf8-\xff".to_vec()));
+    fs::create_dir(&directory).unwrap();
+    let tape = directory.join("demo.tape");
+    let setup_marker = directory.join("setup-ran");
+    fs::write(
+        &tape,
+        r#"Session tape-json-path-test
+Viewport 80 24
+Cwd "."
+Setup "/usr/bin/touch" "setup-ran"
+Launch "/bin/sh" "-c" "printf READY; sleep 30"
+Stop
+"#,
+    )
+    .unwrap();
+
+    let output = session
+        .command()
+        .arg("play")
+        .arg(&tape)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_ne!(output.status.code(), Some(101), "process panicked");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("play --json requires a UTF-8 tape path before lifecycle side effects"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!setup_marker.exists());
+    assert!(!session.output(&["status", session.name]).status.success());
+}
+
+#[test]
 fn tape_play_validates_before_launch_or_action_side_effects() {
     let session = NamedSession::new("tape-validate", "tape-validate-test");
     let tape = session.runtime.join("invalid.tape");
     fs::write(
         &tape,
         r#"Session tape-validate-test
-Viewport 80 24
+Viewport 2 1
 Cwd "."
 Setup "/usr/bin/touch" "setup-ran"
 Cleanup "/usr/bin/touch" "cleanup-ran"
 Launch "/usr/bin/touch" "launched"
 Action "/usr/bin/touch" "acted"
-Move 1 1 Steps 0
+Click 65534 0
 Stop
 "#,
     )
@@ -614,7 +698,7 @@ Stop
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("invalid.tape:8: move Steps must be between 1 and 1000")
+            .contains("invalid.tape:8: Click coordinate (65534, 0) is outside Viewport 2x1")
     );
     assert!(!session.runtime.join("setup-ran").exists());
     assert!(!session.runtime.join("cleanup-ran").exists());
@@ -753,5 +837,79 @@ Stop
         );
         thread::sleep(Duration::from_millis(10));
     }
+    assert!(!session.output(&["status", session.name]).status.success());
+}
+
+#[test]
+fn tape_action_bounds_drain_when_escaped_descendant_retains_output_pipes() {
+    let session = NamedSession::new("tape-action-drain", "tape-action-drain-test");
+    let helper = session.runtime.join("escape-action.sh");
+    let escaped_pid = session.runtime.join("escaped.pid");
+    let cleanup_marker = session.runtime.join("cleanup-ran");
+    fs::write(
+        &helper,
+        "#!/bin/sh\nsetsid /bin/sh -c 'echo $$ > escaped.pid; sleep 30' &\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    let tape = session.runtime.join("action-drain.tape");
+    fs::write(
+        &tape,
+        r#"Session tape-action-drain-test
+Viewport 80 24
+Cwd "."
+Cleanup "/usr/bin/touch" "cleanup-ran"
+Launch "/bin/sh" "-c" "printf READY; sleep 30"
+Wait READY Timeout 2s
+Action "./escape-action.sh" Timeout 1s
+Stop
+"#,
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    let mut playback = session
+        .command()
+        .arg("play")
+        .arg(&tape)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if playback.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = playback.kill();
+            panic!("playback did not bound Action output drain within 3 seconds");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let output = playback.wait_with_output().unwrap();
+
+    let pid = fs::read_to_string(&escaped_pid)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+
+    assert!(!output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Action failed"), "{stderr}");
+    assert!(
+        stderr.contains("left output pipes open after 250ms"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("detached descendants may still be running"),
+        "{stderr}"
+    );
+    assert!(cleanup_marker.exists(), "cleanup did not proceed");
     assert!(!session.output(&["status", session.name]).status.success());
 }

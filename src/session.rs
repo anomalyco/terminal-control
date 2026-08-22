@@ -185,6 +185,19 @@ fn is_primary_pointer_button(button: &PointerButton) -> bool {
     *button == PointerButton::Primary
 }
 
+fn validate_mouse_input(input: &[MouseInput], cols: u16, rows: u16) -> Result<()> {
+    for event in input {
+        if event.x >= cols || event.y >= rows {
+            bail!(
+                "mouse coordinate ({}, {}) is outside target viewport {cols}x{rows}; coordinates must satisfy X < {cols} and Y < {rows}",
+                event.x,
+                event.y,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// One named daemon session discovered in the local runtime directory.
 #[derive(Debug, Serialize)]
 pub struct NamedSessionStatus {
@@ -458,6 +471,7 @@ impl Session {
         if self.has_exited()? || self.stopped {
             bail!("session command has exited");
         }
+        validate_mouse_input(input, self.cols, self.rows)?;
         let last = input.len().saturating_sub(1);
         for (index, event) in input.iter().enumerate() {
             self.write_input(&event.bytes)?;
@@ -1472,18 +1486,25 @@ pub fn mouse_to_in(
     input: Vec<MouseInput>,
     pace: Duration,
 ) -> Result<()> {
+    let target = terminal_target(window, pane)?;
+    let shot = show_target(name, target.clone(), Duration::ZERO, Duration::ZERO)?;
+    validate_mouse_input(&input, shot.frame.cols, shot.frame.rows)?;
     if !status(name)?.launch.pointer_recording {
-        return send_to_in(
+        return send_to_target(
             name,
-            window,
-            pane,
+            target,
             input.into_iter().map(|event| event.bytes).collect(),
             pace,
         );
     }
-    if window.is_some() {
+    if matches!(target, TerminalTarget::Window(_)) {
         bail!("structured pointer recording is currently supported only by direct named sessions");
     }
+    let pane = match target {
+        TerminalTarget::Selected => None,
+        TerminalTarget::Pane(pane) => Some(pane),
+        TerminalTarget::Window(_) => unreachable!(),
+    };
     request(
         name,
         Request::Mouse {

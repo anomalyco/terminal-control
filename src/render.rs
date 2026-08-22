@@ -122,7 +122,10 @@ pub fn svg(frame: &Frame, options: &Options) -> String {
             cursor.color.css(),
         ));
     }
-    if let Some(pointer) = options.pointer {
+    if let Some(pointer) = options.pointer
+        && pointer.x < frame.cols
+        && pointer.y < frame.rows
+    {
         output.push_str(&pointer_svg(pointer, options));
     }
     output.push_str("</g></svg>");
@@ -541,6 +544,34 @@ mod tests {
         assert!(output.contains("#f9fafb"));
         assert!(output.contains("cx=\"40.5\""));
         assert!(output.contains("cy=\"81\""));
+    }
+
+    #[test]
+    fn does_not_render_pointer_evidence_outside_the_frame() {
+        let frame = Frame {
+            version: 1,
+            cols: 2,
+            rows: 1,
+            foreground: crate::frame::DEFAULT_FOREGROUND,
+            background: crate::frame::DEFAULT_BACKGROUND,
+            cursor: None,
+            cells: Vec::new(),
+        };
+        let output = svg(
+            &frame,
+            &Options {
+                pointer: Some(PointerOverlay {
+                    x: 2,
+                    y: 0,
+                    opacity: u8::MAX,
+                    click: u8::MAX,
+                    pressed: true,
+                }),
+                ..Options::default()
+            },
+        );
+
+        assert!(!output.contains("data-termctrl-pointer"), "{output}");
     }
     use crate::frame::{Attributes, Color, Frame, Underline};
 

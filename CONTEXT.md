@@ -17,8 +17,10 @@ A named terminal application that remains available across waiting, input, resiz
 An embedded session owns the same live terminal lifecycle in-process; the named CLI session commands are an adapter for interacting with that lifecycle across invocations. A named session daemon starts in a separate Unix session from its launcher, so shell and process-group hangups do not end it. It remains available until explicitly stopped, including after its application exits while the final screen is retained.
 
 Mouse control addresses zero-based cells in the target application's viewport. For workspace panes,
-coordinates are pane-local and exclude composed workspace chrome and borders. A click is one primary
-button press and release; a drag is a primary press, interpolated held-button motion, and release.
+coordinates are pane-local and exclude composed workspace chrome and borders. Live mouse input is
+checked against the actual selected target before PTY input or structured recording mutation. A click
+is one primary button press and release; a drag is a primary press, interpolated held-button motion,
+and release.
 Direct named sessions may explicitly enable structured pointer recording. That produces recording
 version 2 press, move, and release events and exposes the current pointer state to opt-in live SVG or
 PNG rendering. Bare pointer rendering fades after inactivity; persistent rendering retains the last
@@ -72,7 +74,10 @@ actions run before launch; ordered steps use visible-text waits, paced text or k
 drag controls, markers, presentation holds, bounded argv-based host actions, and a required clean
 stop. Reverse-order cleanup runs only after the owned session is confirmed stopped, on both success
 and safe failure paths. Relative paths resolve from the tape directory, failures identify the source
-line, and cleanup failures follow rather than mask the primary failure.
+line, and cleanup failures follow rather than mask the primary failure. Mouse endpoints are validated
+against the declared viewport before lifecycle effects. Action output capture and drain are finite;
+escaped new-session descendants can outlive the action group but cannot retain pipes indefinitely and
+block owned-session cleanup. JSON receipt paths are validated as UTF-8 before setup or launch.
 Tape pointer position is execution state, not recording policy. The first unpressed Move establishes
 it with one no-button SGR event; subsequent Moves interpolate from it, and Click, RightClick, or Drag updates it.
 `Pointer on` only decides whether those inputs are also retained as structured v2 events.

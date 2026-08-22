@@ -44,9 +44,14 @@ before Launch and reverse-order cleanup runs only after the owned session is con
 including safe failure paths. Relative paths resolve from the tape directory. The `.tape` authoring
 source is distinct from any private `.termctrl`
 recording it creates; inspect that recording and run `video --edit` as a separate phase.
-Add `Pointer on` only when the demo needs structured click and drag overlays. It requires `Record`,
+Add `Pointer on` only when the demo needs structured click, move, and drag overlays. It requires `Record`,
 writes opt-in recording version 2, and is rendered only with `--pointer`; ordinary recordings remain
 version 1. Pointer capture currently applies to direct named sessions, not composed workspaces.
+Use `Move X Y [Steps N] [Pace DURATION]` for smooth unpressed travel. The first Move establishes the
+position; later Moves interpolate, and Click/Drag update the same position. Bare `--pointer` fades as
+before. Use `--pointer=persistent` when a long presentation hold should retain the latest position;
+click feedback remains brief and no pointer appears before the first event. Do not confuse this
+render choice with the tape's `Pointer on` capture policy.
 
 Enter a visible workspace that humans and agents control together:
 
@@ -107,6 +112,7 @@ output is a rendered snapshot; pane-targeted ANSI is the original pane stream.
 - Use `save --format ... --out ...` only when a persisted artifact is required.
 - Use `video` only after explicitly recording a timeline with `--record`.
 - Use `--record-pointer` plus `--pointer` only when graphical mouse causality is part of the evidence.
+- Use persistent pointer rendering only when the latest target must remain legible through idle holds.
 - Use `play` when a repeatable interaction belongs in a reviewed `.tape` source file.
 
 Do not treat logs as the visible state of an alternate-screen TUI.

@@ -177,8 +177,13 @@ fn click_and_drag_send_exact_sgr_mouse_events() {
 fn pointer_enabled_session_records_structured_events_and_renders_live_and_replay() {
     let session = NamedSession::new("pointer-recording", "pointer-recording-test");
     let recording = session.runtime.join("pointer.termctrl");
+    let before = session.runtime.join("before.svg");
     let live = session.runtime.join("live.svg");
     let replay = session.runtime.join("replay.svg");
+    let live_faded = session.runtime.join("live-faded.svg");
+    let live_persistent = session.runtime.join("live-persistent.svg");
+    let replay_faded = session.runtime.join("replay-faded.svg");
+    let replay_persistent = session.runtime.join("replay-persistent.svg");
     let output = session.output(&[
         "start",
         session.name,
@@ -192,6 +197,20 @@ fn pointer_enabled_session_records_structured_events_and_renders_live_and_replay
     ]);
     assert_success(&output);
     assert_success(&session.output(&["wait", session.name, "READY"]));
+    assert_success(&session.output(&[
+        "save",
+        session.name,
+        "--format",
+        "svg",
+        "--pointer=persistent",
+        "--out",
+        before.to_str().unwrap(),
+    ]));
+    assert!(
+        !fs::read_to_string(before)
+            .unwrap()
+            .contains("data-termctrl-pointer=\"true\"")
+    );
     assert_success(&session.output(&["click", session.name, "12", "4"]));
     assert_success(&session.output(&[
         "drag",
@@ -215,6 +234,26 @@ fn pointer_enabled_session_records_structured_events_and_renders_live_and_replay
         "--out",
         live.to_str().unwrap(),
     ]));
+    thread::sleep(Duration::from_millis(1_300));
+    assert_success(&session.output(&["mark", session.name, "pointer-idle"]));
+    assert_success(&session.output(&[
+        "save",
+        session.name,
+        "--format",
+        "svg",
+        "--pointer",
+        "--out",
+        live_faded.to_str().unwrap(),
+    ]));
+    assert_success(&session.output(&[
+        "save",
+        session.name,
+        "--format",
+        "svg",
+        "--pointer=persistent",
+        "--out",
+        live_persistent.to_str().unwrap(),
+    ]));
     assert_success(&session.output(&["stop", session.name]));
     assert_success(&session.output(&[
         "save",
@@ -227,6 +266,30 @@ fn pointer_enabled_session_records_structured_events_and_renders_live_and_replay
         "--pointer",
         "--out",
         replay.to_str().unwrap(),
+    ]));
+    assert_success(&session.output(&[
+        "save",
+        "--recording",
+        recording.to_str().unwrap(),
+        "--at-marker",
+        "pointer-idle",
+        "--format",
+        "svg",
+        "--pointer",
+        "--out",
+        replay_faded.to_str().unwrap(),
+    ]));
+    assert_success(&session.output(&[
+        "save",
+        "--recording",
+        recording.to_str().unwrap(),
+        "--at-marker",
+        "pointer-idle",
+        "--format",
+        "svg",
+        "--pointer=persistent",
+        "--out",
+        replay_persistent.to_str().unwrap(),
     ]));
 
     let entries: Vec<serde_json::Value> = fs::read_to_string(&recording)
@@ -246,8 +309,23 @@ fn pointer_enabled_session_records_structured_events_and_renders_live_and_replay
     );
     for path in [live, replay] {
         let svg = fs::read_to_string(path).unwrap();
-        assert!(svg.contains("#f9fafb"), "{svg}");
-        assert!(svg.contains("#111827"), "{svg}");
+        assert!(svg.contains("data-termctrl-pointer=\"true\""), "{svg}");
+        assert!(
+            svg.contains("data-termctrl-pointer-click=\"true\""),
+            "{svg}"
+        );
+    }
+    for path in [live_faded, replay_faded] {
+        let svg = fs::read_to_string(path).unwrap();
+        assert!(!svg.contains("data-termctrl-pointer=\"true\""), "{svg}");
+    }
+    for path in [live_persistent, replay_persistent] {
+        let svg = fs::read_to_string(path).unwrap();
+        assert!(svg.contains("data-termctrl-pointer=\"true\""), "{svg}");
+        assert!(
+            !svg.contains("data-termctrl-pointer-click=\"true\""),
+            "{svg}"
+        );
     }
 }
 
@@ -268,12 +346,16 @@ Env DEMO_ENV "quoted # value"
 Record "demo.termctrl"
 Pointer on
 Color never
-Launch "/bin/sh" "-c" "stty raw -echo; printf READY:%s:%s \"$DEMO_ENV\" \"$PWD\"; od -An -tx1 -v -N 64; while [ ! -f action-ready ]; do sleep 0.01; done; printf FIXTURE; sleep 30"
+Launch "/bin/sh" "-c" "stty raw -echo; printf READY:%s:%s \"$DEMO_ENV\" \"$PWD\"; (while [ ! -f action-ready ]; do sleep 0.01; done; printf FIXTURE) & od -An -tx1 -v"
 Wait "READY:quoted # value" Timeout 2s
 Type "hello" Pace 1ms
 Key enter
+Move 5 2 Steps 4 Pace 0ms
+Move 9 2 Steps 2 Pace 0ms
 Click 12 4
+Move 14 4 Steps 2 Pace 0ms
 Drag 0 0 2 0 Steps 2 Pace 0ms
+Move 4 0 Steps 2 Pace 0ms
 Action "/usr/bin/touch" "action-ready"
 Wait FIXTURE Timeout 2s
 Mark complete
@@ -303,7 +385,35 @@ Stop
             .iter()
             .any(|entry| { entry["type"] == "marker" && entry["name"] == "complete" })
     );
-    assert!(entries.iter().any(|entry| entry["type"] == "pointer"));
+    let pointer_events = entries
+        .iter()
+        .filter(|entry| entry["type"] == "pointer")
+        .map(|entry| {
+            (
+                entry["x"].as_u64().unwrap(),
+                entry["y"].as_u64().unwrap(),
+                entry["phase"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pointer_events,
+        [
+            (5, 2, "move"),
+            (7, 2, "move"),
+            (9, 2, "move"),
+            (12, 4, "press"),
+            (12, 4, "release"),
+            (13, 4, "move"),
+            (14, 4, "move"),
+            (0, 0, "press"),
+            (1, 0, "move"),
+            (2, 0, "move"),
+            (2, 0, "release"),
+            (3, 0, "move"),
+            (4, 0, "move"),
+        ]
+    );
     let client_input: Vec<u8> = entries
         .iter()
         .filter(|entry| entry["type"] == "input" && entry["origin"] == "client")
@@ -319,15 +429,66 @@ Stop
         client_input,
         [
             b"hello\r".as_slice(),
+            b"\x1b[<35;6;3M".as_slice(),
+            b"\x1b[<35;8;3M".as_slice(),
+            b"\x1b[<35;10;3M".as_slice(),
             b"\x1b[<0;13;5M".as_slice(),
             b"\x1b[<0;13;5m".as_slice(),
+            b"\x1b[<35;14;5M".as_slice(),
+            b"\x1b[<35;15;5M".as_slice(),
             b"\x1b[<0;1;1M".as_slice(),
             b"\x1b[<32;2;1M".as_slice(),
             b"\x1b[<32;3;1M".as_slice(),
             b"\x1b[<0;3;1m".as_slice(),
+            b"\x1b[<35;4;1M".as_slice(),
+            b"\x1b[<35;5;1M".as_slice(),
         ]
         .concat()
     );
+}
+
+#[test]
+fn tape_move_sends_exact_unpressed_motion_without_pointer_recording() {
+    let session = NamedSession::new("tape-move", "tape-move-test");
+    let tape = session.runtime.join("move.tape");
+    let observed = session.runtime.join("observed.hex");
+    let expected = [
+        b"\x1b[<35;2;2M".as_slice(),
+        b"\x1b[<35;4;2M".as_slice(),
+        b"\x1b[<35;6;2M".as_slice(),
+        b"\x1b[<0;3;4M".as_slice(),
+        b"\x1b[<0;3;4m".as_slice(),
+        b"\x1b[<35;4;4M".as_slice(),
+        b"\x1b[<35;5;4M".as_slice(),
+        b"\x1b[<0;1;1M".as_slice(),
+        b"\x1b[<32;2;1M".as_slice(),
+        b"\x1b[<32;3;1M".as_slice(),
+        b"\x1b[<0;3;1m".as_slice(),
+        b"\x1b[<35;4;1M".as_slice(),
+        b"\x1b[<35;5;1M".as_slice(),
+    ]
+    .concat();
+    let source = format!(
+        r#"Session tape-move-test
+Viewport 80 24
+Cwd "."
+Launch "/bin/sh" "-c" "stty raw -echo; printf READY; od -An -tx1 -v -N {} > observed.hex; printf DONE; sleep 30"
+Wait READY Timeout 2s
+Move 1 1 Steps 9 Pace 0ms
+Move 5 1 Steps 2 Pace 0ms
+Click 2 3
+Move 4 3 Steps 2 Pace 0ms
+Drag 0 0 2 0 Steps 2 Pace 0ms
+Move 4 0 Steps 2 Pace 0ms
+Wait DONE Timeout 2s
+Stop
+"#,
+        expected.len()
+    );
+    fs::write(&tape, source).unwrap();
+
+    assert_success(&session.output(&["play", tape.to_str().unwrap()]));
+    assert_eq!(parsed_hex(&fs::read(observed).unwrap()), expected);
 }
 
 #[test]
@@ -343,14 +504,18 @@ Setup "/usr/bin/touch" "setup-ran"
 Cleanup "/usr/bin/touch" "cleanup-ran"
 Launch "/usr/bin/touch" "launched"
 Action "/usr/bin/touch" "acted"
-Stop extra
+Move 1 1 Steps 0
+Stop
 "#,
     )
     .unwrap();
 
     let output = session.output(&["play", tape.to_str().unwrap()]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid.tape:8: usage: Stop"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("invalid.tape:8: move Steps must be between 1 and 1000")
+    );
     assert!(!session.runtime.join("setup-ran").exists());
     assert!(!session.runtime.join("cleanup-ran").exists());
     assert!(!session.runtime.join("launched").exists());

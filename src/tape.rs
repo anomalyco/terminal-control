@@ -78,6 +78,12 @@ enum Step {
         x: u16,
         y: u16,
     },
+    Move {
+        line: usize,
+        to: (u16, u16),
+        steps: u16,
+        pace: Duration,
+    },
     Drag {
         line: usize,
         from: (u16, u16),
@@ -109,6 +115,7 @@ impl Step {
             | Self::Type { line, .. }
             | Self::Key { line, .. }
             | Self::Click { line, .. }
+            | Self::Move { line, .. }
             | Self::Drag { line, .. }
             | Self::Mark { line, .. }
             | Self::Sleep { line, .. }
@@ -123,6 +130,7 @@ impl Step {
             Self::Type { .. } => "Type",
             Self::Key { .. } => "Key",
             Self::Click { .. } => "Click",
+            Self::Move { .. } => "Move",
             Self::Drag { .. } => "Drag",
             Self::Mark { .. } => "Mark",
             Self::Sleep { .. } => "Sleep",
@@ -395,6 +403,25 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
                     .map_err(|error| located_error(source, line, "invalid Click", error))?;
                 steps.push(Step::Click { line, x, y });
             }
+            "Move" => {
+                require_step(source, line, command, before_launch)?;
+                if tokens.len() < 3 {
+                    return line_error(source, line, "usage: Move X Y [Steps N] [Pace DURATION]");
+                }
+                let to = (
+                    number::<u16>(source, line, &tokens[1], "move x")?,
+                    number::<u16>(source, line, &tokens[2], "move y")?,
+                );
+                let (move_steps, pace) = motion_options(source, line, &tokens, 3, "Move")?;
+                super::mouse_move(None, to, move_steps)
+                    .map_err(|error| located_error(source, line, "invalid Move", error))?;
+                steps.push(Step::Move {
+                    line,
+                    to,
+                    steps: move_steps,
+                    pace,
+                });
+            }
             "Drag" => {
                 require_step(source, line, command, before_launch)?;
                 if tokens.len() < 5 {
@@ -412,44 +439,7 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
                     number::<u16>(source, line, &tokens[3], "drag to x")?,
                     number::<u16>(source, line, &tokens[4], "drag to y")?,
                 );
-                let mut drag_steps = 10;
-                let mut pace = Duration::from_millis(8);
-                let mut saw_steps = false;
-                let mut saw_pace = false;
-                let mut option = 5;
-                while option < tokens.len() {
-                    if option + 1 >= tokens.len() {
-                        return line_error(source, line, "Drag options require a value");
-                    }
-                    match tokens[option].as_str() {
-                        "Steps" if !saw_steps => {
-                            drag_steps =
-                                number::<u16>(source, line, &tokens[option + 1], "drag steps")?;
-                            if !(1..=1000).contains(&drag_steps) {
-                                return line_error(
-                                    source,
-                                    line,
-                                    "drag Steps must be between 1 and 1000",
-                                );
-                            }
-                            saw_steps = true;
-                        }
-                        "Pace" if !saw_pace => {
-                            pace = duration(source, line, &tokens[option + 1], true)?;
-                            saw_pace = true;
-                        }
-                        "Steps" => return line_error(source, line, "duplicate Drag Steps option"),
-                        "Pace" => return line_error(source, line, "duplicate Drag Pace option"),
-                        other => {
-                            return line_error(
-                                source,
-                                line,
-                                format!("unknown Drag option {other:?}"),
-                            );
-                        }
-                    }
-                    option += 2;
-                }
+                let (drag_steps, pace) = motion_options(source, line, &tokens, 5, "Drag")?;
                 mouse_drag(from, to, drag_steps)
                     .map_err(|error| located_error(source, line, "invalid Drag", error))?;
                 steps.push(Step::Drag {
@@ -601,8 +591,9 @@ fn execute(tape: Tape) -> Result<()> {
 
     if primary.is_none() {
         let owned = owned.as_mut().expect("successful launch owns a session");
+        let mut pointer_position = None;
         for step in &tape.steps {
-            if let Err(error) = execute_step(&tape, step, owned) {
+            if let Err(error) = execute_step(&tape, step, owned, &mut pointer_position) {
                 primary = Some(located_error(
                     &tape.source,
                     step.line(),
@@ -644,7 +635,12 @@ fn execute(tape: Tape) -> Result<()> {
     finish_lifecycle(primary, additional)
 }
 
-fn execute_step(tape: &Tape, step: &Step, owned: &mut OwnedSession) -> Result<()> {
+fn execute_step(
+    tape: &Tape,
+    step: &Step,
+    owned: &mut OwnedSession,
+    pointer_position: &mut Option<(u16, u16)>,
+) -> Result<()> {
     match step {
         Step::Wait { text, timeout, .. } => {
             if let Err(error) = session::wait(&tape.name, text.clone(), *timeout) {
@@ -678,6 +674,27 @@ fn execute_step(tape: &Tape, step: &Step, owned: &mut OwnedSession) -> Result<()
             } else {
                 session::send(&tape.name, mouse_click(*x, *y)?, Duration::ZERO)?;
             }
+            *pointer_position = Some((*x, *y));
+        }
+        Step::Move {
+            to, steps, pace, ..
+        } => {
+            if tape.pointer_recording {
+                session::mouse_to_in(
+                    &tape.name,
+                    None,
+                    None,
+                    super::mouse_move_events(*pointer_position, *to, *steps)?,
+                    *pace,
+                )?;
+            } else {
+                session::send(
+                    &tape.name,
+                    super::mouse_move(*pointer_position, *to, *steps)?,
+                    *pace,
+                )?;
+            }
+            *pointer_position = Some(*to);
         }
         Step::Drag {
             from,
@@ -697,6 +714,7 @@ fn execute_step(tape: &Tape, step: &Step, owned: &mut OwnedSession) -> Result<()
             } else {
                 session::send(&tape.name, mouse_drag(*from, *to, *steps)?, *pace)?;
             }
+            *pointer_position = Some(*to);
         }
         Step::Mark { name, .. } => session::mark(&tape.name, name.clone())?,
         Step::Sleep { duration, .. } => thread::sleep(*duration),
@@ -1032,6 +1050,60 @@ fn paced_values(
     Ok((tokens[1..].to_vec(), Duration::ZERO))
 }
 
+fn motion_options(
+    source: &Path,
+    line: usize,
+    tokens: &[String],
+    mut option: usize,
+    command: &str,
+) -> Result<(u16, Duration)> {
+    let mut steps = 10;
+    let mut pace = Duration::from_millis(8);
+    let mut saw_steps = false;
+    let mut saw_pace = false;
+    while option < tokens.len() {
+        if option + 1 >= tokens.len() {
+            return line_error(source, line, format!("{command} options require a value"));
+        }
+        match tokens[option].as_str() {
+            "Steps" if !saw_steps => {
+                steps = number::<u16>(
+                    source,
+                    line,
+                    &tokens[option + 1],
+                    &format!("{} steps", command.to_ascii_lowercase()),
+                )?;
+                if !(1..=1000).contains(&steps) {
+                    return line_error(
+                        source,
+                        line,
+                        format!(
+                            "{} Steps must be between 1 and 1000",
+                            command.to_ascii_lowercase()
+                        ),
+                    );
+                }
+                saw_steps = true;
+            }
+            "Pace" if !saw_pace => {
+                pace = duration(source, line, &tokens[option + 1], true)?;
+                saw_pace = true;
+            }
+            "Steps" => {
+                return line_error(source, line, format!("duplicate {command} Steps option"));
+            }
+            "Pace" => {
+                return line_error(source, line, format!("duplicate {command} Pace option"));
+            }
+            other => {
+                return line_error(source, line, format!("unknown {command} option {other:?}"));
+            }
+        }
+        option += 2;
+    }
+    Ok((steps, pace))
+}
+
 fn parse_action(source: &Path, line: usize, tokens: &[String], name: &str) -> Result<ActionSpec> {
     at_least_args(
         source,
@@ -1262,8 +1334,11 @@ Launch "demo-app" "--mode" 'literal # argument'
 Wait "Ready #1" Timeout 2s
 Type "hello \"tape\"" Pace 35ms
 Key ctrl-p down enter Pace 10ms
+Move 4 2 Steps 8 Pace 0ms
+Move 8 2 Steps 2 Pace 4ms
 Click 12 4
 Drag 12 4 30 4 Pace 0ms Steps 6
+Move 34 4 Steps 2 Pace 0ms
 Mark "after-input"
 Sleep 250ms
 Action "/usr/bin/touch" "fixture ready" Timeout 3s
@@ -1289,7 +1364,7 @@ Stop
         assert_eq!(tape.setup[0].value.timeout, Duration::from_secs(2));
         assert_eq!(tape.cleanup.len(), 1);
         assert_eq!(tape.cleanup[0].value.timeout, DEFAULT_ACTION_TIMEOUT);
-        assert_eq!(tape.steps.len(), 9);
+        assert_eq!(tape.steps.len(), 12);
         assert!(matches!(
             &tape.steps[1],
             Step::Type { text, pace, .. }
@@ -1297,11 +1372,16 @@ Stop
         ));
         assert!(matches!(
             &tape.steps[4],
+            Step::Move { to, steps, pace, .. }
+                if *to == (8, 2) && *steps == 2 && *pace == Duration::from_millis(4)
+        ));
+        assert!(matches!(
+            &tape.steps[6],
             Step::Drag { steps, pace, .. }
                 if *steps == 6 && pace.is_zero()
         ));
         assert!(matches!(
-            &tape.steps[7],
+            &tape.steps[10],
             Step::Action { action, .. } if action.timeout == Duration::from_secs(3)
         ));
     }
@@ -1342,6 +1422,20 @@ Stop
             parse(
                 Path::new("demo.tape"),
                 "Session demo\nViewport 80 24\nLaunch app\nKey unsupported\nStop\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                Path::new("demo.tape"),
+                "Session demo\nViewport 80 24\nLaunch app\nMove 1 2 Steps 0\nStop\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                Path::new("demo.tape"),
+                "Session demo\nViewport 80 24\nLaunch app\nMove 1 2 Pace 1ms Pace 2ms\nStop\n"
             )
             .is_err()
         );

@@ -54,19 +54,27 @@ Steps follow `Launch` in order:
 | `Type TEXT [Pace DURATION]` | Send text, optionally one Unicode scalar at a time. |
 | `Key KEY [KEY ...] [Pace DURATION]` | Send supported named keys in order. |
 | `Click X Y` | Send a primary click at a zero-based application cell. |
+| `Move X Y [Steps N] [Pace DURATION]` | Move the unpressed pointer; defaults to 10 points at 8 ms. |
 | `Drag X1 Y1 X2 Y2 [Steps N] [Pace DURATION]` | Send primary drag events; defaults to 10 steps at 8 ms. |
 | `Mark NAME` | Add a unique recording marker; requires `Record`. |
 | `Sleep DURATION` | Hold the presentation deliberately without checking state. |
 | `Action PROGRAM [ARG ...] [Timeout DURATION]` | Run an in-session host action using exact argv. |
 | `Stop` | Required final command; stop the owned named session cleanly. |
 
-`Type` and `Key` accept the same named-key vocabulary as `termctrl send`. `Click` and `Drag` reuse
-the normal SGR mouse implementation, so the application must enable mouse tracking. Coordinates are
-application-cell coordinates, not screen pixels.
+`Type` and `Key` accept the same named-key vocabulary as `termctrl send`. `Click`, `Move`, and `Drag`
+reuse the normal SGR mouse implementation, so the application must enable the corresponding mouse
+tracking. Coordinates are application-cell coordinates, not screen pixels. The first `Move`
+establishes the tape pointer position with one honest no-button motion event; it does not invent a
+path from an unknown origin. Later Moves interpolate `Steps` events from the authoritative position,
+including the destination. Click sets the position to its target and Drag sets it to its endpoint.
 
-With `Pointer on`, click and drag also produce structured press, move, and release events in an
+With `Pointer on`, click, move, and drag also produce structured press, move, and release events in an
 opt-in version 2 recording. Render them with `save --recording ... --pointer` or `video --pointer`.
-Without that directive, tape recordings remain version 1 and render exactly as before.
+Without that directive, tape recordings remain version 1 and existing Click/Drag behavior is
+unchanged; Move still sends its explicit no-button input to the application. `Pointer on` controls
+capture only. Bare `--pointer` uses the fading renderer, while `--pointer=persistent` keeps the most
+recent event visible without prolonging press or click feedback. No overlay exists before the first
+event.
 
 `Setup`, `Action`, and `Cleanup` have a finite 30-second default timeout. A trailing
 `Timeout DURATION` overrides it. Each action starts in its own Unix process group; timeout terminates
@@ -93,6 +101,8 @@ Cleanup "/usr/bin/rm" "-f" "fixtures/game.json"
 Launch "cargo" "run" "--release" "--bin" "ttt"
 
 Wait "Choose a square" Timeout 10s
+Move 8 8
+Move 12 8 Steps 8 Pace 16ms
 Click 12 8
 Wait "Your turn"
 Type "middle" Pace 35ms

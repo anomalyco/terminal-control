@@ -44,10 +44,13 @@ Sources:
 Use --format json, --format ansi, or --format svg for another terminal representation. Use
 `--format semantic` with a named target for optional application-provided UI semantics.
 Use `--at-marker NAME` or `--at-ms MS` with --recording to inspect an exact moment. Use `save`
-to write files.";
+to write files. On pointer-enabled sources, bare `--pointer` fades after inactivity; use
+`--pointer=persistent` to retain the latest position.";
 
 const SAVE_HELP: &str = "\
 Save freezes a visible terminal screen and writes exactly the requested artifact formats.
+On pointer-enabled sources, bare `--pointer` preserves the existing fading overlay behavior;
+`--pointer=persistent` keeps the latest position visible without extending click feedback.
 
 Examples:
   termctrl save demo --format png --out captures/current.png
@@ -84,7 +87,8 @@ Use Wait for application readiness and Sleep only for deliberate presentation ho
 and Cleanup run explicit argv vectors with a finite 30-second default timeout and bounded output;
 they never implicitly invoke a shell. Setup runs before Launch. Cleanup runs in reverse declaration
 order after the owned session stops, including failure paths where session shutdown is confirmed.
-`Pointer on` requires Record and captures structured click and drag events for optional rendering.
+`Pointer on` requires Record and captures structured click, move, and drag events for rendering.
+Move sends smooth unpressed motion from the last tape pointer position; the first Move establishes it.
 Add `Timeout DURATION` to any host action when the default is unsuitable. Cleanup errors are reported
 after the primary playback error. Video rendering remains a separate
 `termctrl video RECORDING --edit PLAN` phase.
@@ -185,6 +189,8 @@ Pass `--footer` to add a bottom row with the clip caption, elapsed timecode, and
 branding; without it, edit-plan captions render as inline annotation rows.
 Use `--pointer` to overlay structured pointer events from a version 2 recording. Pointer capture is
 opt-in at direct-session start and leaves default version 1 recordings and exports unchanged.
+Bare `--pointer` fades after inactivity. `--pointer=persistent` keeps the latest position fully
+opaque while click feedback still expires normally; no overlay precedes the first pointer event.
 
 Example:
   termctrl start demo --record captures/demo.termctrl -- opencode
@@ -351,9 +357,15 @@ struct RenderArgs {
     /// Hide the terminal cursor in rendered output.
     #[arg(long)]
     hide_cursor: bool,
-    /// Overlay structured pointer state from an opted-in session or version 2 recording.
-    #[arg(long)]
-    pointer: bool,
+    /// Overlay structured pointer state; use `--pointer=persistent` to prevent fading.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "fading",
+        require_equals = true
+    )]
+    pointer: Option<PointerMode>,
 }
 
 #[derive(Args)]
@@ -995,15 +1007,38 @@ struct VideoArgs {
     /// Include leading contentless startup/terminal negotiation frames.
     #[arg(long)]
     include_startup: bool,
-    /// Overlay recorded pointer movement, click feedback, and inactivity fade.
-    #[arg(long)]
-    pointer: bool,
+    /// Overlay recorded pointer movement; use `--pointer=persistent` to prevent fading.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "fading",
+        require_equals = true
+    )]
+    pointer: Option<PointerMode>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum HostProfile {
     /// Respond to OpenTUI startup terminal capability queries.
     Opentui,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum PointerMode {
+    /// Fade after a short period without pointer input.
+    Fading,
+    /// Keep the most recent pointer position fully visible.
+    Persistent,
+}
+
+impl From<PointerMode> for render::PointerMode {
+    fn from(mode: PointerMode) -> Self {
+        match mode {
+            PointerMode::Fading => Self::Fading,
+            PointerMode::Persistent => Self::Persistent,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1167,7 +1202,8 @@ fn main() -> Result<()> {
         Command::Stop(args) => session::stop(&args.name)?,
         Command::Video(args) => {
             let out = args.out.clone();
-            recording::video(
+            let pointer_mode = args.pointer.map(Into::into);
+            recording::video_with_pointer_mode(
                 &args.input,
                 &recording::VideoOptions {
                     out: args.out,
@@ -1182,8 +1218,9 @@ fn main() -> Result<()> {
                     tail: Duration::from_millis(args.tail_ms),
                     include_startup: args.include_startup,
                     edit: args.edit,
-                    pointer: args.pointer,
+                    pointer: pointer_mode.is_some(),
                 },
+                pointer_mode,
             )?;
             println!("{}", out.display());
         }
@@ -1518,6 +1555,13 @@ fn mouse_drag(from: (u16, u16), to: (u16, u16), steps: u16) -> Result<Vec<Vec<u8
         .collect())
 }
 
+fn mouse_move(from: Option<(u16, u16)>, to: (u16, u16), steps: u16) -> Result<Vec<Vec<u8>>> {
+    Ok(mouse_move_events(from, to, steps)?
+        .into_iter()
+        .map(|event| event.bytes)
+        .collect())
+}
+
 fn mouse_click_events(x: u16, y: u16) -> Result<Vec<session::MouseInput>> {
     Ok(vec![
         session::MouseInput {
@@ -1567,6 +1611,38 @@ fn mouse_drag_events(
         phase: recording::PointerPhase::Release,
     });
     Ok(input)
+}
+
+fn mouse_move_events(
+    from: Option<(u16, u16)>,
+    to: (u16, u16),
+    steps: u16,
+) -> Result<Vec<session::MouseInput>> {
+    if steps == 0 {
+        bail!("move steps must be greater than zero");
+    }
+    let points = match from {
+        Some(from) => (1..=steps)
+            .map(|step| {
+                (
+                    interpolate(from.0, to.0, step, steps),
+                    interpolate(from.1, to.1, step, steps),
+                )
+            })
+            .collect::<Vec<_>>(),
+        None => vec![to],
+    };
+    points
+        .into_iter()
+        .map(|(x, y)| {
+            Ok(session::MouseInput {
+                bytes: sgr_mouse(35, x, y, b'M')?,
+                x,
+                y,
+                phase: recording::PointerPhase::Move,
+            })
+        })
+        .collect()
 }
 
 fn interpolate(from: u16, to: u16, step: u16, steps: u16) -> u16 {
@@ -2051,7 +2127,7 @@ fn write_outputs(
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let enabled = |format| formats.contains(&format);
-    if args.pointer && !enabled(ShotFormat::Svg) && !enabled(ShotFormat::Png) {
+    if args.pointer.is_some() && !enabled(ShotFormat::Svg) && !enabled(ShotFormat::Png) {
         bail!("--pointer requires a rendered PNG or SVG format");
     }
     let svg = if enabled(ShotFormat::Svg) || enabled(ShotFormat::Png) {
@@ -2110,7 +2186,7 @@ fn write_stdout(captured: &shot_engine::Shot, args: &RenderArgs, format: ShotFor
 }
 
 fn rendered_svg(captured: &shot_engine::Shot, args: &RenderArgs) -> Result<String> {
-    if args.pointer && !captured.pointer_recording {
+    if args.pointer.is_some() && !captured.pointer_recording {
         bail!("--pointer requires a pointer-enabled named session or version 2 recording");
     }
     Ok(render::svg(
@@ -2122,11 +2198,11 @@ fn rendered_svg(captured: &shot_engine::Shot, args: &RenderArgs) -> Result<Strin
             padding: args.padding,
             font_family: args.font_family.clone(),
             show_cursor: !args.hide_cursor,
-            pointer: args
-                .pointer
-                .then_some(captured.pointer)
-                .flatten()
-                .and_then(render::PointerOverlay::from_snapshot),
+            pointer: args.pointer.and_then(|mode| {
+                captured.pointer.and_then(|pointer| {
+                    render::PointerOverlay::from_snapshot_with_mode(pointer, mode.into())
+                })
+            }),
         },
     ))
 }
@@ -2530,6 +2606,40 @@ mod tests {
     }
 
     #[test]
+    fn pointer_flag_defaults_to_fading_and_accepts_explicit_modes() {
+        let cli = Cli::try_parse_from(["termctrl", "show", "--pointer", "demo", "--format", "svg"])
+            .unwrap();
+        let Command::Show(args) = cli.command else {
+            panic!("expected show command");
+        };
+        assert_eq!(args.render.pointer, Some(PointerMode::Fading));
+        assert_eq!(args.source.name.as_deref(), Some("demo"));
+
+        let cli = Cli::try_parse_from([
+            "termctrl",
+            "save",
+            "demo",
+            "--format",
+            "svg",
+            "--out",
+            "demo.svg",
+            "--pointer=persistent",
+        ])
+        .unwrap();
+        let Command::Save(args) = cli.command else {
+            panic!("expected save command");
+        };
+        assert_eq!(args.render.pointer, Some(PointerMode::Persistent));
+
+        let cli = Cli::try_parse_from(["termctrl", "video", "demo.termctrl", "--pointer=fading"])
+            .unwrap();
+        let Command::Video(args) = cli.command else {
+            panic!("expected video command");
+        };
+        assert_eq!(args.pointer, Some(PointerMode::Fading));
+    }
+
+    #[test]
     fn rejects_settling_options_for_pipe_reads() {
         let cli = Cli::try_parse_from([
             "termctrl",
@@ -2634,5 +2744,19 @@ mod tests {
             ]
         );
         assert!(mouse_drag((0, 0), (1, 1), 0).is_err());
+    }
+
+    #[test]
+    fn encodes_first_and_interpolated_unpressed_mouse_motion() {
+        assert_eq!(
+            mouse_move(None, (4, 2), 10).unwrap(),
+            [b"\x1b[<35;5;3M".to_vec()]
+        );
+        assert_eq!(
+            mouse_move(Some((4, 2)), (8, 0), 2).unwrap(),
+            [b"\x1b[<35;7;2M".to_vec(), b"\x1b[<35;9;1M".to_vec()]
+        );
+        assert!(mouse_move(None, (u16::MAX, 0), 1).is_err());
+        assert!(mouse_move(Some((0, 0)), (1, 1), 0).is_err());
     }
 }

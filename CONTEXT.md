@@ -21,7 +21,9 @@ coordinates are pane-local and exclude composed workspace chrome and borders. A 
 button press and release; a drag is a primary press, interpolated held-button motion, and release.
 Direct named sessions may explicitly enable structured pointer recording. That produces recording
 version 2 press, move, and release events and exposes the current pointer state to opt-in live SVG or
-PNG rendering. Default direct and composed-workspace recordings remain version 1.
+PNG rendering. Bare pointer rendering fades after inactivity; persistent rendering retains the last
+position at full opacity while keeping click feedback transient. Neither mode renders before the first
+event. Default direct and composed-workspace recordings remain version 1.
 
 ### Workspace
 
@@ -70,6 +72,9 @@ drag controls, markers, presentation holds, bounded argv-based host actions, and
 stop. Reverse-order cleanup runs only after the owned session is confirmed stopped, on both success
 and safe failure paths. Relative paths resolve from the tape directory, failures identify the source
 line, and cleanup failures follow rather than mask the primary failure.
+Tape pointer position is execution state, not recording policy. The first unpressed Move establishes
+it with one no-button SGR event; subsequent Moves interpolate from it, and Click or Drag updates it.
+`Pointer on` only decides whether those inputs are also retained as structured v2 events.
 
 A tape is executable authoring input and should be reviewed before use. It is not a recording:
 `.termctrl` remains the timestamped observed timeline, and `video --edit` remains a separate explicit

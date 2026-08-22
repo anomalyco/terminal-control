@@ -165,6 +165,8 @@ Cleanup "/usr/bin/rm" "-f" "fixtures/game.json"
 Launch "cargo" "run" "--release" "--bin" "ttt"
 
 Wait "Choose a square" Timeout 10s
+Move 8 8
+Move 12 8 Steps 8 Pace 16ms
 Click 12 8
 Wait "Your turn"
 Type "middle" Pace 35ms
@@ -195,7 +197,14 @@ Pointer overlays are opt-in. Start a direct session with `--record ... --record-
 `Pointer on` in a recording tape, then pass `--pointer` to rendered `show`/`save` output or `video`.
 This writes recording format version 2 with structured press, move, and release events. Ordinary
 recordings remain version 1 and existing rendering stays unchanged. Pointer capture is currently a
-direct named-session capability; composed workspaces continue to use version 1 recordings.
+direct named-session capability; composed workspaces continue to use version 1 recordings. Bare
+`--pointer` retains the fading behavior. Use `--pointer=persistent` to keep the latest pointer at
+full opacity through long idle periods; the click ring still expires, and nothing renders before the
+first structured pointer event. Capture policy (`Pointer on`) and render persistence are independent.
+
+Tape `Move X Y [Steps N] [Pace DURATION]` emits unpressed SGR motion. The first Move establishes the
+authoritative position with one event; later Moves interpolate from it, defaulting to 10 points at
+8 ms. Click and Drag update that position so subsequent motion remains continuous.
 
 ## Semantic UI Snapshots
 

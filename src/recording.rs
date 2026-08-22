@@ -340,6 +340,18 @@ pub struct VideoOptions {
 }
 
 pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
+    video_with_pointer_mode(
+        path,
+        options,
+        options.pointer.then_some(render::PointerMode::Fading),
+    )
+}
+
+pub fn video_with_pointer_mode(
+    path: &Path,
+    options: &VideoOptions,
+    pointer_mode: Option<render::PointerMode>,
+) -> Result<()> {
     if options.fps == 0 {
         bail!("--fps must be greater than zero");
     }
@@ -347,7 +359,7 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
         bail!("--fps must not exceed {MAX_VIDEO_FPS}");
     }
     let recording = read(path)?;
-    if options.pointer && recording.version != POINTER_FORMAT_VERSION {
+    if pointer_mode.is_some() && recording.version != POINTER_FORMAT_VERSION {
         bail!("--pointer requires a version 2 recording created with pointer capture enabled");
     }
     let states = states(&recording)?;
@@ -392,7 +404,7 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("secure {}", temp.display()))?;
     }
-    let result = render_video_frames(&temp, &recording, &states, &samples, options);
+    let result = render_video_frames(&temp, &recording, &states, &samples, options, pointer_mode);
     let _ = fs::remove_dir_all(&temp);
     result
 }
@@ -878,6 +890,7 @@ fn render_video_frames(
     states: &[VideoFrame],
     samples: &[VideoSample],
     options: &VideoOptions,
+    pointer_mode: Option<render::PointerMode>,
 ) -> Result<()> {
     eprintln!("Rendering {} sampled frames...", samples.len());
     let cols = states
@@ -917,13 +930,8 @@ fn render_video_frames(
             base_keys[sample.state].clone()
         };
         let mut sample_options = render_options.clone();
-        sample_options.pointer = options
-            .pointer
-            .then_some(states[sample.state].pointer)
-            .flatten()
-            .and_then(|pointer| {
-                render::PointerOverlay::from_snapshot(pointer.snapshot(sample.at_ms))
-            });
+        sample_options.pointer =
+            sampled_pointer(states[sample.state].pointer, sample.at_ms, pointer_mode);
         render_or_link(
             &renderer,
             &mut rendered,
@@ -948,6 +956,18 @@ fn render_video_frames(
         bail!("ffmpeg failed while exporting {}", options.out.display());
     }
     Ok(())
+}
+
+fn sampled_pointer(
+    pointer: Option<PointerState>,
+    at_ms: u64,
+    mode: Option<render::PointerMode>,
+) -> Option<render::PointerOverlay> {
+    mode.and_then(|mode| {
+        pointer.and_then(|pointer| {
+            render::PointerOverlay::from_snapshot_with_mode(pointer.snapshot(at_ms), mode)
+        })
+    })
 }
 
 fn render_or_link(
@@ -1527,6 +1547,20 @@ mod tests {
         assert_eq!(pointer.age_ms, 980);
         assert_eq!(pointer.click_age_ms, Some(990));
         assert!(!pointer.pressed);
+    }
+
+    #[test]
+    fn video_pointer_mode_controls_idle_visibility_without_extending_clicks() {
+        let pointer = PointerState::apply(None, 0, 2, 3, PointerPhase::Press);
+        let pointer = PointerState::apply(Some(pointer), 10, 2, 3, PointerPhase::Release);
+
+        assert!(sampled_pointer(Some(pointer), 5_000, Some(render::PointerMode::Fading)).is_none());
+        let persistent =
+            sampled_pointer(Some(pointer), 5_000, Some(render::PointerMode::Persistent)).unwrap();
+        assert_eq!(persistent.opacity, u8::MAX);
+        assert_eq!(persistent.click, 0);
+        assert!(!persistent.pressed);
+        assert!(sampled_pointer(None, 5_000, Some(render::PointerMode::Persistent)).is_none());
     }
 
     #[test]

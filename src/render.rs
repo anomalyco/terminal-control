@@ -43,9 +43,22 @@ pub struct PointerOverlay {
     pub pressed: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerMode {
+    Fading,
+    Persistent,
+}
+
 impl PointerOverlay {
     pub fn from_snapshot(pointer: PointerSnapshot) -> Option<Self> {
-        let opacity = if pointer.pressed || pointer.age_ms <= POINTER_HOLD_MS {
+        Self::from_snapshot_with_mode(pointer, PointerMode::Fading)
+    }
+
+    pub fn from_snapshot_with_mode(pointer: PointerSnapshot, mode: PointerMode) -> Option<Self> {
+        let opacity = if mode == PointerMode::Persistent
+            || pointer.pressed
+            || pointer.age_ms <= POINTER_HOLD_MS
+        {
             u8::MAX
         } else {
             let fade_age = pointer.age_ms.saturating_sub(POINTER_HOLD_MS);
@@ -136,11 +149,11 @@ fn pointer_svg(pointer: PointerOverlay, options: &Options) -> String {
         x + 13.0 * scale,
         y + 8.0 * scale,
     );
-    let mut output = String::new();
+    let mut output = r#"<g data-termctrl-pointer="true">"#.to_owned();
     if click > 0.0 {
         let radius = (1.0 - click) * 8.0 * scale + 4.0 * scale;
         output.push_str(&format!(
-            r##"<circle cx="{x}" cy="{y}" r="{radius}" fill="none" stroke="#67e8f9" stroke-width="{}" opacity="{}"/>"##,
+            r##"<circle data-termctrl-pointer-click="true" cx="{x}" cy="{y}" r="{radius}" fill="none" stroke="#67e8f9" stroke-width="{}" opacity="{}"/>"##,
             if pointer.pressed { 2.5 } else { 2.0 },
             click * opacity * 0.8,
         ));
@@ -148,6 +161,7 @@ fn pointer_svg(pointer: PointerOverlay, options: &Options) -> String {
     output.push_str(&format!(
         r##"<path d="{path}" fill="#111827" stroke="#111827" stroke-width="4" stroke-linejoin="round" opacity="{opacity}"/><path d="{path}" fill="#f9fafb" stroke="#f9fafb" stroke-width="1.4" stroke-linejoin="round" opacity="{opacity}"/>"##,
     ));
+    output.push_str("</g>");
     output
 }
 
@@ -427,35 +441,24 @@ mod tests {
 
     #[test]
     fn pointer_overlay_fades_and_click_feedback_expires() {
-        let fresh = PointerOverlay::from_snapshot(PointerSnapshot {
-            x: 2,
-            y: 3,
-            age_ms: 0,
-            pressed: false,
-            click_age_ms: Some(0),
-        })
-        .unwrap();
-        assert_eq!(fresh.opacity, u8::MAX);
-        assert_eq!(fresh.click, u8::MAX);
-
-        let fading = PointerOverlay::from_snapshot(PointerSnapshot {
-            age_ms: POINTER_HOLD_MS + POINTER_FADE_MS / 2,
-            click_age_ms: Some(POINTER_CLICK_MS),
-            ..PointerSnapshot {
+        let fresh = PointerOverlay::from_snapshot_with_mode(
+            PointerSnapshot {
                 x: 2,
                 y: 3,
                 age_ms: 0,
                 pressed: false,
-                click_age_ms: None,
-            }
-        })
+                click_age_ms: Some(0),
+            },
+            PointerMode::Fading,
+        )
         .unwrap();
-        assert!(fading.opacity > 0 && fading.opacity < u8::MAX);
-        assert_eq!(fading.click, 0);
-        assert!(
-            PointerOverlay::from_snapshot(PointerSnapshot {
-                age_ms: POINTER_HOLD_MS + POINTER_FADE_MS,
-                click_age_ms: None,
+        assert_eq!(fresh.opacity, u8::MAX);
+        assert_eq!(fresh.click, u8::MAX);
+
+        let fading = PointerOverlay::from_snapshot_with_mode(
+            PointerSnapshot {
+                age_ms: POINTER_HOLD_MS + POINTER_FADE_MS / 2,
+                click_age_ms: Some(POINTER_CLICK_MS),
                 ..PointerSnapshot {
                     x: 2,
                     y: 3,
@@ -463,9 +466,48 @@ mod tests {
                     pressed: false,
                     click_age_ms: None,
                 }
-            })
+            },
+            PointerMode::Fading,
+        )
+        .unwrap();
+        assert!(fading.opacity > 0 && fading.opacity < u8::MAX);
+        assert_eq!(fading.click, 0);
+        assert!(
+            PointerOverlay::from_snapshot_with_mode(
+                PointerSnapshot {
+                    age_ms: POINTER_HOLD_MS + POINTER_FADE_MS,
+                    click_age_ms: None,
+                    ..PointerSnapshot {
+                        x: 2,
+                        y: 3,
+                        age_ms: 0,
+                        pressed: false,
+                        click_age_ms: None,
+                    }
+                },
+                PointerMode::Fading
+            )
             .is_none()
         );
+    }
+
+    #[test]
+    fn persistent_pointer_survives_idle_but_click_feedback_expires() {
+        let pointer = PointerOverlay::from_snapshot_with_mode(
+            PointerSnapshot {
+                x: 7,
+                y: 4,
+                age_ms: 60_000,
+                pressed: false,
+                click_age_ms: Some(60_000),
+            },
+            PointerMode::Persistent,
+        )
+        .unwrap();
+
+        assert_eq!(pointer.opacity, u8::MAX);
+        assert_eq!(pointer.click, 0);
+        assert!(!pointer.pressed);
     }
 
     #[test]

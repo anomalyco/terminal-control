@@ -106,13 +106,25 @@ Use a named session when several interactions target the same running applicatio
 termctrl start demo --host opentui --cols 112 --rows 34 -- my-terminal-app
 termctrl wait demo "Ready"
 termctrl send demo text:help enter
+termctrl click demo 12 4
+termctrl drag demo 12 4 30 4
 termctrl show demo
 termctrl show demo --format semantic
 termctrl save demo --format png --out captures/help.png
 termctrl stop demo
 ```
 
-- `send` accepts `text:<value>`, named keys (`enter`, `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, `page-down`), and `ctrl-a` through `ctrl-z`. Pipe exact bytes with `--stdin`.
+- `send` accepts `text:<value>`, named keys (`enter`, `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, `page-down`), modifier chords including `shift+enter`, and `ctrl-a` through `ctrl-z`. Pipe exact bytes with `--stdin`.
+- `click NAME X Y` sends a primary-button press and release. `drag NAME FROM_X FROM_Y TO_X TO_Y`
+  sends a primary press, interpolated held-button motion, and release; `--steps` controls the motion
+  event count and `--pace-ms` controls their interval. Coordinates are zero-based application cells:
+  X increases rightward and Y downward. Workspace coordinates are local to the selected or targeted
+  pane and exclude tab chrome and borders. Every coordinate must fit the actual target viewport;
+  the daemon resolves the selected pane or window and validates its current dimensions in the same
+  mutation that writes the PTY, so concurrent resizes or selection changes cannot stale the check.
+  Invalid clicks and drag endpoints fail before input or pointer evidence is recorded. The application
+  must have mouse tracking enabled. Restart an older named session if the client reports that it
+  predates viewport-safe mouse input.
 - `wait` blocks until text is visible; use it instead of sleeping. It defaults to a five-second
   maximum, so omit `--timeout 5000` and override only when choosing a different limit.
 - `status` reports running/exited state, command, cwd, viewport, and recording path. `list` shows
@@ -139,6 +151,78 @@ termctrl logs demo --ansi > captures/demo-output.ansi
 ```
 
 Full-screen alternate-screen TUIs do not produce useful logs; read their visible screen with `show`.
+
+## Script A Deterministic Demo
+
+`play` validates a complete tape before launching anything, then drives the existing named-session,
+wait, keyboard, mouse, marker, and recording controls:
+
+```text
+# demos/ttt.tape
+Session ttt-demo
+Viewport 80 24
+Cwd ".."
+Env TTT_FIXTURE "demo game"
+Record "captures/ttt.termctrl"
+Pointer on
+Setup "/usr/bin/cp" "fixtures/empty.json" "fixtures/game.json"
+Cleanup "/usr/bin/rm" "-f" "fixtures/game.json"
+Launch "cargo" "run" "--release" "--bin" "ttt"
+
+Wait "Choose a square" Timeout 10s
+Move 8 8
+Move 12 8 Steps 8 Pace 16ms
+Click 12 8
+RightClick 20 8
+Wait "Your turn"
+Type "middle" Pace 35ms
+Key shift+enter
+Mark result
+Sleep 750ms
+Stop
+```
+
+```bash
+termctrl play demos/ttt.tape
+termctrl video demos/captures/ttt.termctrl --edit demos/captures/ttt-edit.json \
+  --out demos/captures/ttt.mp4
+```
+
+A `.tape` file is readable authoring source, not a `.termctrl` recording. Relative `Cwd` and `Record`
+paths use the tape directory; host actions use the configured cwd and environment. Prefer state-aware
+`Wait` steps; reserve `Sleep` for a deliberate presentation hold. `Setup`, `Action`, and `Cleanup`
+run explicit argv vectors without implicit shell evaluation. They default to a finite 30-second
+timeout, accept a trailing `Timeout DURATION`, and retain bounded diagnostics. Setup runs before
+Launch; cleanup runs in reverse order after session stop on success or safe failure paths. Cleanup
+errors do not mask the primary failure. Output drain also has a finite grace: an action whose escaped
+descendant retains stdout or stderr fails instead of delaying session cleanup indefinitely. A failed
+step reports its file and line, and wait timeouts include the last visible screen. Video selection
+and editing remain an explicit phase after the recording exists. See
+[docs/tape-scripting.md](docs/tape-scripting.md) for the complete format.
+
+Pointer overlays are opt-in. Start a direct session with `--record ... --record-pointer`, or use
+`Pointer on` in a recording tape, then pass `--pointer` to rendered `show`/`save` output or `video`.
+This writes recording format version 2 with structured press, move, and release events. Ordinary
+recordings remain version 1 and existing rendering stays unchanged. Pointer capture is currently a
+direct named-session capability; composed workspaces continue to use version 1 recordings. Bare
+`--pointer` retains the fading behavior. Use `--pointer=persistent` to keep the latest pointer at
+full opacity through long idle periods; the click ring still expires, and nothing renders before the
+first structured pointer event. Capture policy (`Pointer on`) and render persistence are independent.
+
+Tape `Move X Y [Steps N] [Pace DURATION]` emits unpressed SGR motion. The first Move establishes the
+authoritative position with one event; later Moves interpolate from it, defaulting to 10 points at
+8 ms. Click, RightClick, and Drag update that position so subsequent motion remains continuous.
+`RightClick X Y` emits a secondary SGR press and release. With `Pointer on`, its version 2 pointer
+events add `button: "secondary"`; primary events retain their original representation and default
+recordings remain version 1.
+
+`Wait TEXT` keeps substring matching for compatibility. Add `Match line` when the visible text must
+equal a complete trimmed terminal row, so `Wait "history entry 1" Match line` does not match
+`history entry 10`. `Timeout DURATION` and `Match line` may appear in either order.
+
+Successful `play` prints the canonical tape path and any recording path. Use `--json` for a stable
+receipt containing `status`, `tape`, `session`, and `recording`, or `--quiet` to suppress stdout.
+On Unix, `--json` requires UTF-8 tape and recording paths; this is rejected before setup or launch.
 
 ## Semantic UI Snapshots
 
@@ -230,6 +314,8 @@ termctrl layout workspace --grid 2x2
 termctrl show workspace
 termctrl show workspace --pane 1
 termctrl send workspace --pane 1 text:opencode2 enter
+termctrl click workspace 12 4 --pane 1
+termctrl drag workspace 12 4 30 4 --pane 1
 termctrl focus workspace --pane 1
 termctrl close-pane workspace --pane 1
 ```
@@ -289,7 +375,8 @@ An edit plan selects marker ranges with per-clip speed, captions, and optional e
 
 Without `--edit`, export preserves recorded timing. `--footer` renders captions, timecode, and branding in a bottom bar. `--tail-ms 0` removes the default one-second final hold. Keep speeds low enough for text to stay readable.
 
-Recordings are JSON Lines files containing terminal output and typed input; they can include prompts or secrets. Treat them as sensitive.
+Recordings are JSON Lines files containing terminal output and typed input; opt-in version 2 files
+also contain structured pointer events. They can include prompts or secrets. Treat them as sensitive.
 
 ## Pipes And ANSI Streams
 
@@ -325,6 +412,7 @@ See [docs/typescript-client.md](docs/typescript-client.md) for artifacts, record
 
 ## More Documentation
 
+- [docs/tape-scripting.md](docs/tape-scripting.md) — deterministic `.tape` demo scripts and their safety boundary.
 - [docs/rust-library.md](docs/rust-library.md) — embed the shot engine and sessions in Rust, plus versioned JSON schemas.
 - [docs/driver-protocol.md](docs/driver-protocol.md) — the `termctrl driver` JSON Lines protocol for external tooling.
 - [docs/semantic-protocol.md](docs/semantic-protocol.md) — the application semantic socket handshake and snapshot contract.

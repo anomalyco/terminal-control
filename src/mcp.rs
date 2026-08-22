@@ -1274,6 +1274,7 @@ mod tests {
                     max_bytes: 1024,
                     opentui_host: false,
                     color: crate::shot::ColorMode::Auto,
+                    pointer_recording: false,
                 },
             },
         );

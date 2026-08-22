@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::frame::Frame;
-use crate::recording::{self, InputOrigin};
+use crate::recording::{self, InputOrigin, PointerButton, PointerPhase};
 use crate::semantic;
 use crate::shot::{self, Host, Options, Shot, respond_to_output};
 use crate::terminal_core::{InputModes, SCROLLBACK_ROWS, TerminalCore};
@@ -29,7 +29,10 @@ const WINDOW_PROTOCOL_VERSION: u8 = 3;
 const LAYOUT_COMMAND_PROTOCOL_VERSION: u8 = 4;
 const WORKSPACE_CONTROL_PROTOCOL_VERSION: u8 = 5;
 const SEMANTIC_PROTOCOL_VERSION: u8 = 6;
-const CURRENT_PROTOCOL_VERSION: u8 = SEMANTIC_PROTOCOL_VERSION;
+const POINTER_PROTOCOL_VERSION: u8 = 7;
+const POINTER_BUTTON_PROTOCOL_VERSION: u8 = 8;
+const MOUSE_INPUT_PROTOCOL_VERSION: u8 = 9;
+const CURRENT_PROTOCOL_VERSION: u8 = MOUSE_INPUT_PROTOCOL_VERSION;
 const ATTACHED_TERMINAL_ERROR: &str = "workspace already has an attached terminal";
 
 fn attachment_rejection(name: &str, error: &str) -> anyhow::Error {
@@ -75,6 +78,8 @@ pub struct Session {
     exit_ready: bool,
     last_output: Option<Instant>,
     recording: Option<recording::Writer>,
+    started: Instant,
+    pointer: Option<recording::PointerState>,
     capture_input: bool,
     captured_input: Vec<(InputOrigin, Vec<u8>)>,
     cols: u16,
@@ -158,6 +163,40 @@ pub struct SessionLaunch {
     pub max_bytes: usize,
     pub opentui_host: bool,
     pub color: shot::ColorMode,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pointer_recording: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MouseInput {
+    pub bytes: Vec<u8>,
+    pub x: u16,
+    pub y: u16,
+    pub phase: PointerPhase,
+    #[serde(default, skip_serializing_if = "is_primary_pointer_button")]
+    pub button: PointerButton,
+}
+
+fn is_primary_pointer_button(button: &PointerButton) -> bool {
+    *button == PointerButton::Primary
+}
+
+fn validate_mouse_input(input: &[MouseInput], cols: u16, rows: u16) -> Result<()> {
+    for event in input {
+        if event.x >= cols || event.y >= rows {
+            bail!(
+                "mouse coordinate ({}, {}) is outside target viewport {cols}x{rows}; coordinates must satisfy X < {cols} and Y < {rows}",
+                event.x,
+                event.y,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// One named daemon session discovered in the local runtime directory.
@@ -218,9 +257,17 @@ impl Session {
         let terminal =
             TerminalCore::new_with_theme(options.rows, options.cols, SCROLLBACK_ROWS, theme)?;
         let started = Instant::now();
+        if options.pointer_recording && record.is_none() {
+            bail!("pointer recording requires a .termctrl recording path");
+        }
         let recording = record
             .map(|path| {
-                recording::Writer::new(
+                let create = if options.pointer_recording {
+                    recording::Writer::new_with_pointer
+                } else {
+                    recording::Writer::new
+                };
+                create(
                     path,
                     started,
                     options.cols,
@@ -309,6 +356,8 @@ impl Session {
             exit_ready: false,
             last_output: None,
             recording,
+            started,
+            pointer: None,
             capture_input: false,
             captured_input: Vec::new(),
             cols: options.cols,
@@ -326,6 +375,7 @@ impl Session {
                 max_bytes: options.max_bytes,
                 opentui_host: options.opentui_host,
                 color: options.color,
+                pointer_recording: options.pointer_recording,
             },
             mirror: None,
             semantic,
@@ -414,6 +464,57 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn send_mouse_all(&mut self, input: &[MouseInput], pace: Duration) -> Result<()> {
+        self.send_mouse_input_all_inner(input, pace, true)
+    }
+
+    pub(crate) fn send_mouse_input_all(
+        &mut self,
+        input: &[MouseInput],
+        pace: Duration,
+    ) -> Result<()> {
+        self.send_mouse_input_all_inner(input, pace, false)
+    }
+
+    fn send_mouse_input_all_inner(
+        &mut self,
+        input: &[MouseInput],
+        pace: Duration,
+        require_pointer_recording: bool,
+    ) -> Result<()> {
+        self.consume_batch()?;
+        if require_pointer_recording && !self.launch.pointer_recording {
+            bail!("session was not started with structured pointer recording enabled");
+        }
+        if self.has_exited()? || self.stopped {
+            bail!("session command has exited");
+        }
+        validate_mouse_input(input, self.cols, self.rows)?;
+        let last = input.len().saturating_sub(1);
+        for (index, event) in input.iter().enumerate() {
+            self.write_input(&event.bytes)?;
+            if self.launch.pointer_recording {
+                let recording = self
+                    .recording
+                    .as_mut()
+                    .context("session has no active pointer recording")?;
+                recording.pointer_with_button(event.x, event.y, event.phase, event.button)?;
+                let at_ms = self.started.elapsed().as_millis() as u64;
+                self.pointer = Some(recording::PointerState::apply(
+                    self.pointer,
+                    at_ms,
+                    event.x,
+                    event.y,
+                    event.phase,
+                ));
+            }
+            if !pace.is_zero() && index < last {
+                thread::sleep(pace);
+            }
+        }
+        Ok(())
+    }
+
     /// Wait until visible terminal text contains `text`.
     pub fn wait_for_text(&mut self, text: &str, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
@@ -488,6 +589,10 @@ impl Session {
                     shot: Shot {
                         frame: self.terminal.frame()?,
                         ansi: self.ansi.clone(),
+                        pointer_recording: self.launch.pointer_recording,
+                        pointer: self.pointer.map(|pointer| {
+                            pointer.snapshot(self.started.elapsed().as_millis() as u64)
+                        }),
                     },
                     reason,
                 });
@@ -630,6 +735,10 @@ impl Session {
         Ok(Shot {
             frame: self.terminal.frame()?,
             ansi: self.ansi.clone(),
+            pointer_recording: self.launch.pointer_recording,
+            pointer: self
+                .pointer
+                .map(|pointer| pointer.snapshot(self.started.elapsed().as_millis() as u64)),
         })
     }
 
@@ -916,6 +1025,18 @@ enum Request {
         #[serde(default)]
         pane: Option<crate::workspace::PaneId>,
     },
+    Mouse {
+        input: Vec<MouseInput>,
+        pace_ms: u64,
+        #[serde(default)]
+        pane: Option<crate::workspace::PaneId>,
+    },
+    MouseInput {
+        input: Vec<MouseInput>,
+        pace_ms: u64,
+        #[serde(default)]
+        pane: Option<crate::workspace::PaneId>,
+    },
     Show {
         settle_ms: u64,
         deadline_ms: u64,
@@ -979,6 +1100,11 @@ enum Request {
     SendWindow {
         name: String,
         input: Vec<Vec<u8>>,
+        pace_ms: u64,
+    },
+    MouseInputWindow {
+        name: String,
+        input: Vec<MouseInput>,
         pace_ms: u64,
     },
     WaitWindow {
@@ -1050,6 +1176,9 @@ enum ProtocolCapability {
     LayoutCommand,
     WorkspaceControl,
     Semantic,
+    Pointer,
+    PointerButton,
+    MouseInput,
 }
 
 impl ProtocolCapability {
@@ -1061,6 +1190,9 @@ impl ProtocolCapability {
             Self::LayoutCommand => LAYOUT_COMMAND_PROTOCOL_VERSION,
             Self::WorkspaceControl => WORKSPACE_CONTROL_PROTOCOL_VERSION,
             Self::Semantic => SEMANTIC_PROTOCOL_VERSION,
+            Self::Pointer => POINTER_PROTOCOL_VERSION,
+            Self::PointerButton => POINTER_BUTTON_PROTOCOL_VERSION,
+            Self::MouseInput => MOUSE_INPUT_PROTOCOL_VERSION,
         }
     }
 
@@ -1083,6 +1215,15 @@ impl ProtocolCapability {
             }
             Self::Semantic => {
                 "running session predates semantic snapshots; restart it with the current termctrl"
+            }
+            Self::Pointer => {
+                "running session predates structured pointer recording; restart it with the current termctrl"
+            }
+            Self::PointerButton => {
+                "running session predates structured pointer button recording; restart it with the current termctrl"
+            }
+            Self::MouseInput => {
+                "running session predates viewport-safe mouse input; restart it with the current termctrl"
             }
         }
     }
@@ -1135,6 +1276,17 @@ impl Request {
             | Self::ClosePane { .. } => ProtocolCapability::Pane,
             Self::Attach { .. } | Self::ResizeAttachment { .. } => ProtocolCapability::Attachment,
             Self::SemanticSnapshot { .. } => ProtocolCapability::Semantic,
+            Self::Mouse { input, .. }
+                if input
+                    .iter()
+                    .any(|event| event.button != PointerButton::Primary) =>
+            {
+                ProtocolCapability::PointerButton
+            }
+            Self::Mouse { .. } => ProtocolCapability::Pointer,
+            Self::MouseInput { .. } | Self::MouseInputWindow { .. } => {
+                ProtocolCapability::MouseInput
+            }
             Self::Ping
             | Self::Status
             | Self::Wait { pane: None, .. }
@@ -1363,6 +1515,36 @@ pub fn send_to_in(
     pace: Duration,
 ) -> Result<()> {
     send_to_target(name, terminal_target(window, pane)?, input, pace)
+}
+
+#[doc(hidden)]
+pub fn mouse_to_in(
+    name: &str,
+    window: Option<String>,
+    pane: Option<crate::workspace::PaneId>,
+    input: Vec<MouseInput>,
+    pace: Duration,
+) -> Result<()> {
+    let target = terminal_target(window, pane)?;
+    let operation = match target {
+        TerminalTarget::Selected => Request::MouseInput {
+            input,
+            pace_ms: pace.as_millis() as u64,
+            pane: None,
+        },
+        TerminalTarget::Pane(pane) => Request::MouseInput {
+            input,
+            pace_ms: pace.as_millis() as u64,
+            pane: Some(pane),
+        },
+        TerminalTarget::Window(name) => Request::MouseInputWindow {
+            name,
+            input,
+            pace_ms: pace.as_millis() as u64,
+        },
+    };
+    request(name, operation)?;
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -1807,6 +1989,13 @@ pub fn infer_name(command: &[String]) -> Result<String> {
 fn request(name: &str, operation: Request) -> Result<Response> {
     validate_name(name)?;
     let requirements = operation.requirements();
+    if requirements.capability == Some(ProtocolCapability::PointerButton) {
+        let response = implementation::request(socket_path(name)?, &Request::Ping)?;
+        ProtocolCapability::PointerButton.require(&response)?;
+        if let Some(error) = response.error {
+            bail!(error);
+        }
+    }
     let response = if requirements.hold_name_lock {
         implementation::request_layout_command(name, &operation)?
     } else {
@@ -2068,6 +2257,13 @@ mod implementation {
             .arg(options.cell_height.to_string())
             .arg("--max-bytes")
             .arg(options.max_bytes.to_string());
+        if options.pointer_recording {
+            daemon.arg("--pointer-recording");
+        }
+        if !options.inherit_env {
+            daemon.env_clear();
+        }
+        daemon.envs(&options.env);
         daemon
             .env_remove("TERMCTRL_WORKSPACE")
             .env_remove("TERMCTRL_PANE_ID")
@@ -2104,6 +2300,7 @@ mod implementation {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        detach_daemon(&mut daemon);
         let mut daemon = daemon.spawn().context("start session daemon")?;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -2818,14 +3015,7 @@ mod implementation {
         if !command.is_empty() {
             daemon.arg("--").args(command);
         }
-        unsafe {
-            daemon.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        detach_daemon(&mut daemon);
         daemon
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2844,6 +3034,17 @@ mod implementation {
                 bail!("timed out starting workspace {name:?}");
             }
             thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn detach_daemon(command: &mut Command) {
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
     }
 
@@ -3002,6 +3203,26 @@ mod implementation {
                 }
                 session.send_all(&input, Duration::from_millis(pace_ms))?;
             }
+            Request::Mouse {
+                input,
+                pace_ms,
+                pane,
+            } => {
+                if pane.is_some_and(|pane| pane != 0) {
+                    bail!("single sessions only contain pane 0");
+                }
+                session.send_mouse_all(&input, Duration::from_millis(pace_ms))?;
+            }
+            Request::MouseInput {
+                input,
+                pace_ms,
+                pane,
+            } => {
+                if pane.is_some_and(|pane| pane != 0) {
+                    bail!("single sessions only contain pane 0");
+                }
+                session.send_mouse_input_all(&input, Duration::from_millis(pace_ms))?;
+            }
             Request::Wait {
                 text,
                 timeout_ms,
@@ -3074,6 +3295,7 @@ mod implementation {
             | Request::WindowLayout { .. }
             | Request::ShowWindow { .. }
             | Request::SendWindow { .. }
+            | Request::MouseInputWindow { .. }
             | Request::WaitWindow { .. }
             | Request::LogsWindow { .. }
             | Request::MovePane { .. } => {
@@ -3128,6 +3350,20 @@ mod implementation {
                 workspace.send_all(pane, &input, Duration::from_millis(pace_ms), |workspace| {
                     terminal.tick(workspace)
                 })?;
+            }
+            Request::Mouse { .. } => {
+                bail!(
+                    "structured pointer recording is currently supported only by direct named sessions"
+                )
+            }
+            Request::MouseInput {
+                input,
+                pace_ms,
+                pane,
+            } => {
+                let duration = pace_ms.saturating_mul(input.len().saturating_sub(1) as u64);
+                require_control_duration("paced mouse input", duration)?;
+                workspace.send_mouse_input_all(pane, &input, Duration::from_millis(pace_ms))?;
             }
             Request::Wait {
                 text,
@@ -3249,6 +3485,15 @@ mod implementation {
                     Duration::from_millis(pace_ms),
                     |workspace| terminal.tick(workspace),
                 )?;
+            }
+            Request::MouseInputWindow {
+                name,
+                input,
+                pace_ms,
+            } => {
+                let duration = pace_ms.saturating_mul(input.len().saturating_sub(1) as u64);
+                require_control_duration("paced mouse input", duration)?;
+                workspace.send_mouse_input_all_in(&name, &input, Duration::from_millis(pace_ms))?;
             }
             Request::WaitWindow {
                 name,
@@ -3419,6 +3664,8 @@ mod implementation {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::session::{MouseInput, PointerButton, PointerPhase};
+        use crate::terminal_theme::TerminalTheme;
 
         #[test]
         fn name_start_lock_rejects_a_concurrent_owner() {
@@ -3432,6 +3679,20 @@ mod implementation {
             drop(held);
             assert!(StartLock::acquire(&path).is_ok());
             let _ = fs::remove_file(path);
+        }
+
+        #[test]
+        fn detached_daemon_starts_in_its_own_unix_session() {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            detach_daemon(&mut command);
+            let mut child = command.spawn().unwrap();
+            let pid = child.id() as libc::pid_t;
+
+            assert_eq!(unsafe { libc::getsid(pid) }, pid);
+
+            child.kill().unwrap();
+            child.wait().unwrap();
         }
 
         #[test]
@@ -3467,6 +3728,155 @@ mod implementation {
             assert!(response.captured.is_some());
             assert!(response.status.is_some());
             workspace.stop();
+        }
+
+        fn primary_mouse_input(x: u16, y: u16) -> Vec<MouseInput> {
+            vec![MouseInput {
+                bytes: format!("\x1b[<0;{};{}M", x + 1, y + 1).into_bytes(),
+                x,
+                y,
+                phase: PointerPhase::Press,
+                button: PointerButton::Primary,
+            }]
+        }
+
+        #[test]
+        fn direct_mouse_mutation_revalidates_after_a_deterministic_resize_race() {
+            let record = std::env::temp_dir().join(format!(
+                "termctrl-direct-mouse-race-{}-{:?}.termctrl",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let options = Options {
+                cols: 200,
+                rows: 2,
+                ..Options::default()
+            };
+            let command = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+            let mut session = Session::start(&command, None, Some(&record), &options).unwrap();
+
+            let before = respond(
+                &mut session,
+                Request::Show {
+                    settle_ms: 0,
+                    deadline_ms: 0,
+                    pane: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(before.captured.unwrap().frame.cols, 200);
+            respond(
+                &mut session,
+                Request::Resize {
+                    cols: 1,
+                    rows: 2,
+                    cell_width: None,
+                    cell_height: None,
+                },
+            )
+            .unwrap();
+
+            let error = respond(
+                &mut session,
+                Request::MouseInput {
+                    input: primary_mouse_input(199, 0),
+                    pace_ms: 0,
+                    pane: None,
+                },
+            )
+            .err()
+            .expect("post-resize mouse input must fail");
+            assert!(
+                error.to_string().contains("outside target viewport 1x2"),
+                "{error:#}"
+            );
+            session.stop().unwrap();
+            let recording = fs::read_to_string(&record).unwrap();
+            assert!(!recording.contains("\"origin\":\"client\""), "{recording}");
+            let _ = fs::remove_file(record);
+        }
+
+        #[test]
+        fn workspace_mouse_routes_resolve_and_validate_after_resize_in_one_dispatch() {
+            let record = std::env::temp_dir().join(format!(
+                "termctrl-workspace-mouse-race-{}-{:?}.termctrl",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let options = Options {
+                cols: 200,
+                rows: 3,
+                ..Options::default()
+            };
+            let command = ["sh".to_owned(), "-c".to_owned(), "cat".to_owned()];
+            let mut workspace = Workspace::start_named_with_theme(
+                "mouse-routes",
+                &command,
+                None,
+                Some(&record),
+                &options,
+                TerminalTheme::default(),
+                TabPosition::Bottom,
+            )
+            .unwrap();
+            workspace
+                .create_window(Some("other"), &command, None)
+                .unwrap();
+            workspace.select_window("main").unwrap();
+            let mut terminal = WorkspaceTerminal::detached();
+
+            for request in [
+                Request::Show {
+                    settle_ms: 0,
+                    deadline_ms: 0,
+                    pane: None,
+                },
+                Request::Show {
+                    settle_ms: 0,
+                    deadline_ms: 0,
+                    pane: Some(0),
+                },
+                Request::ShowWindow {
+                    name: "other".to_owned(),
+                    settle_ms: 0,
+                    deadline_ms: 0,
+                },
+            ] {
+                let response = respond_workspace(&mut workspace, request, &mut terminal).unwrap();
+                assert_eq!(response.captured.unwrap().frame.cols, 200);
+            }
+            workspace.resize(1, 3, 9, 18).unwrap();
+
+            for request in [
+                Request::MouseInput {
+                    input: primary_mouse_input(199, 0),
+                    pace_ms: 0,
+                    pane: None,
+                },
+                Request::MouseInput {
+                    input: primary_mouse_input(199, 0),
+                    pace_ms: 0,
+                    pane: Some(0),
+                },
+                Request::MouseInputWindow {
+                    name: "other".to_owned(),
+                    input: primary_mouse_input(199, 0),
+                    pace_ms: 0,
+                },
+            ] {
+                let error = respond_workspace(&mut workspace, request, &mut terminal)
+                    .err()
+                    .expect("post-resize workspace mouse input must fail");
+                assert!(
+                    error.to_string().contains("outside target viewport 1x2"),
+                    "{error:#}"
+                );
+            }
+            workspace.pump().unwrap();
+            workspace.stop();
+            let recording = fs::read_to_string(&record).unwrap();
+            assert!(!recording.contains("\"origin\":\"client\""), "{recording}");
+            let _ = fs::remove_file(record);
         }
 
         #[test]
@@ -3724,9 +4134,41 @@ mod tests {
                 .is_err()
         );
         assert!(ProtocolCapability::Semantic.require(&version_four).is_err());
+        assert!(
+            ProtocolCapability::Pointer
+                .require(&response)
+                .unwrap_err()
+                .to_string()
+                .contains("predates structured pointer recording")
+        );
+        assert!(
+            ProtocolCapability::PointerButton
+                .require(&response)
+                .unwrap_err()
+                .to_string()
+                .contains("predates structured pointer button recording")
+        );
+        assert!(
+            ProtocolCapability::MouseInput
+                .require(&response)
+                .unwrap_err()
+                .to_string()
+                .contains("predates viewport-safe mouse input")
+        );
+        let version_eight = Response {
+            protocol_version: POINTER_BUTTON_PROTOCOL_VERSION,
+            ..Response::default()
+        };
+        assert!(
+            ProtocolCapability::MouseInput
+                .require(&version_eight)
+                .unwrap_err()
+                .to_string()
+                .contains("restart it with the current termctrl")
+        );
         assert_eq!(
             Response::default().protocol_version,
-            SEMANTIC_PROTOCOL_VERSION
+            MOUSE_INPUT_PROTOCOL_VERSION
         );
     }
 
@@ -3782,6 +4224,48 @@ mod tests {
                 Some(ProtocolCapability::Semantic),
                 false,
             ),
+            (
+                Request::Mouse {
+                    input: Vec::new(),
+                    pace_ms: 0,
+                    pane: None,
+                },
+                Some(ProtocolCapability::Pointer),
+                false,
+            ),
+            (
+                Request::MouseInput {
+                    input: Vec::new(),
+                    pace_ms: 0,
+                    pane: None,
+                },
+                Some(ProtocolCapability::MouseInput),
+                false,
+            ),
+            (
+                Request::MouseInputWindow {
+                    name: "editor".to_owned(),
+                    input: Vec::new(),
+                    pace_ms: 0,
+                },
+                Some(ProtocolCapability::MouseInput),
+                false,
+            ),
+            (
+                Request::Mouse {
+                    input: vec![MouseInput {
+                        bytes: b"secondary".to_vec(),
+                        x: 1,
+                        y: 2,
+                        phase: PointerPhase::Press,
+                        button: PointerButton::Secondary,
+                    }],
+                    pace_ms: 0,
+                    pane: None,
+                },
+                Some(ProtocolCapability::PointerButton),
+                false,
+            ),
             (Request::Status, None, false),
         ];
 
@@ -3797,7 +4281,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_workspace_requests_round_trip() {
+    fn additive_control_requests_round_trip() {
         for request in [
             Request::Layout {
                 columns: 2,
@@ -3870,6 +4354,22 @@ mod tests {
                 deadline_unix_ms: 1,
                 pane: Some(3),
                 window: None,
+            },
+            Request::MouseInput {
+                input: vec![MouseInput {
+                    bytes: b"mouse".to_vec(),
+                    x: 2,
+                    y: 1,
+                    phase: PointerPhase::Move,
+                    button: PointerButton::Primary,
+                }],
+                pace_ms: 8,
+                pane: Some(3),
+            },
+            Request::MouseInputWindow {
+                name: "code".to_owned(),
+                input: Vec::new(),
+                pace_ms: 0,
             },
         ] {
             let encoded = serde_json::to_vec(&request).unwrap();

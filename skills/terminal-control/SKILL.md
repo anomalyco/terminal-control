@@ -29,6 +29,34 @@ termctrl stop app
 
 Always stop named sessions after use unless the user explicitly wants the live process retained.
 
+Use a checked-in `.tape` when the interaction itself should be repeatable as a deterministic demo:
+
+```bash
+termctrl play demos/app.tape
+```
+
+`play` validates the complete source before launching its named session. Tape steps reuse the normal
+`wait`, paced text/key input, click, drag, marker, recording, and stop behavior. Prefer `Wait` for
+state transitions and use `Sleep` only for a deliberate presentation hold. `Setup`, `Action`, and
+`Cleanup` are explicit argv-based host commands for controlled fixture changes; they do not
+implicitly invoke a shell, default to a 30-second timeout, and retain bounded diagnostics. Setup runs
+before Launch and reverse-order cleanup runs only after the owned session is confirmed stopped,
+including safe failure paths. Action output-pipe drain is also finite; an escaped descendant retaining
+a pipe fails the action rather than blocking cleanup indefinitely. Relative paths resolve from the
+tape directory. The `.tape` authoring source is distinct from any private `.termctrl` recording it
+creates; inspect that recording and run `video --edit` as a separate phase.
+Add `Pointer on` only when the demo needs structured click, move, and drag overlays. It requires `Record`,
+writes opt-in recording version 2, and is rendered only with `--pointer`; ordinary recordings remain
+version 1. Pointer capture currently applies to direct named sessions, not composed workspaces.
+Use `Move X Y [Steps N] [Pace DURATION]` for smooth unpressed travel. The first Move establishes the
+position; later Moves interpolate, and Click/RightClick/Drag update the same position. `RightClick X Y`
+emits a secondary click and retains button evidence when `Pointer on` is enabled. `Key` accepts the
+same input spellings as live `send`, including `shift+enter`. Use `Wait TEXT Match line` when a complete
+visible row must match rather than a substring. Bare `--pointer` fades as
+before. Use `--pointer=persistent` when a long presentation hold should retain the latest position;
+click feedback remains brief and no pointer appears before the first event. Do not confuse this
+render choice with the tape's `Pointer on` capture policy.
+
 Enter a visible workspace that humans and agents control together:
 
 ```bash
@@ -87,6 +115,11 @@ output is a rendered snapshot; pane-targeted ANSI is the original pane stream.
 - Use `logs` for readable retained output from normal-screen tools and log-like commands.
 - Use `save --format ... --out ...` only when a persisted artifact is required.
 - Use `video` only after explicitly recording a timeline with `--record`.
+- Use `--record-pointer` plus `--pointer` only when graphical mouse causality is part of the evidence.
+- Use persistent pointer rendering only when the latest target must remain legible through idle holds.
+- Use `play` when a repeatable interaction belongs in a reviewed `.tape` source file.
+- Use `play --json` when a caller needs stable success fields, or `--quiet` when it needs no stdout.
+  JSON mode requires UTF-8 tape and recording paths and checks them before lifecycle side effects.
 
 Do not treat logs as the visible state of an alternate-screen TUI.
 
@@ -118,10 +151,22 @@ Send plain text with `text:<value>` and named keys as separate input atoms:
 termctrl send app text:/connect enter
 termctrl send app down enter
 termctrl send app ctrl-c
+termctrl click app 12 4
+termctrl drag app 12 4 30 4
 printf '%s' 'multiline prompt' | termctrl send app --stdin
 ```
 
 Use `wait` after sending input instead of sleeping or assuming that the interface has updated.
+
+Mouse coordinates are zero-based application cells: X increases from left to right and Y from top
+to bottom. For a workspace, coordinates are local to the selected pane or the pane targeted with
+`--pane`/`--window`; do not include tab chrome or pane borders. `click` sends a primary press and
+release. `drag` sends a primary press, linearly interpolated held-button motion events including the
+destination, and release; tune the event count with `--steps` and their interval with `--pace-ms`.
+Coordinates are checked against the actual target viewport before input or pointer evidence is sent.
+The daemon resolves selected-pane and named-window targets and performs that check in the same
+mutation as the PTY write; restart the named session if an older daemon lacks viewport-safe mouse input.
+The application must have enabled mouse tracking.
 
 ## Operate OpenTUI Applications
 

@@ -753,6 +753,16 @@ impl Workspace {
         self.send_all(Some(pane), input, pace, tick)
     }
 
+    pub(crate) fn send_mouse_input_all_in(
+        &mut self,
+        name: &str,
+        input: &[crate::session::MouseInput],
+        pace: Duration,
+    ) -> Result<()> {
+        let index = self.window_index(name)?;
+        self.windows[index].send_mouse_input_all(None, input, pace)
+    }
+
     pub(crate) fn wait_for_text_in(
         &mut self,
         name: &str,
@@ -1363,6 +1373,23 @@ impl Workspace {
         Ok(())
     }
 
+    pub(crate) fn send_mouse_input_all(
+        &mut self,
+        pane: Option<PaneId>,
+        input: &[crate::session::MouseInput],
+        pace: Duration,
+    ) -> Result<()> {
+        let window = match pane {
+            Some(pane) => self
+                .pane_window_index(pane)
+                .ok_or_else(|| anyhow::anyhow!("workspace has no pane {pane}"))?,
+            None => self
+                .active_window_index()
+                .context("workspace has no active window")?,
+        };
+        self.windows[window].send_mouse_input_all(pane, input, pace)
+    }
+
     pub(crate) fn capture(
         &mut self,
         pane: Option<PaneId>,
@@ -1443,7 +1470,12 @@ impl Workspace {
         let mut frame = self.windows[window].frame()?;
         self.add_tab_strip(&mut frame, selected);
         let ansi = frame_ansi(&frame)?;
-        Ok(Shot { frame, ansi })
+        Ok(Shot {
+            frame,
+            ansi,
+            pointer_recording: false,
+            pointer: None,
+        })
     }
 
     pub(crate) fn wait_for_text(
@@ -2330,6 +2362,16 @@ impl Window {
         self.panes[index].session.send_current(input)
     }
 
+    fn send_mouse_input_all(
+        &mut self,
+        pane: Option<PaneId>,
+        input: &[crate::session::MouseInput],
+        pace: Duration,
+    ) -> Result<()> {
+        let index = self.resolve_pane(pane)?;
+        self.panes[index].session.send_mouse_input_all(input, pace)
+    }
+
     pub(crate) fn send_active_if_open(&mut self, input: &[u8]) -> Result<bool> {
         let index = self.resolve_pane(None)?;
         self.panes[index].session.send_current_if_open(input)
@@ -2480,7 +2522,12 @@ impl Window {
         }
         let frame = self.frame()?;
         let ansi = frame_ansi(&frame)?;
-        Ok(Shot { frame, ansi })
+        Ok(Shot {
+            frame,
+            ansi,
+            pointer_recording: false,
+            pointer: None,
+        })
     }
 
     pub(crate) fn panes(&mut self) -> Result<Vec<PaneStatus>> {
@@ -4846,6 +4893,7 @@ mod tests {
                 max_bytes: 1024,
                 opentui_host: false,
                 color: crate::shot::ColorMode::Auto,
+                pointer_recording: false,
             },
         }
     }

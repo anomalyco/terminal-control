@@ -1,3 +1,5 @@
+mod tape;
+
 use std::fs;
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,9 +18,12 @@ Examples:
   termctrl show -- my-terminal-app
   termctrl save --format png --out captures/app.png -- my-terminal-app
   termctrl start demo --host opentui -- opencode
+  termctrl play demos/opencode.tape
   termctrl run
   termctrl attach workspace
   termctrl wait demo '/connect' && termctrl send demo text:/connect enter
+  termctrl click demo 12 4
+  termctrl drag demo 12 4 30 4
   termctrl show demo
   termctrl show demo --format semantic
   termctrl save demo --format png --out captures/provider.png
@@ -39,10 +44,13 @@ Sources:
 Use --format json, --format ansi, or --format svg for another terminal representation. Use
 `--format semantic` with a named target for optional application-provided UI semantics.
 Use `--at-marker NAME` or `--at-ms MS` with --recording to inspect an exact moment. Use `save`
-to write files.";
+to write files. On pointer-enabled sources, bare `--pointer` fades after inactivity; use
+`--pointer=persistent` to retain the latest position.";
 
 const SAVE_HELP: &str = "\
 Save freezes a visible terminal screen and writes exactly the requested artifact formats.
+On pointer-enabled sources, bare `--pointer` preserves the existing fading overlay behavior;
+`--pointer=persistent` keeps the latest position visible without extending click feedback.
 
 Examples:
   termctrl save demo --format png --out captures/current.png
@@ -57,6 +65,8 @@ The application stays alive until `termctrl stop NAME`, so later commands intera
 same screen and application state. Persistent sessions currently require macOS or Linux. Session
 sockets are local control endpoints protected for the current user; recordings contain terminal
 output plus client and automatic host input, so treat them as sensitive artifacts.
+Add `--record-pointer` with `--record` to write opt-in recording version 2 pointer events. The
+default recording remains version 1.
 
 Example:
   termctrl start demo --host opentui --cols 112 --rows 34 -- opencode
@@ -67,6 +77,31 @@ Example:
   termctrl show demo
   termctrl save demo --format png --out captures/provider.png
   termctrl stop demo";
+
+const PLAY_HELP: &str = "\
+Play validates an entire UTF-8 .tape file, then runs its deterministic named-session demo. Tape
+files are line-oriented source programs; they are distinct from the private .termctrl recording
+timelines they may produce. Relative Cwd and Record paths resolve from the tape's directory.
+
+Use Wait for application readiness and Sleep only for deliberate presentation holds. Setup, Action,
+and Cleanup run explicit argv vectors with a finite 30-second default timeout and bounded output;
+they never implicitly invoke a shell. Output pipes also have a finite drain grace, so an escaped
+descendant cannot block cleanup by retaining them. Setup runs before Launch. Cleanup runs in reverse
+declaration order after the owned session stops, including failure paths where shutdown is confirmed.
+`Pointer on` requires Record and captures structured click, move, and drag events for rendering.
+Move sends smooth unpressed motion from the last tape pointer position; the first Move establishes it.
+RightClick sends a secondary click and retains its button in pointer-enabled recordings. Key accepts
+the live send vocabulary, including shift+enter. Wait defaults to substring matching; add `Match line`
+when one complete visible row must match exactly.
+Add `Timeout DURATION` to any host action when the default is unsuitable. Cleanup errors are reported
+after the primary playback error. Video rendering remains a separate
+`termctrl video RECORDING --edit PLAN` phase.
+Successful playback prints the canonical tape path and recording path, when present. Use `--json`
+for a stable structured receipt or `--quiet` when stdout must remain empty. JSON receipt paths must
+be UTF-8 and are checked before setup or launch.
+
+Example:
+  termctrl play demos/opencode.tape";
 
 const RUN_HELP: &str = "\
 Run creates or reattaches a visible Terminal Control workspace. With no arguments it uses the
@@ -111,7 +146,8 @@ Example:
 const SEND_HELP: &str = "\
 Send ordered input to a live session. Text uses `text:<value>`; named keys include `enter`,
 `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, and
-`page-down`. Use `ctrl-a` through `ctrl-z` for control input such as `ctrl-c` cancellation.
+`page-down`. Modifier chords include `shift+enter`; use `ctrl-a` through `ctrl-z` for control input
+such as `ctrl-c` cancellation.
 Add `--pace-ms 35` when producing a human-readable recording so typed text appears character by
 character in the terminal instead of as one immediate paste. Use `--stdin` to send exact bytes
 from standard input as one burst.
@@ -121,6 +157,33 @@ Examples:
   termctrl send demo ctrl-c
   printf '%s' 'a multiline prompt' | termctrl send demo --stdin
   termctrl send demo --pace-ms 35 'text:Write a terminal haiku.' enter";
+
+const CLICK_HELP: &str = "\
+Click sends a primary mouse press and release using zero-based application-cell coordinates: X is
+the column from left to right and Y is the row from top to bottom. Workspace coordinates are local
+to the targeted pane and exclude workspace chrome and borders. Target the selected pane by default,
+one stable pane with `--pane`, or one named window's active pane with `--window`. The application
+must have mouse tracking enabled. X and Y must be inside the actual target viewport.
+The target is resolved and coordinates are checked by the current session daemon immediately before input.
+Direct sessions started with `--record-pointer` also retain this click as a structured event.
+
+Examples:
+  termctrl click demo 12 4
+  termctrl click workspace 3 8 --pane 2";
+
+const DRAG_HELP: &str = "\
+Drag sends a primary mouse press at FROM, linearly interpolated held-button motion, and a release at
+TO. Coordinates use the same zero-based, pane-local convention as `click`. `--steps` controls the
+number of motion events, including the destination; short drags may emit the same cell more than
+once. Target the selected pane by default, one stable pane with `--pane`, or one named window's
+active pane with `--window`. The application must have mouse tracking enabled.
+Both endpoints must be inside the actual target viewport.
+The target is resolved and coordinates are checked by the current session daemon immediately before input.
+Direct sessions started with `--record-pointer` also retain structured press, movement, and release.
+
+Examples:
+  termctrl drag demo 12 4 30 4
+  termctrl drag workspace 3 8 18 8 --pane 2 --steps 6";
 
 const VIDEO_HELP: &str = "\
 Replay a recording produced by `termctrl start --record` into a video artifact. Without `--edit`,
@@ -135,6 +198,10 @@ reused. Pass `--include-startup` to retain blank startup or capability negotiati
 input, and markers until the session is closed. Video export requires `ffmpeg` to be installed.
 Pass `--footer` to add a bottom row with the clip caption, elapsed timecode, and TERMINAL CONTROL
 branding; without it, edit-plan captions render as inline annotation rows.
+Use `--pointer` to overlay structured pointer events from a version 2 recording. Pointer capture is
+opt-in at direct-session start and leaves default version 1 recordings and exports unchanged.
+Bare `--pointer` fades after inactivity. `--pointer=persistent` keeps the latest position fully
+opaque while click feedback still expires normally; no overlay precedes the first pointer event.
 
 Example:
   termctrl start demo --record captures/demo.termctrl -- opencode
@@ -194,6 +261,9 @@ enum Command {
     /// Start a named persistent terminal application.
     #[command(after_help = START_HELP)]
     Start(StartArgs),
+    /// Play a validated deterministic terminal demo script.
+    #[command(after_help = PLAY_HELP)]
+    Play(PlayArgs),
     /// Enter a visible, agent-controllable terminal workspace.
     #[command(after_help = RUN_HELP)]
     Run(RunArgs),
@@ -205,6 +275,12 @@ enum Command {
     /// Send ordered input to a named session.
     #[command(after_help = SEND_HELP)]
     Send(SendArgs),
+    /// Send a primary mouse click to a live session.
+    #[command(after_help = CLICK_HELP)]
+    Click(ClickArgs),
+    /// Send a primary mouse drag to a live session.
+    #[command(after_help = DRAG_HELP)]
+    Drag(DragArgs),
     /// Inspect lifecycle state and launch settings of a named session.
     Status(StatusArgs),
     /// List named local sessions and their states.
@@ -292,6 +368,15 @@ struct RenderArgs {
     /// Hide the terminal cursor in rendered output.
     #[arg(long)]
     hide_cursor: bool,
+    /// Overlay structured pointer state; use `--pointer=persistent` to prevent fading.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "fading",
+        require_equals = true
+    )]
+    pointer: Option<PointerMode>,
 }
 
 #[derive(Args)]
@@ -408,6 +493,9 @@ struct StartArgs {
     /// Write timestamped terminal output and client/host input to this private recording file.
     #[arg(long)]
     record: Option<PathBuf>,
+    /// Record structured pointer events and write recording format version 2.
+    #[arg(long, requires = "record")]
+    record_pointer: bool,
     /// Color environment policy for the terminal command.
     #[arg(long, value_enum, default_value = "auto")]
     color: ColorMode,
@@ -417,6 +505,19 @@ struct StartArgs {
     /// Command and arguments to launch, following `--`.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+#[derive(Args)]
+struct PlayArgs {
+    /// UTF-8 Terminal Control tape source; must use the .tape extension.
+    #[arg(value_name = "FILE.tape")]
+    input: PathBuf,
+    /// Print a stable JSON success receipt.
+    #[arg(long, conflicts_with = "quiet")]
+    json: bool,
+    /// Suppress the success receipt.
+    #[arg(long)]
+    quiet: bool,
 }
 
 #[derive(Args)]
@@ -507,6 +608,48 @@ struct SendArgs {
     /// Ordered input: key name or `text:<value>`.
     #[arg(value_name = "INPUT")]
     input: Vec<String>,
+}
+
+#[derive(Args)]
+struct ClickArgs {
+    /// Name of a running session.
+    name: String,
+    /// Zero-based application column.
+    x: u16,
+    /// Zero-based application row.
+    y: u16,
+    /// Target one workspace pane instead of the selected pane.
+    #[arg(long)]
+    pane: Option<u32>,
+    /// Target one named workspace window's active pane.
+    #[arg(long, conflicts_with = "pane")]
+    window: Option<String>,
+}
+
+#[derive(Args)]
+struct DragArgs {
+    /// Name of a running session.
+    name: String,
+    /// Zero-based starting application column.
+    from_x: u16,
+    /// Zero-based starting application row.
+    from_y: u16,
+    /// Zero-based destination application column.
+    to_x: u16,
+    /// Zero-based destination application row.
+    to_y: u16,
+    /// Number of interpolated motion events, including the destination.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=1000))]
+    steps: u16,
+    /// Delay between mouse events.
+    #[arg(long, default_value_t = 8, value_name = "MS")]
+    pace_ms: u64,
+    /// Target one workspace pane instead of the selected pane.
+    #[arg(long)]
+    pane: Option<u32>,
+    /// Target one named workspace window's active pane.
+    #[arg(long, conflicts_with = "pane")]
+    window: Option<String>,
 }
 
 #[derive(Args)]
@@ -760,6 +903,9 @@ struct RestartArgs {
     cwd: Option<PathBuf>,
     #[arg(long)]
     record: Option<PathBuf>,
+    /// Enable structured pointer recording for the restarted session.
+    #[arg(long)]
+    record_pointer: bool,
     #[arg(long, value_enum)]
     color: Option<ColorMode>,
     #[arg(long, value_enum)]
@@ -785,6 +931,8 @@ struct ServeArgs {
     cwd: Option<PathBuf>,
     #[arg(long)]
     record: Option<PathBuf>,
+    #[arg(long)]
+    pointer_recording: bool,
     #[arg(long)]
     opentui_host: bool,
     #[arg(long, value_enum, default_value = "auto")]
@@ -876,12 +1024,38 @@ struct VideoArgs {
     /// Include leading contentless startup/terminal negotiation frames.
     #[arg(long)]
     include_startup: bool,
+    /// Overlay recorded pointer movement; use `--pointer=persistent` to prevent fading.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "fading",
+        require_equals = true
+    )]
+    pointer: Option<PointerMode>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum HostProfile {
     /// Respond to OpenTUI startup terminal capability queries.
     Opentui,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum PointerMode {
+    /// Fade after a short period without pointer input.
+    Fading,
+    /// Keep the most recent pointer position fully visible.
+    Persistent,
+}
+
+impl From<PointerMode> for render::PointerMode {
+    fn from(mode: PointerMode) -> Self {
+        match mode {
+            PointerMode::Fading => Self::Fading,
+            PointerMode::Persistent => Self::Persistent,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -943,6 +1117,19 @@ fn main() -> Result<()> {
             start_session(&args)?;
             println!("{}", args.name);
         }
+        Command::Play(args) => {
+            let receipt = tape::play(&args.input, args.json)?;
+            if !args.quiet {
+                if args.json {
+                    println!("{}", serde_json::to_string(&receipt)?);
+                } else {
+                    println!("played {}", receipt.source.display());
+                    if let Some(recording) = receipt.recording {
+                        println!("recording {}", recording.display());
+                    }
+                }
+            }
+        }
         Command::Run(args) => run_session(&args)?,
         Command::Attach(args) => attach_session(&args)?,
         Command::Wait(args) => {
@@ -955,6 +1142,8 @@ fn main() -> Result<()> {
             )?;
         }
         Command::Send(args) => send(args)?,
+        Command::Click(args) => click(args)?,
+        Command::Drag(args) => drag(args)?,
         Command::Status(args) => status(args)?,
         Command::List(args) => list(args)?,
         Command::Prune(args) => prune(args)?,
@@ -1042,7 +1231,8 @@ fn main() -> Result<()> {
         Command::Stop(args) => session::stop(&args.name)?,
         Command::Video(args) => {
             let out = args.out.clone();
-            recording::video(
+            let pointer_mode = args.pointer.map(Into::into);
+            recording::video_with_pointer_mode(
                 &args.input,
                 &recording::VideoOptions {
                     out: args.out,
@@ -1057,7 +1247,9 @@ fn main() -> Result<()> {
                     tail: Duration::from_millis(args.tail_ms),
                     include_startup: args.include_startup,
                     edit: args.edit,
+                    pointer: pointer_mode.is_some(),
                 },
+                pointer_mode,
             )?;
             println!("{}", out.display());
         }
@@ -1089,6 +1281,7 @@ fn main() -> Result<()> {
                     color: args.color.into(),
                     env: Default::default(),
                     inherit_env: true,
+                    pointer_recording: args.pointer_recording,
                 },
             )?;
         }
@@ -1114,6 +1307,7 @@ fn main() -> Result<()> {
                     color: args.color.into(),
                     env: Default::default(),
                     inherit_env: true,
+                    pointer_recording: false,
                 },
                 args.tab_position.into(),
             )?;
@@ -1296,6 +1490,7 @@ fn read_source(args: &SourceArgs, render: &RenderArgs) -> Result<shot_engine::Sh
         color: color.into(),
         env: Default::default(),
         inherit_env: true,
+        pointer_recording: false,
     };
     if args.pipe {
         shot_engine::from_pipe_command(&args.command, args.cwd.as_deref(), &options)
@@ -1349,6 +1544,177 @@ fn send(args: SendArgs) -> Result<()> {
         Duration::from_millis(args.pace_ms),
     )?;
     Ok(())
+}
+
+fn click(args: ClickArgs) -> Result<()> {
+    session::mouse_to_in(
+        &args.name,
+        args.window,
+        args.pane,
+        mouse_click_events(args.x, args.y)?,
+        Duration::ZERO,
+    )
+}
+
+fn drag(args: DragArgs) -> Result<()> {
+    session::mouse_to_in(
+        &args.name,
+        args.window,
+        args.pane,
+        mouse_drag_events(
+            (args.from_x, args.from_y),
+            (args.to_x, args.to_y),
+            args.steps,
+        )?,
+        Duration::from_millis(args.pace_ms),
+    )
+}
+
+fn mouse_click(x: u16, y: u16) -> Result<Vec<Vec<u8>>> {
+    Ok(mouse_click_events(x, y)?
+        .into_iter()
+        .map(|event| event.bytes)
+        .collect())
+}
+
+fn mouse_secondary_click(x: u16, y: u16) -> Result<Vec<Vec<u8>>> {
+    Ok(
+        mouse_click_events_with_button(x, y, recording::PointerButton::Secondary)?
+            .into_iter()
+            .map(|event| event.bytes)
+            .collect(),
+    )
+}
+
+fn mouse_drag(from: (u16, u16), to: (u16, u16), steps: u16) -> Result<Vec<Vec<u8>>> {
+    Ok(mouse_drag_events(from, to, steps)?
+        .into_iter()
+        .map(|event| event.bytes)
+        .collect())
+}
+
+fn mouse_move(from: Option<(u16, u16)>, to: (u16, u16), steps: u16) -> Result<Vec<Vec<u8>>> {
+    Ok(mouse_move_events(from, to, steps)?
+        .into_iter()
+        .map(|event| event.bytes)
+        .collect())
+}
+
+fn mouse_click_events(x: u16, y: u16) -> Result<Vec<session::MouseInput>> {
+    mouse_click_events_with_button(x, y, recording::PointerButton::Primary)
+}
+
+fn mouse_click_events_with_button(
+    x: u16,
+    y: u16,
+    button: recording::PointerButton,
+) -> Result<Vec<session::MouseInput>> {
+    let sgr_button = match button {
+        recording::PointerButton::Primary => 0,
+        recording::PointerButton::Secondary => 2,
+    };
+    Ok(vec![
+        session::MouseInput {
+            bytes: sgr_mouse(sgr_button, x, y, b'M')?,
+            x,
+            y,
+            phase: recording::PointerPhase::Press,
+            button,
+        },
+        session::MouseInput {
+            bytes: sgr_mouse(sgr_button, x, y, b'm')?,
+            x,
+            y,
+            phase: recording::PointerPhase::Release,
+            button,
+        },
+    ])
+}
+
+fn mouse_drag_events(
+    from: (u16, u16),
+    to: (u16, u16),
+    steps: u16,
+) -> Result<Vec<session::MouseInput>> {
+    if steps == 0 {
+        bail!("drag steps must be greater than zero");
+    }
+    let mut input = Vec::with_capacity(usize::from(steps) + 2);
+    input.push(session::MouseInput {
+        bytes: sgr_mouse(0, from.0, from.1, b'M')?,
+        x: from.0,
+        y: from.1,
+        phase: recording::PointerPhase::Press,
+        button: recording::PointerButton::Primary,
+    });
+    for step in 1..=steps {
+        let x = interpolate(from.0, to.0, step, steps);
+        let y = interpolate(from.1, to.1, step, steps);
+        input.push(session::MouseInput {
+            bytes: sgr_mouse(32, x, y, b'M')?,
+            x,
+            y,
+            phase: recording::PointerPhase::Move,
+            button: recording::PointerButton::Primary,
+        });
+    }
+    input.push(session::MouseInput {
+        bytes: sgr_mouse(0, to.0, to.1, b'm')?,
+        x: to.0,
+        y: to.1,
+        phase: recording::PointerPhase::Release,
+        button: recording::PointerButton::Primary,
+    });
+    Ok(input)
+}
+
+fn mouse_move_events(
+    from: Option<(u16, u16)>,
+    to: (u16, u16),
+    steps: u16,
+) -> Result<Vec<session::MouseInput>> {
+    if steps == 0 {
+        bail!("move steps must be greater than zero");
+    }
+    let points = match from {
+        Some(from) => (1..=steps)
+            .map(|step| {
+                (
+                    interpolate(from.0, to.0, step, steps),
+                    interpolate(from.1, to.1, step, steps),
+                )
+            })
+            .collect::<Vec<_>>(),
+        None => vec![to],
+    };
+    points
+        .into_iter()
+        .map(|(x, y)| {
+            Ok(session::MouseInput {
+                bytes: sgr_mouse(35, x, y, b'M')?,
+                x,
+                y,
+                phase: recording::PointerPhase::Move,
+                button: recording::PointerButton::Primary,
+            })
+        })
+        .collect()
+}
+
+fn interpolate(from: u16, to: u16, step: u16, steps: u16) -> u16 {
+    let from = i64::from(from);
+    let distance = i64::from(to) - from;
+    (from + distance * i64::from(step) / i64::from(steps)) as u16
+}
+
+fn sgr_mouse(button: u8, x: u16, y: u16, final_byte: u8) -> Result<Vec<u8>> {
+    let x = x
+        .checked_add(1)
+        .context("mouse x coordinate exceeds the SGR protocol limit")?;
+    let y = y
+        .checked_add(1)
+        .context("mouse y coordinate exceeds the SGR protocol limit")?;
+    Ok(format!("\x1b[<{button};{x};{y}{}", char::from(final_byte)).into_bytes())
 }
 
 fn status(args: StatusArgs) -> Result<()> {
@@ -1561,6 +1927,7 @@ fn start_session(args: &StartArgs) -> Result<()> {
         color: args.color.into(),
         env: Default::default(),
         inherit_env: true,
+        pointer_recording: args.record_pointer,
     };
     session::start(
         &args.name,
@@ -1720,6 +2087,7 @@ fn restart_session(args: &RestartArgs) -> Result<()> {
                 matches!(host, HostProfile::Opentui)
             }),
             color: args.color.map_or(previous.color, Into::into),
+            pointer_recording: previous.pointer_recording || args.record_pointer,
             ..shot_engine::Options::default()
         },
     )
@@ -1769,8 +2137,9 @@ fn input_event(event: &str) -> Result<Vec<u8>> {
         "end" => b"\x1b[F".to_vec(),
         "page-up" => b"\x1b[5~".to_vec(),
         "page-down" => b"\x1b[6~".to_vec(),
+        "shift+enter" => b"\x1b[13;2u".to_vec(),
         _ => anyhow::bail!(
-            "unsupported input event {event:?}; use text:<value>, ctrl-a through ctrl-z, enter, escape, arrows, tab, shift-tab, backspace, delete, home, end, page-up, or page-down"
+            "unsupported input event {event:?}; use text:<value>, ctrl-a through ctrl-z, shift+enter, enter, escape, arrows, tab, shift-tab, backspace, delete, home, end, page-up, or page-down"
         ),
     })
 }
@@ -1815,8 +2184,14 @@ fn write_outputs(
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let enabled = |format| formats.contains(&format);
-    let svg = (enabled(ShotFormat::Svg) || enabled(ShotFormat::Png))
-        .then(|| rendered_svg(captured, args));
+    if args.pointer.is_some() && !enabled(ShotFormat::Svg) && !enabled(ShotFormat::Png) {
+        bail!("--pointer requires a rendered PNG or SVG format");
+    }
+    let svg = if enabled(ShotFormat::Svg) || enabled(ShotFormat::Png) {
+        Some(rendered_svg(captured, args)?)
+    } else {
+        None
+    };
     if let Some(svg) = svg.as_ref().filter(|_| enabled(ShotFormat::Svg)) {
         let path = out.with_extension("svg");
         fs::write(&path, svg).with_context(|| format!("write {}", path.display()))?;
@@ -1852,7 +2227,7 @@ fn write_stdout(captured: &shot_engine::Shot, args: &RenderArgs, format: ShotFor
         ShotFormat::Txt => captured.frame.text().into_bytes(),
         ShotFormat::Json => serde_json::to_vec_pretty(&captured.frame)?,
         ShotFormat::Ansi => captured.ansi.clone(),
-        ShotFormat::Svg => rendered_svg(captured, args).into_bytes(),
+        ShotFormat::Svg => rendered_svg(captured, args)?.into_bytes(),
         ShotFormat::Png => unreachable!("show validates PNG before reading source"),
         ShotFormat::Semantic => unreachable!("show handles semantic output before reading source"),
     };
@@ -1867,8 +2242,11 @@ fn write_stdout(captured: &shot_engine::Shot, args: &RenderArgs, format: ShotFor
     Ok(())
 }
 
-fn rendered_svg(captured: &shot_engine::Shot, args: &RenderArgs) -> String {
-    render::svg(
+fn rendered_svg(captured: &shot_engine::Shot, args: &RenderArgs) -> Result<String> {
+    if args.pointer.is_some() && !captured.pointer_recording {
+        bail!("--pointer requires a pointer-enabled named session or version 2 recording");
+    }
+    Ok(render::svg(
         &captured.frame,
         &render::Options {
             cell_width: f32::from(args.cell_width),
@@ -1877,8 +2255,13 @@ fn rendered_svg(captured: &shot_engine::Shot, args: &RenderArgs) -> String {
             padding: args.padding,
             font_family: args.font_family.clone(),
             show_cursor: !args.hide_cursor,
+            pointer: args.pointer.and_then(|mode| {
+                captured.pointer.and_then(|pointer| {
+                    render::PointerOverlay::from_snapshot_with_mode(pointer, mode.into())
+                })
+            }),
         },
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -1913,6 +2296,28 @@ mod tests {
             ])
             .unwrap(),
             b"\x03\x1b[Z\x1b[3~"
+        );
+    }
+
+    #[test]
+    fn live_and_tape_input_parser_encodes_shift_enter_chord() {
+        assert_eq!(input_event("shift+enter").unwrap(), b"\x1b[13;2u");
+        assert_eq!(
+            session_input(&["shift+enter".to_owned()], false).unwrap(),
+            [b"\x1b[13;2u".to_vec()]
+        );
+    }
+
+    #[test]
+    fn parses_play_receipt_modes() {
+        let cli = Cli::try_parse_from(["termctrl", "play", "demo.tape", "--json"]).unwrap();
+        let Command::Play(args) = cli.command else {
+            panic!("expected play command");
+        };
+        assert!(args.json);
+        assert!(!args.quiet);
+        assert!(
+            Cli::try_parse_from(["termctrl", "play", "demo.tape", "--json", "--quiet"]).is_err()
         );
     }
 
@@ -2202,6 +2607,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_tape_play_command() {
+        let cli = Cli::try_parse_from(["termctrl", "play", "demos/ttt.tape"]).unwrap();
+        let Command::Play(args) = cli.command else {
+            panic!("expected play command");
+        };
+
+        assert_eq!(args.input, PathBuf::from("demos/ttt.tape"));
+    }
+
+    #[test]
     fn parses_foreground_run_with_an_inferred_name() {
         let cli = Cli::try_parse_from([
             "termctrl",
@@ -2270,6 +2685,40 @@ mod tests {
     }
 
     #[test]
+    fn pointer_flag_defaults_to_fading_and_accepts_explicit_modes() {
+        let cli = Cli::try_parse_from(["termctrl", "show", "--pointer", "demo", "--format", "svg"])
+            .unwrap();
+        let Command::Show(args) = cli.command else {
+            panic!("expected show command");
+        };
+        assert_eq!(args.render.pointer, Some(PointerMode::Fading));
+        assert_eq!(args.source.name.as_deref(), Some("demo"));
+
+        let cli = Cli::try_parse_from([
+            "termctrl",
+            "save",
+            "demo",
+            "--format",
+            "svg",
+            "--out",
+            "demo.svg",
+            "--pointer=persistent",
+        ])
+        .unwrap();
+        let Command::Save(args) = cli.command else {
+            panic!("expected save command");
+        };
+        assert_eq!(args.render.pointer, Some(PointerMode::Persistent));
+
+        let cli = Cli::try_parse_from(["termctrl", "video", "demo.termctrl", "--pointer=fading"])
+            .unwrap();
+        let Command::Video(args) = cli.command else {
+            panic!("expected video command");
+        };
+        assert_eq!(args.pointer, Some(PointerMode::Fading));
+    }
+
+    #[test]
     fn rejects_settling_options_for_pipe_reads() {
         let cli = Cli::try_parse_from([
             "termctrl",
@@ -2302,5 +2751,100 @@ mod tests {
             session_input(&["text:hi".to_owned(), "enter".to_owned()], true).unwrap(),
             vec![b"h".to_vec(), b"i".to_vec(), b"\r".to_vec()]
         );
+    }
+
+    #[test]
+    fn parses_mouse_control_commands() {
+        let cli = Cli::try_parse_from(["termctrl", "click", "workspace", "12", "4", "--pane", "2"])
+            .unwrap();
+        let Command::Click(args) = cli.command else {
+            panic!("expected click command");
+        };
+        assert_eq!((args.x, args.y, args.pane), (12, 4, Some(2)));
+
+        let cli = Cli::try_parse_from([
+            "termctrl",
+            "drag",
+            "workspace",
+            "12",
+            "4",
+            "30",
+            "8",
+            "--window",
+            "editor",
+            "--steps",
+            "6",
+            "--pace-ms",
+            "0",
+        ])
+        .unwrap();
+        let Command::Drag(args) = cli.command else {
+            panic!("expected drag command");
+        };
+        assert_eq!(
+            (
+                args.from_x,
+                args.from_y,
+                args.to_x,
+                args.to_y,
+                args.steps,
+                args.pace_ms,
+                args.window.as_deref(),
+            ),
+            (12, 4, 30, 8, 6, 0, Some("editor"))
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "termctrl", "drag", "demo", "0", "0", "1", "1", "--steps", "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn encodes_primary_mouse_click_with_zero_based_cells() {
+        assert_eq!(
+            mouse_click(12, 4).unwrap(),
+            [b"\x1b[<0;13;5M".to_vec(), b"\x1b[<0;13;5m".to_vec()]
+        );
+        assert!(mouse_click(u16::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn encodes_secondary_mouse_click_with_zero_based_cells() {
+        assert_eq!(
+            mouse_secondary_click(12, 4).unwrap(),
+            [b"\x1b[<2;13;5M".to_vec(), b"\x1b[<2;13;5m".to_vec()]
+        );
+        assert!(mouse_secondary_click(u16::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn encodes_primary_mouse_drag_with_interpolated_motion() {
+        assert_eq!(
+            mouse_drag((0, 2), (4, 0), 2).unwrap(),
+            [
+                b"\x1b[<0;1;3M".to_vec(),
+                b"\x1b[<32;3;2M".to_vec(),
+                b"\x1b[<32;5;1M".to_vec(),
+                b"\x1b[<0;5;1m".to_vec(),
+            ]
+        );
+        assert!(mouse_drag((0, 0), (1, 1), 0).is_err());
+    }
+
+    #[test]
+    fn encodes_first_and_interpolated_unpressed_mouse_motion() {
+        assert_eq!(
+            mouse_move(None, (4, 2), 10).unwrap(),
+            [b"\x1b[<35;5;3M".to_vec()]
+        );
+        assert_eq!(
+            mouse_move(Some((4, 2)), (8, 0), 2).unwrap(),
+            [b"\x1b[<35;7;2M".to_vec(), b"\x1b[<35;9;1M".to_vec()]
+        );
+        assert!(mouse_move(None, (u16::MAX, 0), 1).is_err());
+        assert!(mouse_move(Some((0, 0)), (1, 1), 0).is_err());
     }
 }

@@ -2104,6 +2104,7 @@ mod implementation {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        detach_daemon(&mut daemon);
         let mut daemon = daemon.spawn().context("start session daemon")?;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -2818,14 +2819,7 @@ mod implementation {
         if !command.is_empty() {
             daemon.arg("--").args(command);
         }
-        unsafe {
-            daemon.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        detach_daemon(&mut daemon);
         daemon
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2844,6 +2838,17 @@ mod implementation {
                 bail!("timed out starting workspace {name:?}");
             }
             thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn detach_daemon(command: &mut Command) {
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
     }
 
@@ -3432,6 +3437,20 @@ mod implementation {
             drop(held);
             assert!(StartLock::acquire(&path).is_ok());
             let _ = fs::remove_file(path);
+        }
+
+        #[test]
+        fn detached_daemon_starts_in_its_own_unix_session() {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            detach_daemon(&mut command);
+            let mut child = command.spawn().unwrap();
+            let pid = child.id() as libc::pid_t;
+
+            assert_eq!(unsafe { libc::getsid(pid) }, pid);
+
+            child.kill().unwrap();
+            child.wait().unwrap();
         }
 
         #[test]

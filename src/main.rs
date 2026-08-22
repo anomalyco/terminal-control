@@ -19,6 +19,8 @@ Examples:
   termctrl run
   termctrl attach workspace
   termctrl wait demo '/connect' && termctrl send demo text:/connect enter
+  termctrl click demo 12 4
+  termctrl drag demo 12 4 30 4
   termctrl show demo
   termctrl show demo --format semantic
   termctrl save demo --format png --out captures/provider.png
@@ -122,6 +124,28 @@ Examples:
   printf '%s' 'a multiline prompt' | termctrl send demo --stdin
   termctrl send demo --pace-ms 35 'text:Write a terminal haiku.' enter";
 
+const CLICK_HELP: &str = "\
+Click sends a primary mouse press and release using zero-based application-cell coordinates: X is
+the column from left to right and Y is the row from top to bottom. Workspace coordinates are local
+to the targeted pane and exclude workspace chrome and borders. Target the selected pane by default,
+one stable pane with `--pane`, or one named window's active pane with `--window`. The application
+must have mouse tracking enabled.
+
+Examples:
+  termctrl click demo 12 4
+  termctrl click workspace 3 8 --pane 2";
+
+const DRAG_HELP: &str = "\
+Drag sends a primary mouse press at FROM, linearly interpolated held-button motion, and a release at
+TO. Coordinates use the same zero-based, pane-local convention as `click`. `--steps` controls the
+number of motion events, including the destination; short drags may emit the same cell more than
+once. Target the selected pane by default, one stable pane with `--pane`, or one named window's
+active pane with `--window`. The application must have mouse tracking enabled.
+
+Examples:
+  termctrl drag demo 12 4 30 4
+  termctrl drag workspace 3 8 18 8 --pane 2 --steps 6";
+
 const VIDEO_HELP: &str = "\
 Replay a recording produced by `termctrl start --record` into a video artifact. Without `--edit`,
 the video preserves observed timing. For a concise annotated demo, add named moments while recording
@@ -205,6 +229,12 @@ enum Command {
     /// Send ordered input to a named session.
     #[command(after_help = SEND_HELP)]
     Send(SendArgs),
+    /// Send a primary mouse click to a live session.
+    #[command(after_help = CLICK_HELP)]
+    Click(ClickArgs),
+    /// Send a primary mouse drag to a live session.
+    #[command(after_help = DRAG_HELP)]
+    Drag(DragArgs),
     /// Inspect lifecycle state and launch settings of a named session.
     Status(StatusArgs),
     /// List named local sessions and their states.
@@ -507,6 +537,48 @@ struct SendArgs {
     /// Ordered input: key name or `text:<value>`.
     #[arg(value_name = "INPUT")]
     input: Vec<String>,
+}
+
+#[derive(Args)]
+struct ClickArgs {
+    /// Name of a running session.
+    name: String,
+    /// Zero-based application column.
+    x: u16,
+    /// Zero-based application row.
+    y: u16,
+    /// Target one workspace pane instead of the selected pane.
+    #[arg(long)]
+    pane: Option<u32>,
+    /// Target one named workspace window's active pane.
+    #[arg(long, conflicts_with = "pane")]
+    window: Option<String>,
+}
+
+#[derive(Args)]
+struct DragArgs {
+    /// Name of a running session.
+    name: String,
+    /// Zero-based starting application column.
+    from_x: u16,
+    /// Zero-based starting application row.
+    from_y: u16,
+    /// Zero-based destination application column.
+    to_x: u16,
+    /// Zero-based destination application row.
+    to_y: u16,
+    /// Number of interpolated motion events, including the destination.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=1000))]
+    steps: u16,
+    /// Delay between mouse events.
+    #[arg(long, default_value_t = 8, value_name = "MS")]
+    pace_ms: u64,
+    /// Target one workspace pane instead of the selected pane.
+    #[arg(long)]
+    pane: Option<u32>,
+    /// Target one named workspace window's active pane.
+    #[arg(long, conflicts_with = "pane")]
+    window: Option<String>,
 }
 
 #[derive(Args)]
@@ -955,6 +1027,8 @@ fn main() -> Result<()> {
             )?;
         }
         Command::Send(args) => send(args)?,
+        Command::Click(args) => click(args)?,
+        Command::Drag(args) => drag(args)?,
         Command::Status(args) => status(args)?,
         Command::List(args) => list(args)?,
         Command::Prune(args) => prune(args)?,
@@ -1349,6 +1423,65 @@ fn send(args: SendArgs) -> Result<()> {
         Duration::from_millis(args.pace_ms),
     )?;
     Ok(())
+}
+
+fn click(args: ClickArgs) -> Result<()> {
+    session::send_to_in(
+        &args.name,
+        args.window,
+        args.pane,
+        mouse_click(args.x, args.y)?,
+        Duration::ZERO,
+    )
+}
+
+fn drag(args: DragArgs) -> Result<()> {
+    session::send_to_in(
+        &args.name,
+        args.window,
+        args.pane,
+        mouse_drag(
+            (args.from_x, args.from_y),
+            (args.to_x, args.to_y),
+            args.steps,
+        )?,
+        Duration::from_millis(args.pace_ms),
+    )
+}
+
+fn mouse_click(x: u16, y: u16) -> Result<Vec<Vec<u8>>> {
+    Ok(vec![sgr_mouse(0, x, y, b'M')?, sgr_mouse(0, x, y, b'm')?])
+}
+
+fn mouse_drag(from: (u16, u16), to: (u16, u16), steps: u16) -> Result<Vec<Vec<u8>>> {
+    if steps == 0 {
+        bail!("drag steps must be greater than zero");
+    }
+    let mut input = Vec::with_capacity(usize::from(steps) + 2);
+    input.push(sgr_mouse(0, from.0, from.1, b'M')?);
+    for step in 1..=steps {
+        let x = interpolate(from.0, to.0, step, steps);
+        let y = interpolate(from.1, to.1, step, steps);
+        input.push(sgr_mouse(32, x, y, b'M')?);
+    }
+    input.push(sgr_mouse(0, to.0, to.1, b'm')?);
+    Ok(input)
+}
+
+fn interpolate(from: u16, to: u16, step: u16, steps: u16) -> u16 {
+    let from = i64::from(from);
+    let distance = i64::from(to) - from;
+    (from + distance * i64::from(step) / i64::from(steps)) as u16
+}
+
+fn sgr_mouse(button: u8, x: u16, y: u16, final_byte: u8) -> Result<Vec<u8>> {
+    let x = x
+        .checked_add(1)
+        .context("mouse x coordinate exceeds the SGR protocol limit")?;
+    let y = y
+        .checked_add(1)
+        .context("mouse y coordinate exceeds the SGR protocol limit")?;
+    Ok(format!("\x1b[<{button};{x};{y}{}", char::from(final_byte)).into_bytes())
 }
 
 fn status(args: StatusArgs) -> Result<()> {
@@ -2302,5 +2435,77 @@ mod tests {
             session_input(&["text:hi".to_owned(), "enter".to_owned()], true).unwrap(),
             vec![b"h".to_vec(), b"i".to_vec(), b"\r".to_vec()]
         );
+    }
+
+    #[test]
+    fn parses_mouse_control_commands() {
+        let cli = Cli::try_parse_from(["termctrl", "click", "workspace", "12", "4", "--pane", "2"])
+            .unwrap();
+        let Command::Click(args) = cli.command else {
+            panic!("expected click command");
+        };
+        assert_eq!((args.x, args.y, args.pane), (12, 4, Some(2)));
+
+        let cli = Cli::try_parse_from([
+            "termctrl",
+            "drag",
+            "workspace",
+            "12",
+            "4",
+            "30",
+            "8",
+            "--window",
+            "editor",
+            "--steps",
+            "6",
+            "--pace-ms",
+            "0",
+        ])
+        .unwrap();
+        let Command::Drag(args) = cli.command else {
+            panic!("expected drag command");
+        };
+        assert_eq!(
+            (
+                args.from_x,
+                args.from_y,
+                args.to_x,
+                args.to_y,
+                args.steps,
+                args.pace_ms,
+                args.window.as_deref(),
+            ),
+            (12, 4, 30, 8, 6, 0, Some("editor"))
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "termctrl", "drag", "demo", "0", "0", "1", "1", "--steps", "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn encodes_primary_mouse_click_with_zero_based_cells() {
+        assert_eq!(
+            mouse_click(12, 4).unwrap(),
+            [b"\x1b[<0;13;5M".to_vec(), b"\x1b[<0;13;5m".to_vec()]
+        );
+        assert!(mouse_click(u16::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn encodes_primary_mouse_drag_with_interpolated_motion() {
+        assert_eq!(
+            mouse_drag((0, 2), (4, 0), 2).unwrap(),
+            [
+                b"\x1b[<0;1;3M".to_vec(),
+                b"\x1b[<32;3;2M".to_vec(),
+                b"\x1b[<32;5;1M".to_vec(),
+                b"\x1b[<0;5;1m".to_vec(),
+            ]
+        );
+        assert!(mouse_drag((0, 0), (1, 1), 0).is_err());
     }
 }

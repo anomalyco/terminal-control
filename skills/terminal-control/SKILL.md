@@ -118,10 +118,19 @@ Send plain text with `text:<value>` and named keys as separate input atoms:
 termctrl send app text:/connect enter
 termctrl send app down enter
 termctrl send app ctrl-c
+termctrl click app 12 4
+termctrl drag app 12 4 30 4
 printf '%s' 'multiline prompt' | termctrl send app --stdin
 ```
 
 Use `wait` after sending input instead of sleeping or assuming that the interface has updated.
+
+Mouse coordinates are zero-based application cells: X increases from left to right and Y from top
+to bottom. For a workspace, coordinates are local to the selected pane or the pane targeted with
+`--pane`/`--window`; do not include tab chrome or pane borders. `click` sends a primary press and
+release. `drag` sends a primary press, linearly interpolated held-button motion events including the
+destination, and release; tune the event count with `--steps` and their interval with `--pace-ms`.
+The application must have enabled mouse tracking.
 
 ## Operate OpenTUI Applications
 

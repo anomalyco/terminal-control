@@ -106,6 +106,8 @@ Use a named session when several interactions target the same running applicatio
 termctrl start demo --host opentui --cols 112 --rows 34 -- my-terminal-app
 termctrl wait demo "Ready"
 termctrl send demo text:help enter
+termctrl click demo 12 4
+termctrl drag demo 12 4 30 4
 termctrl show demo
 termctrl show demo --format semantic
 termctrl save demo --format png --out captures/help.png
@@ -113,6 +115,11 @@ termctrl stop demo
 ```
 
 - `send` accepts `text:<value>`, named keys (`enter`, `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, `page-down`), and `ctrl-a` through `ctrl-z`. Pipe exact bytes with `--stdin`.
+- `click NAME X Y` sends a primary-button press and release. `drag NAME FROM_X FROM_Y TO_X TO_Y`
+  sends a primary press, interpolated held-button motion, and release; `--steps` controls the motion
+  event count and `--pace-ms` controls their interval. Coordinates are zero-based application cells:
+  X increases rightward and Y downward. Workspace coordinates are local to the selected or targeted
+  pane and exclude tab chrome and borders. The application must have mouse tracking enabled.
 - `wait` blocks until text is visible; use it instead of sleeping. It defaults to a five-second
   maximum, so omit `--timeout 5000` and override only when choosing a different limit.
 - `status` reports running/exited state, command, cwd, viewport, and recording path. `list` shows
@@ -230,6 +237,8 @@ termctrl layout workspace --grid 2x2
 termctrl show workspace
 termctrl show workspace --pane 1
 termctrl send workspace --pane 1 text:opencode2 enter
+termctrl click workspace 12 4 --pane 1
+termctrl drag workspace 12 4 30 4 --pane 1
 termctrl focus workspace --pane 1
 termctrl close-pane workspace --pane 1
 ```

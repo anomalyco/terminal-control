@@ -14,7 +14,11 @@ The versioned structured visible terminal state underlying a shot. A frame conta
 
 A named terminal application that remains available across waiting, input, resizing, log inspection, and visible-screen reads or captures. A session is `running` while accepting input, or `exited` when its application has ended but its final screen remains inspectable until explicitly stopped. A session retains bounded readable logs and the most recent bounded ANSI/VT transcript bytes; alternate-screen TUIs are read with `show` rather than logs. A session may write a recording timeline while it runs, including viewport resize events. Named CLI sessions retain non-secret launch settings so status can identify them and restart can reuse their command and working directory.
 
-An embedded session owns the same live terminal lifecycle in-process; the named CLI session commands are an adapter for interacting with that lifecycle across invocations.
+An embedded session owns the same live terminal lifecycle in-process; the named CLI session commands are an adapter for interacting with that lifecycle across invocations. A named session daemon starts in a separate Unix session from its launcher, so shell and process-group hangups do not end it. It remains available until explicitly stopped, including after its application exits while the final screen is retained.
+
+Mouse control addresses zero-based cells in the target application's viewport. For workspace panes,
+coordinates are pane-local and exclude composed workspace chrome and borders. A click is one primary
+button press and release; a drag is a primary press, interpolated held-button motion, and release.
 
 ### Workspace
 

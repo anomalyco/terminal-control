@@ -18,9 +18,11 @@ An embedded session owns the same live terminal lifecycle in-process; the named 
 
 Mouse control addresses zero-based cells in the target application's viewport. For workspace panes,
 coordinates are pane-local and exclude composed workspace chrome and borders. Live mouse input is
-checked against the actual selected target before PTY input or structured recording mutation. A click
-is one primary button press and release; a drag is a primary press, interpolated held-button motion,
-and release.
+an additive structured daemon mutation: direct sessions validate their current dimensions, while
+workspaces resolve the current selected pane, stable pane ID, or named window's active pane and then
+validate it within the same single-threaded operation. PTY input and structured recording mutation
+occur only after that check. Older daemons return an actionable restart requirement. A click is one
+primary button press and release; a drag is a primary press, interpolated held-button motion, and release.
 Direct named sessions may explicitly enable structured pointer recording. That produces recording
 version 2 press, move, and release events and exposes the current pointer state to opt-in live SVG or
 PNG rendering. Bare pointer rendering fades after inactivity; persistent rendering retains the last

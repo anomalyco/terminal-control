@@ -164,6 +164,8 @@ to bottom. For a workspace, coordinates are local to the selected pane or the pa
 release. `drag` sends a primary press, linearly interpolated held-button motion events including the
 destination, and release; tune the event count with `--steps` and their interval with `--pace-ms`.
 Coordinates are checked against the actual target viewport before input or pointer evidence is sent.
+The daemon resolves selected-pane and named-window targets and performs that check in the same
+mutation as the PTY write; restart the named session if an older daemon lacks viewport-safe mouse input.
 The application must have enabled mouse tracking.
 
 ## Operate OpenTUI Applications

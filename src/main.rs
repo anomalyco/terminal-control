@@ -164,6 +164,7 @@ the column from left to right and Y is the row from top to bottom. Workspace coo
 to the targeted pane and exclude workspace chrome and borders. Target the selected pane by default,
 one stable pane with `--pane`, or one named window's active pane with `--window`. The application
 must have mouse tracking enabled. X and Y must be inside the actual target viewport.
+The target is resolved and coordinates are checked by the current session daemon immediately before input.
 Direct sessions started with `--record-pointer` also retain this click as a structured event.
 
 Examples:
@@ -177,6 +178,7 @@ number of motion events, including the destination; short drags may emit the sam
 once. Target the selected pane by default, one stable pane with `--pane`, or one named window's
 active pane with `--window`. The application must have mouse tracking enabled.
 Both endpoints must be inside the actual target viewport.
+The target is resolved and coordinates are checked by the current session daemon immediately before input.
 Direct sessions started with `--record-pointer` also retain structured press, movement, and release.
 
 Examples:

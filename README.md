@@ -120,8 +120,11 @@ termctrl stop demo
   event count and `--pace-ms` controls their interval. Coordinates are zero-based application cells:
   X increases rightward and Y downward. Workspace coordinates are local to the selected or targeted
   pane and exclude tab chrome and borders. Every coordinate must fit the actual target viewport;
-  invalid clicks and drag endpoints fail before input or pointer evidence is recorded. The application
-  must have mouse tracking enabled.
+  the daemon resolves the selected pane or window and validates its current dimensions in the same
+  mutation that writes the PTY, so concurrent resizes or selection changes cannot stale the check.
+  Invalid clicks and drag endpoints fail before input or pointer evidence is recorded. The application
+  must have mouse tracking enabled. Restart an older named session if the client reports that it
+  predates viewport-safe mouse input.
 - `wait` blocks until text is visible; use it instead of sleeping. It defaults to a five-second
   maximum, so omit `--timeout 5000` and override only when choosing a different limit.
 - `status` reports running/exited state, command, cwd, viewport, and recording path. `list` shows

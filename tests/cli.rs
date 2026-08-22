@@ -174,6 +174,84 @@ fn click_and_drag_send_exact_sgr_mouse_events() {
 }
 
 #[test]
+fn pointer_enabled_session_records_structured_events_and_renders_live_and_replay() {
+    let session = NamedSession::new("pointer-recording", "pointer-recording-test");
+    let recording = session.runtime.join("pointer.termctrl");
+    let live = session.runtime.join("live.svg");
+    let replay = session.runtime.join("replay.svg");
+    let output = session.output(&[
+        "start",
+        session.name,
+        "--record",
+        recording.to_str().unwrap(),
+        "--record-pointer",
+        "--",
+        "/bin/sh",
+        "-c",
+        "stty raw -echo; printf READY; cat >/dev/null",
+    ]);
+    assert_success(&output);
+    assert_success(&session.output(&["wait", session.name, "READY"]));
+    assert_success(&session.output(&["click", session.name, "12", "4"]));
+    assert_success(&session.output(&[
+        "drag",
+        session.name,
+        "0",
+        "0",
+        "2",
+        "0",
+        "--steps",
+        "2",
+        "--pace-ms",
+        "0",
+    ]));
+    assert_success(&session.output(&["mark", session.name, "pointer-final"]));
+    assert_success(&session.output(&[
+        "save",
+        session.name,
+        "--format",
+        "svg",
+        "--pointer",
+        "--out",
+        live.to_str().unwrap(),
+    ]));
+    assert_success(&session.output(&["stop", session.name]));
+    assert_success(&session.output(&[
+        "save",
+        "--recording",
+        recording.to_str().unwrap(),
+        "--at-marker",
+        "pointer-final",
+        "--format",
+        "svg",
+        "--pointer",
+        "--out",
+        replay.to_str().unwrap(),
+    ]));
+
+    let entries: Vec<serde_json::Value> = fs::read_to_string(&recording)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(entries[0]["version"], 2);
+    let phases = entries
+        .iter()
+        .filter(|entry| entry["type"] == "pointer")
+        .map(|entry| entry["phase"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases,
+        ["press", "release", "press", "move", "move", "release"]
+    );
+    for path in [live, replay] {
+        let svg = fs::read_to_string(path).unwrap();
+        assert!(svg.contains("#f9fafb"), "{svg}");
+        assert!(svg.contains("#111827"), "{svg}");
+    }
+}
+
+#[test]
 fn tape_play_runs_state_aware_demo_and_records_exact_input() {
     let session = NamedSession::new("tape-play", "tape-play-test");
     let tape = session.runtime.join("demo.tape");
@@ -188,6 +266,7 @@ MaxBytes 1048576
 Cwd "."
 Env DEMO_ENV "quoted # value"
 Record "demo.termctrl"
+Pointer on
 Color never
 Launch "/bin/sh" "-c" "stty raw -echo; printf READY:%s:%s \"$DEMO_ENV\" \"$PWD\"; od -An -tx1 -v -N 64; while [ ! -f action-ready ]; do sleep 0.01; done; printf FIXTURE; sleep 30"
 Wait "READY:quoted # value" Timeout 2s
@@ -216,6 +295,7 @@ Stop
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(entries[0]["type"], "header");
+    assert_eq!(entries[0]["version"], 2);
     assert_eq!(entries[0]["cols"], 72);
     assert_eq!(entries[0]["rows"], 12);
     assert!(
@@ -223,6 +303,7 @@ Stop
             .iter()
             .any(|entry| { entry["type"] == "marker" && entry["name"] == "complete" })
     );
+    assert!(entries.iter().any(|entry| entry["type"] == "pointer"));
     let client_input: Vec<u8> = entries
         .iter()
         .filter(|entry| entry["type"] == "input" && entry["origin"] == "client")

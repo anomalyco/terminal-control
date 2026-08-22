@@ -42,6 +42,9 @@ argv-based host command for controlled fixture changes; it does not invoke a she
 still executable input and must be trusted. Relative paths resolve from the tape directory. A failed
 play stops the session it owns. The `.tape` authoring source is distinct from any private `.termctrl`
 recording it creates; inspect that recording and run `video --edit` as a separate phase.
+Add `Pointer on` only when the demo needs structured click and drag overlays. It requires `Record`,
+writes opt-in recording version 2, and is rendered only with `--pointer`; ordinary recordings remain
+version 1. Pointer capture currently applies to direct named sessions, not composed workspaces.
 
 Enter a visible workspace that humans and agents control together:
 
@@ -101,6 +104,7 @@ output is a rendered snapshot; pane-targeted ANSI is the original pane stream.
 - Use `logs` for readable retained output from normal-screen tools and log-like commands.
 - Use `save --format ... --out ...` only when a persisted artifact is required.
 - Use `video` only after explicitly recording a timeline with `--record`.
+- Use `--record-pointer` plus `--pointer` only when graphical mouse causality is part of the evidence.
 - Use `play` when a repeatable interaction belongs in a reviewed `.tape` source file.
 
 Do not treat logs as the visible state of an alternate-screen TUI.

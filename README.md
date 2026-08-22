@@ -159,6 +159,7 @@ Viewport 80 24
 Cwd ".."
 Env TTT_FIXTURE "demo game"
 Record "captures/ttt.termctrl"
+Pointer on
 Launch "cargo" "run" "--release" "--bin" "ttt"
 
 Wait "Choose a square" Timeout 10s
@@ -184,6 +185,12 @@ shell for controlled fixture changes, so play only tapes you trust. A failed ste
 line, includes the last visible screen for wait timeouts, and stops the session it launched. Video
 selection and editing remain an explicit phase after the recording exists. See
 [docs/tape-scripting.md](docs/tape-scripting.md) for the complete format.
+
+Pointer overlays are opt-in. Start a direct session with `--record ... --record-pointer`, or use
+`Pointer on` in a recording tape, then pass `--pointer` to rendered `show`/`save` output or `video`.
+This writes recording format version 2 with structured press, move, and release events. Ordinary
+recordings remain version 1 and existing rendering stays unchanged. Pointer capture is currently a
+direct named-session capability; composed workspaces continue to use version 1 recordings.
 
 ## Semantic UI Snapshots
 
@@ -336,7 +343,8 @@ An edit plan selects marker ranges with per-clip speed, captions, and optional e
 
 Without `--edit`, export preserves recorded timing. `--footer` renders captions, timecode, and branding in a bottom bar. `--tail-ms 0` removes the default one-second final hold. Keep speeds low enough for text to stay readable.
 
-Recordings are JSON Lines files containing terminal output and typed input; they can include prompts or secrets. Treat them as sensitive.
+Recordings are JSON Lines files containing terminal output and typed input; opt-in version 2 files
+also contain structured pointer events. They can include prompts or secrets. Treat them as sensitive.
 
 ## Pipes And ANSI Streams
 

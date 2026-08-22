@@ -1443,7 +1443,12 @@ impl Workspace {
         let mut frame = self.windows[window].frame()?;
         self.add_tab_strip(&mut frame, selected);
         let ansi = frame_ansi(&frame)?;
-        Ok(Shot { frame, ansi })
+        Ok(Shot {
+            frame,
+            ansi,
+            pointer_recording: false,
+            pointer: None,
+        })
     }
 
     pub(crate) fn wait_for_text(
@@ -2480,7 +2485,12 @@ impl Window {
         }
         let frame = self.frame()?;
         let ansi = frame_ansi(&frame)?;
-        Ok(Shot { frame, ansi })
+        Ok(Shot {
+            frame,
+            ansi,
+            pointer_recording: false,
+            pointer: None,
+        })
     }
 
     pub(crate) fn panes(&mut self) -> Result<Vec<PaneStatus>> {
@@ -4846,6 +4856,7 @@ mod tests {
                 max_bytes: 1024,
                 opentui_host: false,
                 color: crate::shot::ColorMode::Auto,
+                pointer_recording: false,
             },
         }
     }

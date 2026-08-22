@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::frame::{Cell, Frame, Underline};
+use crate::recording::{POINTER_CLICK_MS, POINTER_FADE_MS, POINTER_HOLD_MS, PointerSnapshot};
 
 mod box_drawing;
 
@@ -16,6 +17,7 @@ pub struct Options {
     pub padding: f32,
     pub font_family: String,
     pub show_cursor: bool,
+    pub pointer: Option<PointerOverlay>,
 }
 
 impl Default for Options {
@@ -27,7 +29,45 @@ impl Default for Options {
             padding: 18.0,
             font_family: "JetBrains Mono, SFMono-Regular, Menlo, monospace".to_owned(),
             show_cursor: true,
+            pointer: None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PointerOverlay {
+    pub x: u16,
+    pub y: u16,
+    pub opacity: u8,
+    pub click: u8,
+    pub pressed: bool,
+}
+
+impl PointerOverlay {
+    pub fn from_snapshot(pointer: PointerSnapshot) -> Option<Self> {
+        let opacity = if pointer.pressed || pointer.age_ms <= POINTER_HOLD_MS {
+            u8::MAX
+        } else {
+            let fade_age = pointer.age_ms.saturating_sub(POINTER_HOLD_MS);
+            if fade_age >= POINTER_FADE_MS {
+                return None;
+            }
+            ((POINTER_FADE_MS - fade_age) * u64::from(u8::MAX) / POINTER_FADE_MS) as u8
+        };
+        let click = pointer.click_age_ms.map_or(0, |age| {
+            if age >= POINTER_CLICK_MS {
+                0
+            } else {
+                ((POINTER_CLICK_MS - age) * u64::from(u8::MAX) / POINTER_CLICK_MS) as u8
+            }
+        });
+        Some(Self {
+            x: pointer.x,
+            y: pointer.y,
+            opacity,
+            click,
+            pressed: pointer.pressed,
+        })
     }
 }
 
@@ -69,7 +109,45 @@ pub fn svg(frame: &Frame, options: &Options) -> String {
             cursor.color.css(),
         ));
     }
+    if let Some(pointer) = options.pointer {
+        output.push_str(&pointer_svg(pointer, options));
+    }
     output.push_str("</g></svg>");
+    output
+}
+
+fn pointer_svg(pointer: PointerOverlay, options: &Options) -> String {
+    let x = options.padding + (f32::from(pointer.x) + 0.5) * options.cell_width;
+    let y = options.padding + (f32::from(pointer.y) + 0.5) * options.cell_height;
+    let opacity = f32::from(pointer.opacity) / 255.0;
+    let click = f32::from(pointer.click) / 255.0;
+    let scale = options.cell_width.min(options.cell_height).max(6.0) / 14.0;
+    let path = format!(
+        "M {x} {y} L {x} {} L {} {} L {} {} L {} {} L {} {} L {} {} Z",
+        y + 14.0 * scale,
+        x + 4.0 * scale,
+        y + 10.0 * scale,
+        x + 7.0 * scale,
+        y + 16.0 * scale,
+        x + 10.0 * scale,
+        y + 14.0 * scale,
+        x + 7.0 * scale,
+        y + 8.0 * scale,
+        x + 13.0 * scale,
+        y + 8.0 * scale,
+    );
+    let mut output = String::new();
+    if click > 0.0 {
+        let radius = (1.0 - click) * 8.0 * scale + 4.0 * scale;
+        output.push_str(&format!(
+            r##"<circle cx="{x}" cy="{y}" r="{radius}" fill="none" stroke="#67e8f9" stroke-width="{}" opacity="{}"/>"##,
+            if pointer.pressed { 2.5 } else { 2.0 },
+            click * opacity * 0.8,
+        ));
+    }
+    output.push_str(&format!(
+        r##"<path d="{path}" fill="#111827" stroke="#111827" stroke-width="4" stroke-linejoin="round" opacity="{opacity}"/><path d="{path}" fill="#f9fafb" stroke="#f9fafb" stroke-width="1.4" stroke-linejoin="round" opacity="{opacity}"/>"##,
+    ));
     output
 }
 
@@ -346,6 +424,82 @@ fn xml(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_overlay_fades_and_click_feedback_expires() {
+        let fresh = PointerOverlay::from_snapshot(PointerSnapshot {
+            x: 2,
+            y: 3,
+            age_ms: 0,
+            pressed: false,
+            click_age_ms: Some(0),
+        })
+        .unwrap();
+        assert_eq!(fresh.opacity, u8::MAX);
+        assert_eq!(fresh.click, u8::MAX);
+
+        let fading = PointerOverlay::from_snapshot(PointerSnapshot {
+            age_ms: POINTER_HOLD_MS + POINTER_FADE_MS / 2,
+            click_age_ms: Some(POINTER_CLICK_MS),
+            ..PointerSnapshot {
+                x: 2,
+                y: 3,
+                age_ms: 0,
+                pressed: false,
+                click_age_ms: None,
+            }
+        })
+        .unwrap();
+        assert!(fading.opacity > 0 && fading.opacity < u8::MAX);
+        assert_eq!(fading.click, 0);
+        assert!(
+            PointerOverlay::from_snapshot(PointerSnapshot {
+                age_ms: POINTER_HOLD_MS + POINTER_FADE_MS,
+                click_age_ms: None,
+                ..PointerSnapshot {
+                    x: 2,
+                    y: 3,
+                    age_ms: 0,
+                    pressed: false,
+                    click_age_ms: None,
+                }
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn renders_high_contrast_pointer_and_click_ring_at_target_cell() {
+        let frame = Frame {
+            version: 1,
+            cols: 10,
+            rows: 5,
+            foreground: crate::frame::DEFAULT_FOREGROUND,
+            background: crate::frame::DEFAULT_BACKGROUND,
+            cursor: None,
+            cells: Vec::new(),
+        };
+        let output = svg(
+            &frame,
+            &Options {
+                pointer: Some(PointerOverlay {
+                    x: 2,
+                    y: 3,
+                    opacity: u8::MAX,
+                    click: u8::MAX,
+                    pressed: true,
+                }),
+                ..Options::default()
+            },
+        );
+
+        assert!(output.contains("<circle"));
+        assert!(output.contains("#67e8f9"));
+        assert!(output.contains("#111827"));
+        assert!(output.contains("#f9fafb"));
+        assert!(output.contains("cx=\"40.5\""));
+        assert!(output.contains("cy=\"81\""));
+    }
     use crate::frame::{Attributes, Color, Frame, Underline};
 
     #[test]

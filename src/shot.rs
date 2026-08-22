@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::frame::{Color, Frame, indexed_color};
+use crate::recording::PointerSnapshot;
 use crate::terminal_core::TerminalCore;
 use crate::terminal_theme::TerminalTheme;
 use anyhow::{Context, Result, bail};
@@ -39,6 +40,8 @@ pub struct Options {
     pub env: BTreeMap<String, String>,
     /// Whether the terminal application inherits the parent process environment.
     pub inherit_env: bool,
+    /// Write version 2 recordings with structured pointer events.
+    pub pointer_recording: bool,
 }
 
 impl Default for Options {
@@ -58,8 +61,13 @@ impl Default for Options {
             color: ColorMode::Auto,
             env: BTreeMap::new(),
             inherit_env: true,
+            pointer_recording: false,
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A visible terminal frame together with its source ANSI/VT stream.
@@ -67,6 +75,10 @@ impl Default for Options {
 pub struct Shot {
     pub frame: Frame,
     pub ansi: Vec<u8>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pointer_recording: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<PointerSnapshot>,
 }
 
 /// Environment policy applied to a launched command's color configuration.
@@ -89,6 +101,8 @@ pub fn from_ansi(bytes: Vec<u8>, rows: u16, cols: u16, max_bytes: usize) -> Resu
     Ok(Shot {
         frame: terminal.frame()?,
         ansi: bytes,
+        pointer_recording: false,
+        pointer: None,
     })
 }
 
@@ -187,6 +201,8 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
         Ok(Shot {
             frame: terminal.frame()?,
             ansi,
+            pointer_recording: false,
+            pointer: None,
         })
     })();
     #[cfg(unix)]
@@ -294,6 +310,8 @@ pub fn from_pipe_command(
         Ok(Shot {
             frame: terminal.frame()?,
             ansi,
+            pointer_recording: false,
+            pointer: None,
         })
     })();
     #[cfg(unix)]
@@ -845,6 +863,7 @@ mod tests {
                 color: ColorMode::Auto,
                 env: BTreeMap::new(),
                 inherit_env: true,
+                pointer_recording: false,
             },
         )
         .unwrap();
@@ -971,6 +990,7 @@ mod tests {
                 color: ColorMode::Auto,
                 env: BTreeMap::new(),
                 inherit_env: true,
+                pointer_recording: false,
             },
         );
 

@@ -19,6 +19,9 @@ An embedded session owns the same live terminal lifecycle in-process; the named 
 Mouse control addresses zero-based cells in the target application's viewport. For workspace panes,
 coordinates are pane-local and exclude composed workspace chrome and borders. A click is one primary
 button press and release; a drag is a primary press, interpolated held-button motion, and release.
+Direct named sessions may explicitly enable structured pointer recording. That produces recording
+version 2 press, move, and release events and exposes the current pointer state to opt-in live SVG or
+PNG rendering. Default direct and composed-workspace recordings remain version 1.
 
 ### Workspace
 
@@ -47,7 +50,13 @@ A versioned JSON Lines stdin/stdout adapter over embedded sessions for external 
 
 ### Recording
 
-A timestamped terminal event timeline containing output, client or automatic host input, viewport resize events, and named editing markers. A recording can be rendered directly to a realtime video that preserves observed timing or rendered through an explicit edit plan that stitches marker ranges with clip-specific speed, holds, and captions. The source recording remains unchanged and should be treated as potentially sensitive.
+A timestamped terminal event timeline containing output, client or automatic host input, viewport
+resize events, and named editing markers. Default recordings use version 1. Explicit pointer capture
+uses version 2 and adds structured press, move, and release events; replay, saved images, and video
+render the high-contrast pointer only when requested. A recording can be rendered directly to a
+realtime video that preserves observed timing or rendered through an explicit edit plan that stitches
+marker ranges with clip-specific speed, holds, and captions. The source recording remains unchanged
+and should be treated as potentially sensitive.
 
 Agents inspect marker names with `termctrl markers` and inspect exact recording moments with `termctrl show --recording ... --at-marker ...` or `--at-ms ...` before committing to a video edit plan.
 
@@ -63,6 +72,7 @@ and failures identify the source line and clean up the session owned by that pla
 A tape is executable authoring input and should be reviewed before use. It is not a recording:
 `.termctrl` remains the timestamped observed timeline, and `video --edit` remains a separate explicit
 rendering phase.
+Tapes may opt into recording version 2 with `Pointer on`; otherwise they preserve version 1 behavior.
 
 ### ANSI/VT Stream
 

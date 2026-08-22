@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::frame::Frame;
-use crate::recording::{self, InputOrigin};
+use crate::recording::{self, InputOrigin, PointerPhase};
 use crate::semantic;
 use crate::shot::{self, Host, Options, Shot, respond_to_output};
 use crate::terminal_core::{InputModes, SCROLLBACK_ROWS, TerminalCore};
@@ -29,7 +29,8 @@ const WINDOW_PROTOCOL_VERSION: u8 = 3;
 const LAYOUT_COMMAND_PROTOCOL_VERSION: u8 = 4;
 const WORKSPACE_CONTROL_PROTOCOL_VERSION: u8 = 5;
 const SEMANTIC_PROTOCOL_VERSION: u8 = 6;
-const CURRENT_PROTOCOL_VERSION: u8 = SEMANTIC_PROTOCOL_VERSION;
+const POINTER_PROTOCOL_VERSION: u8 = 7;
+const CURRENT_PROTOCOL_VERSION: u8 = POINTER_PROTOCOL_VERSION;
 const ATTACHED_TERMINAL_ERROR: &str = "workspace already has an attached terminal";
 
 fn attachment_rejection(name: &str, error: &str) -> anyhow::Error {
@@ -75,6 +76,8 @@ pub struct Session {
     exit_ready: bool,
     last_output: Option<Instant>,
     recording: Option<recording::Writer>,
+    started: Instant,
+    pointer: Option<recording::PointerState>,
     capture_input: bool,
     captured_input: Vec<(InputOrigin, Vec<u8>)>,
     cols: u16,
@@ -158,6 +161,21 @@ pub struct SessionLaunch {
     pub max_bytes: usize,
     pub opentui_host: bool,
     pub color: shot::ColorMode,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pointer_recording: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MouseInput {
+    pub bytes: Vec<u8>,
+    pub x: u16,
+    pub y: u16,
+    pub phase: PointerPhase,
 }
 
 /// One named daemon session discovered in the local runtime directory.
@@ -218,9 +236,17 @@ impl Session {
         let terminal =
             TerminalCore::new_with_theme(options.rows, options.cols, SCROLLBACK_ROWS, theme)?;
         let started = Instant::now();
+        if options.pointer_recording && record.is_none() {
+            bail!("pointer recording requires a .termctrl recording path");
+        }
         let recording = record
             .map(|path| {
-                recording::Writer::new(
+                let create = if options.pointer_recording {
+                    recording::Writer::new_with_pointer
+                } else {
+                    recording::Writer::new
+                };
+                create(
                     path,
                     started,
                     options.cols,
@@ -309,6 +335,8 @@ impl Session {
             exit_ready: false,
             last_output: None,
             recording,
+            started,
+            pointer: None,
             capture_input: false,
             captured_input: Vec::new(),
             cols: options.cols,
@@ -326,6 +354,7 @@ impl Session {
                 max_bytes: options.max_bytes,
                 opentui_host: options.opentui_host,
                 color: options.color,
+                pointer_recording: options.pointer_recording,
             },
             mirror: None,
             semantic,
@@ -414,6 +443,37 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn send_mouse_all(&mut self, input: &[MouseInput], pace: Duration) -> Result<()> {
+        self.consume_batch()?;
+        if !self.launch.pointer_recording {
+            bail!("session was not started with structured pointer recording enabled");
+        }
+        if self.has_exited()? || self.stopped {
+            bail!("session command has exited");
+        }
+        let last = input.len().saturating_sub(1);
+        for (index, event) in input.iter().enumerate() {
+            self.write_input(&event.bytes)?;
+            let recording = self
+                .recording
+                .as_mut()
+                .context("session has no active pointer recording")?;
+            recording.pointer(event.x, event.y, event.phase)?;
+            let at_ms = self.started.elapsed().as_millis() as u64;
+            self.pointer = Some(recording::PointerState::apply(
+                self.pointer,
+                at_ms,
+                event.x,
+                event.y,
+                event.phase,
+            ));
+            if !pace.is_zero() && index < last {
+                thread::sleep(pace);
+            }
+        }
+        Ok(())
+    }
+
     /// Wait until visible terminal text contains `text`.
     pub fn wait_for_text(&mut self, text: &str, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
@@ -488,6 +548,10 @@ impl Session {
                     shot: Shot {
                         frame: self.terminal.frame()?,
                         ansi: self.ansi.clone(),
+                        pointer_recording: self.launch.pointer_recording,
+                        pointer: self.pointer.map(|pointer| {
+                            pointer.snapshot(self.started.elapsed().as_millis() as u64)
+                        }),
                     },
                     reason,
                 });
@@ -630,6 +694,10 @@ impl Session {
         Ok(Shot {
             frame: self.terminal.frame()?,
             ansi: self.ansi.clone(),
+            pointer_recording: self.launch.pointer_recording,
+            pointer: self
+                .pointer
+                .map(|pointer| pointer.snapshot(self.started.elapsed().as_millis() as u64)),
         })
     }
 
@@ -916,6 +984,12 @@ enum Request {
         #[serde(default)]
         pane: Option<crate::workspace::PaneId>,
     },
+    Mouse {
+        input: Vec<MouseInput>,
+        pace_ms: u64,
+        #[serde(default)]
+        pane: Option<crate::workspace::PaneId>,
+    },
     Show {
         settle_ms: u64,
         deadline_ms: u64,
@@ -1050,6 +1124,7 @@ enum ProtocolCapability {
     LayoutCommand,
     WorkspaceControl,
     Semantic,
+    Pointer,
 }
 
 impl ProtocolCapability {
@@ -1061,6 +1136,7 @@ impl ProtocolCapability {
             Self::LayoutCommand => LAYOUT_COMMAND_PROTOCOL_VERSION,
             Self::WorkspaceControl => WORKSPACE_CONTROL_PROTOCOL_VERSION,
             Self::Semantic => SEMANTIC_PROTOCOL_VERSION,
+            Self::Pointer => POINTER_PROTOCOL_VERSION,
         }
     }
 
@@ -1083,6 +1159,9 @@ impl ProtocolCapability {
             }
             Self::Semantic => {
                 "running session predates semantic snapshots; restart it with the current termctrl"
+            }
+            Self::Pointer => {
+                "running session predates structured pointer recording; restart it with the current termctrl"
             }
         }
     }
@@ -1135,6 +1214,7 @@ impl Request {
             | Self::ClosePane { .. } => ProtocolCapability::Pane,
             Self::Attach { .. } | Self::ResizeAttachment { .. } => ProtocolCapability::Attachment,
             Self::SemanticSnapshot { .. } => ProtocolCapability::Semantic,
+            Self::Mouse { .. } => ProtocolCapability::Pointer,
             Self::Ping
             | Self::Status
             | Self::Wait { pane: None, .. }
@@ -1363,6 +1443,37 @@ pub fn send_to_in(
     pace: Duration,
 ) -> Result<()> {
     send_to_target(name, terminal_target(window, pane)?, input, pace)
+}
+
+#[doc(hidden)]
+pub fn mouse_to_in(
+    name: &str,
+    window: Option<String>,
+    pane: Option<crate::workspace::PaneId>,
+    input: Vec<MouseInput>,
+    pace: Duration,
+) -> Result<()> {
+    if !status(name)?.launch.pointer_recording {
+        return send_to_in(
+            name,
+            window,
+            pane,
+            input.into_iter().map(|event| event.bytes).collect(),
+            pace,
+        );
+    }
+    if window.is_some() {
+        bail!("structured pointer recording is currently supported only by direct named sessions");
+    }
+    request(
+        name,
+        Request::Mouse {
+            input,
+            pace_ms: pace.as_millis() as u64,
+            pane,
+        },
+    )?;
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -2068,6 +2179,9 @@ mod implementation {
             .arg(options.cell_height.to_string())
             .arg("--max-bytes")
             .arg(options.max_bytes.to_string());
+        if options.pointer_recording {
+            daemon.arg("--pointer-recording");
+        }
         if !options.inherit_env {
             daemon.env_clear();
         }
@@ -3011,6 +3125,16 @@ mod implementation {
                 }
                 session.send_all(&input, Duration::from_millis(pace_ms))?;
             }
+            Request::Mouse {
+                input,
+                pace_ms,
+                pane,
+            } => {
+                if pane.is_some_and(|pane| pane != 0) {
+                    bail!("single sessions only contain pane 0");
+                }
+                session.send_mouse_all(&input, Duration::from_millis(pace_ms))?;
+            }
             Request::Wait {
                 text,
                 timeout_ms,
@@ -3137,6 +3261,11 @@ mod implementation {
                 workspace.send_all(pane, &input, Duration::from_millis(pace_ms), |workspace| {
                     terminal.tick(workspace)
                 })?;
+            }
+            Request::Mouse { .. } => {
+                bail!(
+                    "structured pointer recording is currently supported only by direct named sessions"
+                )
             }
             Request::Wait {
                 text,
@@ -3747,9 +3876,16 @@ mod tests {
                 .is_err()
         );
         assert!(ProtocolCapability::Semantic.require(&version_four).is_err());
+        assert!(
+            ProtocolCapability::Pointer
+                .require(&response)
+                .unwrap_err()
+                .to_string()
+                .contains("predates structured pointer recording")
+        );
         assert_eq!(
             Response::default().protocol_version,
-            SEMANTIC_PROTOCOL_VERSION
+            POINTER_PROTOCOL_VERSION
         );
     }
 
@@ -3803,6 +3939,15 @@ mod tests {
                     window: None,
                 },
                 Some(ProtocolCapability::Semantic),
+                false,
+            ),
+            (
+                Request::Mouse {
+                    input: Vec::new(),
+                    pace_ms: 0,
+                    pane: None,
+                },
+                Some(ProtocolCapability::Pointer),
                 false,
             ),
             (Request::Status, None, false),

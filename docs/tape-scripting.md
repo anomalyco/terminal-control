@@ -37,6 +37,7 @@ All header directives must precede `Launch`:
 | `Cwd PATH` | Launch and action working directory; defaults to the tape directory. |
 | `Env KEY VALUE` | Add or override one inherited environment value; repeat for multiple keys. |
 | `Record FILE.termctrl` | Opt into a recording, resolved from the tape directory. |
+| `Pointer on\|off` | Opt into version 2 structured pointer recording; `on` requires `Record`. |
 | `Host none\|opentui` | Terminal host profile; defaults to `none`. |
 | `Color auto\|always\|never` | Color environment policy; defaults to `auto`. |
 | `Launch PROGRAM [ARG ...]` | Required application argv; no implicit shell. |
@@ -59,6 +60,10 @@ Steps follow `Launch` in order:
 the normal SGR mouse implementation, so the application must enable mouse tracking. Coordinates are
 application-cell coordinates, not screen pixels.
 
+With `Pointer on`, click and drag also produce structured press, move, and release events in an
+opt-in version 2 recording. Render them with `save --recording ... --pointer` or `video --pointer`.
+Without that directive, tape recordings remain version 1 and render exactly as before.
+
 ## Example
 
 ```text
@@ -69,6 +74,7 @@ Cell 9 18
 Cwd ".."
 Env TTT_SEED "fixed-demo"
 Record "captures/ttt.termctrl"
+Pointer on
 Color always
 Launch "cargo" "run" "--release" "--bin" "ttt"
 

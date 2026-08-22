@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anomalyco/terminal-control/schemas/recording-entry-v2.schema.json",
+  "title": "Terminal Control recording JSON Lines entry v2",
+  "description": "Version 2 extends the version 1 timeline with opt-in structured pointer events.",
+  "oneOf": [
+    { "$ref": "#/$defs/header" },
+    { "$ref": "#/$defs/output" },
+    { "$ref": "#/$defs/input" },
+    { "$ref": "#/$defs/resize" },
+    { "$ref": "#/$defs/marker" },
+    { "$ref": "#/$defs/pointer" }
+  ],
+  "$defs": {
+    "dimension": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "terminalDimension": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "byteArray": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+    },
+    "header": {
+      "type": "object",
+      "required": ["type", "version", "cols", "rows", "cell_width", "cell_height"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "header" },
+        "version": { "const": 2 },
+        "cols": { "$ref": "#/$defs/terminalDimension" },
+        "rows": { "$ref": "#/$defs/terminalDimension" },
+        "cell_width": { "$ref": "#/$defs/dimension" },
+        "cell_height": { "$ref": "#/$defs/dimension" }
+      }
+    },
+    "output": {
+      "type": "object",
+      "required": ["type", "at_ms", "bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "output" },
+        "at_ms": { "type": "integer", "minimum": 0 },
+        "bytes": { "$ref": "#/$defs/byteArray" }
+      }
+    },
+    "input": {
+      "type": "object",
+      "required": ["type", "at_ms", "origin", "bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "input" },
+        "at_ms": { "type": "integer", "minimum": 0 },
+        "origin": { "enum": ["client", "host"] },
+        "bytes": { "$ref": "#/$defs/byteArray" }
+      }
+    },
+    "resize": {
+      "type": "object",
+      "required": ["type", "at_ms", "cols", "rows", "cell_width", "cell_height"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "resize" },
+        "at_ms": { "type": "integer", "minimum": 0 },
+        "cols": { "$ref": "#/$defs/terminalDimension" },
+        "rows": { "$ref": "#/$defs/terminalDimension" },
+        "cell_width": { "$ref": "#/$defs/dimension" },
+        "cell_height": { "$ref": "#/$defs/dimension" }
+      }
+    },
+    "marker": {
+      "type": "object",
+      "required": ["type", "at_ms", "name"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "marker" },
+        "at_ms": { "type": "integer", "minimum": 0 },
+        "name": { "type": "string", "minLength": 1 }
+      }
+    },
+    "pointer": {
+      "type": "object",
+      "required": ["type", "at_ms", "x", "y", "phase"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "pointer" },
+        "at_ms": { "type": "integer", "minimum": 0 },
+        "x": { "$ref": "#/$defs/dimension" },
+        "y": { "$ref": "#/$defs/dimension" },
+        "phase": { "enum": ["press", "move", "release"] }
+      }
+    }
+  }
+}

@@ -14,8 +14,14 @@ use crate::shot::Shot;
 use crate::terminal_core::{SCROLLBACK_ROWS, TerminalCore};
 
 const MAX_VIDEO_FPS: u32 = 1000;
-/// Schema version written in the header of every `.termctrl` recording.
+/// Default schema version written by recordings without pointer capture.
 pub const FORMAT_VERSION: u8 = 1;
+/// Schema version used only when structured pointer capture is explicitly enabled.
+pub const POINTER_FORMAT_VERSION: u8 = 2;
+
+pub const POINTER_HOLD_MS: u64 = 500;
+pub const POINTER_FADE_MS: u64 = 700;
+pub const POINTER_CLICK_MS: u64 = 220;
 
 /// One JSON Lines entry in a `.termctrl` recording timeline.
 #[derive(Serialize, Deserialize)]
@@ -49,6 +55,79 @@ pub enum Entry {
         at_ms: u64,
         name: String,
     },
+    Pointer {
+        at_ms: u64,
+        x: u16,
+        y: u16,
+        phase: PointerPhase,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PointerPhase {
+    Press,
+    Move,
+    Release,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerSnapshot {
+    pub x: u16,
+    pub y: u16,
+    pub age_ms: u64,
+    pub pressed: bool,
+    pub click_age_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PointerState {
+    x: u16,
+    y: u16,
+    at_ms: u64,
+    pressed: bool,
+    click_at_ms: Option<u64>,
+}
+
+impl PointerState {
+    pub(crate) fn apply(
+        previous: Option<Self>,
+        at_ms: u64,
+        x: u16,
+        y: u16,
+        phase: PointerPhase,
+    ) -> Self {
+        let pressed = match phase {
+            PointerPhase::Press => true,
+            PointerPhase::Move => previous.is_some_and(|pointer| pointer.pressed),
+            PointerPhase::Release => false,
+        };
+        let click_at_ms = match phase {
+            PointerPhase::Press => Some(at_ms),
+            PointerPhase::Move | PointerPhase::Release => {
+                previous.and_then(|pointer| pointer.click_at_ms)
+            }
+        };
+        Self {
+            x,
+            y,
+            at_ms,
+            pressed,
+            click_at_ms,
+        }
+    }
+
+    pub(crate) fn snapshot(self, at_ms: u64) -> PointerSnapshot {
+        PointerSnapshot {
+            x: self.x,
+            y: self.y,
+            age_ms: at_ms.saturating_sub(self.at_ms),
+            pressed: self.pressed,
+            click_age_ms: self
+                .click_at_ms
+                .map(|clicked| at_ms.saturating_sub(clicked)),
+        }
+    }
 }
 
 /// Source of bytes written to the application while recording a session.
@@ -62,6 +141,7 @@ pub enum InputOrigin {
 pub struct Writer {
     file: fs::File,
     started: Instant,
+    version: u8,
     poisoned: bool,
 }
 
@@ -73,6 +153,45 @@ impl Writer {
         rows: u16,
         cell_width: u16,
         cell_height: u16,
+    ) -> Result<Self> {
+        Self::new_versioned(
+            path,
+            started,
+            cols,
+            rows,
+            cell_width,
+            cell_height,
+            FORMAT_VERSION,
+        )
+    }
+
+    pub fn new_with_pointer(
+        path: &Path,
+        started: Instant,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+    ) -> Result<Self> {
+        Self::new_versioned(
+            path,
+            started,
+            cols,
+            rows,
+            cell_width,
+            cell_height,
+            POINTER_FORMAT_VERSION,
+        )
+    }
+
+    fn new_versioned(
+        path: &Path,
+        started: Instant,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+        version: u8,
     ) -> Result<Self> {
         crate::shot::validate_geometry(rows, cols)?;
         if let Some(parent) = path
@@ -100,7 +219,7 @@ impl Writer {
         serde_json::to_writer(
             &mut file,
             &Entry::Header {
-                version: FORMAT_VERSION,
+                version,
                 cols,
                 rows,
                 cell_width,
@@ -113,6 +232,7 @@ impl Writer {
         Ok(Self {
             file,
             started,
+            version,
             poisoned: false,
         })
     }
@@ -163,6 +283,18 @@ impl Writer {
         })
     }
 
+    pub fn pointer(&mut self, x: u16, y: u16, phase: PointerPhase) -> Result<()> {
+        if self.version != POINTER_FORMAT_VERSION {
+            bail!("structured pointer events require a version 2 recording");
+        }
+        self.write(Entry::Pointer {
+            at_ms: self.started.elapsed().as_millis() as u64,
+            x,
+            y,
+            phase,
+        })
+    }
+
     fn write(&mut self, entry: Entry) -> Result<()> {
         if self.poisoned {
             bail!("recording writer is unavailable after a failed rollback");
@@ -204,6 +336,7 @@ pub struct VideoOptions {
     pub tail: Duration,
     pub include_startup: bool,
     pub edit: Option<PathBuf>,
+    pub pointer: bool,
 }
 
 pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
@@ -214,6 +347,9 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
         bail!("--fps must not exceed {MAX_VIDEO_FPS}");
     }
     let recording = read(path)?;
+    if options.pointer && recording.version != POINTER_FORMAT_VERSION {
+        bail!("--pointer requires a version 2 recording created with pointer capture enabled");
+    }
     let states = states(&recording)?;
     let states = visible_states(&states, options.include_startup);
     if states.is_empty() {
@@ -263,6 +399,7 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
 
 /// Parsed recording metadata and timeline entries.
 pub struct Recording {
+    pub version: u8,
     pub cols: u16,
     pub rows: u16,
     pub cell_width: u16,
@@ -295,7 +432,7 @@ pub fn read(path: &Path) -> Result<Recording> {
     else {
         bail!("recording does not start with a header");
     };
-    if version != FORMAT_VERSION {
+    if !matches!(version, FORMAT_VERSION | POINTER_FORMAT_VERSION) {
         bail!("unsupported recording version {version}");
     }
     crate::shot::validate_geometry(rows, cols)?;
@@ -311,7 +448,15 @@ pub fn read(path: &Path) -> Result<Recording> {
     {
         bail!("recording contains a header after the first line");
     }
+    if version == FORMAT_VERSION
+        && events
+            .iter()
+            .any(|entry| matches!(entry, Entry::Pointer { .. }))
+    {
+        bail!("recording version 1 cannot contain structured pointer events");
+    }
     Ok(Recording {
+        version,
         cols,
         rows,
         cell_width,
@@ -343,6 +488,8 @@ pub fn shot_at(path: &Path, at_ms: Option<u64>, marker: Option<&str>) -> Result<
             .frame
             .clone(),
         ansi: replay.ansi,
+        pointer_recording: recording.version == POINTER_FORMAT_VERSION,
+        pointer: replay.pointer,
     })
 }
 
@@ -351,11 +498,13 @@ struct VideoFrame {
     at_ms: u64,
     frame: Frame,
     footer_caption: Option<String>,
+    pointer: Option<PointerState>,
 }
 
 struct Replay {
     ansi: Vec<u8>,
     frames: Vec<VideoFrame>,
+    pointer: Option<PointerSnapshot>,
 }
 
 fn states(recording: &Recording) -> Result<Vec<VideoFrame>> {
@@ -370,7 +519,10 @@ fn replay(recording: &Recording, cutoff: Option<u64>) -> Result<Replay> {
         at_ms: 0,
         frame: terminal.frame()?,
         footer_caption: None,
+        pointer: None,
     });
+    let mut pointer = None;
+    let mut replayed_at_ms = 0;
     for event in &recording.events {
         let at_ms = match event {
             Entry::Output { at_ms, bytes } => {
@@ -394,12 +546,26 @@ fn replay(recording: &Recording, cutoff: Option<u64>) -> Result<Replay> {
                 terminal.resize(*cols, *rows, *cell_width, *cell_height)?;
                 *at_ms
             }
-            Entry::Input { .. } | Entry::Marker { .. } | Entry::Header { .. } => continue,
+            Entry::Pointer { at_ms, x, y, phase } => {
+                if cutoff.is_some_and(|cutoff| *at_ms > cutoff) {
+                    continue;
+                }
+                pointer = Some(PointerState::apply(pointer, *at_ms, *x, *y, *phase));
+                *at_ms
+            }
+            Entry::Input { at_ms, .. } | Entry::Marker { at_ms, .. } => {
+                if cutoff.is_none_or(|cutoff| *at_ms <= cutoff) {
+                    replayed_at_ms = replayed_at_ms.max(*at_ms);
+                }
+                continue;
+            }
+            Entry::Header { .. } => continue,
         };
+        replayed_at_ms = replayed_at_ms.max(at_ms);
         let frame = terminal.frame()?;
         if frames
             .last()
-            .is_some_and(|previous| previous.frame == frame)
+            .is_some_and(|previous| previous.frame == frame && previous.pointer == pointer)
         {
             continue;
         }
@@ -407,9 +573,15 @@ fn replay(recording: &Recording, cutoff: Option<u64>) -> Result<Replay> {
             at_ms,
             frame,
             footer_caption: None,
+            pointer,
         });
     }
-    Ok(Replay { ansi, frames })
+    let snapshot_at = cutoff.unwrap_or(replayed_at_ms).max(replayed_at_ms);
+    Ok(Replay {
+        ansi,
+        frames,
+        pointer: pointer.map(|pointer| pointer.snapshot(snapshot_at)),
+    })
 }
 
 fn visible_states(states: &[VideoFrame], include_startup: bool) -> &[VideoFrame] {
@@ -519,6 +691,7 @@ fn edited_states(
             at_ms: offset,
             frame: frame_with_caption(&first.frame, clip.caption.as_deref(), caption_placement),
             footer_caption: footer_caption(clip.caption.as_deref(), caption_placement),
+            pointer: scale_pointer(first.pointer, clip_start, from, speed),
         });
         output.extend(
             states
@@ -532,6 +705,7 @@ fn edited_states(
                         caption_placement,
                     ),
                     footer_caption: footer_caption(clip.caption.as_deref(), caption_placement),
+                    pointer: scale_pointer(state.pointer, clip_start, from, speed),
                 }),
         );
         let clip_end = scale_clip_time(clip_start, from, to, speed);
@@ -542,6 +716,7 @@ fn edited_states(
                 at_ms: clip_end,
                 frame: last.frame.clone(),
                 footer_caption: last.footer_caption.clone(),
+                pointer: last.pointer,
             });
         }
         let hold_ms = clip.hold_ms.unwrap_or(0);
@@ -553,6 +728,7 @@ fn edited_states(
                 at_ms: offset,
                 frame: last.frame.clone(),
                 footer_caption: last.footer_caption.clone(),
+                pointer: last.pointer,
             });
         }
     }
@@ -574,6 +750,29 @@ fn footer_caption(caption: Option<&str>, placement: CaptionPlacement) -> Option<
 
 fn scale_clip_time(clip_start: u64, from: u64, at_ms: u64, speed: f64) -> u64 {
     clip_start + ((at_ms.saturating_sub(from) as f64) / speed) as u64
+}
+
+fn scale_pointer(
+    pointer: Option<PointerState>,
+    clip_start: u64,
+    from: u64,
+    speed: f64,
+) -> Option<PointerState> {
+    pointer.map(|pointer| PointerState {
+        at_ms: scale_event_time(clip_start, from, pointer.at_ms, speed),
+        click_at_ms: pointer
+            .click_at_ms
+            .map(|at_ms| scale_event_time(clip_start, from, at_ms, speed)),
+        ..pointer
+    })
+}
+
+fn scale_event_time(clip_start: u64, from: u64, at_ms: u64, speed: f64) -> u64 {
+    if at_ms >= from {
+        scale_clip_time(clip_start, from, at_ms, speed)
+    } else {
+        clip_start.saturating_sub(((from - at_ms) as f64 / speed) as u64)
+    }
 }
 
 fn marker_times(entries: &[Entry]) -> Result<HashMap<String, u64>> {
@@ -624,7 +823,14 @@ fn annotate(mut frame: Frame, caption: Option<&str>) -> Frame {
     frame
 }
 
-fn samples(states: &[VideoFrame], options: &VideoOptions) -> Vec<usize> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoSample {
+    state: usize,
+    at_ms: u64,
+    elapsed_ms: u64,
+}
+
+fn samples(states: &[VideoFrame], options: &VideoOptions) -> Vec<VideoSample> {
     if states.is_empty() {
         return Vec::new();
     }
@@ -649,11 +855,19 @@ fn samples(states: &[VideoFrame], options: &VideoOptions) -> Vec<usize> {
         while state + 1 < timeline.len() && timeline[state + 1] <= sample_ms {
             state += 1;
         }
-        output.push(state);
+        output.push(VideoSample {
+            state,
+            at_ms: states[0].at_ms.saturating_add(sample_ms),
+            elapsed_ms: sample_ms,
+        });
         sample += 1;
     }
-    if output.last() != Some(&(states.len() - 1)) {
-        output.push(states.len() - 1);
+    if output.last().map(|sample| sample.state) != Some(states.len() - 1) {
+        output.push(VideoSample {
+            state: states.len() - 1,
+            at_ms: states[0].at_ms.saturating_add(end_ms),
+            elapsed_ms: end_ms,
+        });
     }
     output
 }
@@ -662,7 +876,7 @@ fn render_video_frames(
     temp: &Path,
     recording: &Recording,
     states: &[VideoFrame],
-    samples: &[usize],
+    samples: &[VideoSample],
     options: &VideoOptions,
 ) -> Result<()> {
     eprintln!("Rendering {} sampled frames...", samples.len());
@@ -680,7 +894,7 @@ fn render_video_frames(
         .iter()
         .map(|state| render_key(&state.frame, cols, rows, options.hide_cursor))
         .collect::<Vec<_>>();
-    let mut rendered = HashMap::<Frame, PathBuf>::new();
+    let mut rendered = HashMap::<String, PathBuf>::new();
     let renderer = render::PngRenderer::new();
     let render_options = render::Options {
         cell_width: f32::from(options.cell_width.unwrap_or(recording.cell_width)),
@@ -689,33 +903,35 @@ fn render_video_frames(
         padding: options.padding,
         font_family: options.font_family.clone(),
         show_cursor: !options.hide_cursor,
+        pointer: None,
     };
-    for (index, state) in samples.iter().enumerate() {
+    for (index, sample) in samples.iter().enumerate() {
         let path = temp.join(format!("frame-{index:06}.png"));
-        if options.footer {
-            let key = with_footer(
-                base_keys[*state].clone(),
-                states[*state].footer_caption.as_deref(),
-                (u128::from(index as u64) * 1000 / u128::from(options.fps)) as u64,
-            );
-            render_or_link(
-                &renderer,
-                &mut rendered,
-                &key,
-                &path,
-                &render_options,
-                options.pixel_ratio,
-            )?;
+        let key = if options.footer {
+            with_footer(
+                base_keys[sample.state].clone(),
+                states[sample.state].footer_caption.as_deref(),
+                sample.elapsed_ms,
+            )
         } else {
-            render_or_link(
-                &renderer,
-                &mut rendered,
-                &base_keys[*state],
-                &path,
-                &render_options,
-                options.pixel_ratio,
-            )?;
-        }
+            base_keys[sample.state].clone()
+        };
+        let mut sample_options = render_options.clone();
+        sample_options.pointer = options
+            .pointer
+            .then_some(states[sample.state].pointer)
+            .flatten()
+            .and_then(|pointer| {
+                render::PointerOverlay::from_snapshot(pointer.snapshot(sample.at_ms))
+            });
+        render_or_link(
+            &renderer,
+            &mut rendered,
+            &key,
+            &path,
+            &sample_options,
+            options.pixel_ratio,
+        )?;
     }
     eprintln!("Rendered {} unique screens.", rendered.len());
     eprintln!("Encoding {}...", options.out.display());
@@ -736,18 +952,19 @@ fn render_video_frames(
 
 fn render_or_link(
     renderer: &render::PngRenderer,
-    rendered: &mut HashMap<Frame, PathBuf>,
+    rendered: &mut HashMap<String, PathBuf>,
     key: &Frame,
     path: &Path,
     options: &render::Options,
     pixel_ratio: f32,
 ) -> Result<()> {
-    if let Some(existing) = rendered.get(key) {
+    let svg = render::svg(key, options);
+    if let Some(existing) = rendered.get(&svg) {
         fs::hard_link(existing, path).or_else(|_| fs::copy(existing, path).map(|_| ()))?;
         return Ok(());
     }
-    renderer.render(&render::svg(key, options), path, pixel_ratio)?;
-    rendered.insert(key.clone(), path.to_path_buf());
+    renderer.render(&svg, path, pixel_ratio)?;
+    rendered.insert(svg, path.to_path_buf());
     Ok(())
 }
 
@@ -910,6 +1127,7 @@ mod tests {
             tail: Duration::ZERO,
             include_startup: false,
             edit: None,
+            pointer: false,
         }
     }
 
@@ -942,18 +1160,20 @@ mod tests {
                     at_ms: 0,
                     frame: initial,
                     footer_caption: None,
+                    pointer: None,
                 },
                 VideoFrame {
                     at_ms: 4000,
                     frame: final_frame.clone(),
                     footer_caption: None,
+                    pointer: None,
                 },
             ],
             &options(),
         );
 
         assert_eq!(frames.len(), 81);
-        assert_eq!(frames.last(), Some(&1));
+        assert_eq!(frames.last().map(|sample| sample.state), Some(1));
     }
 
     #[test]
@@ -966,16 +1186,19 @@ mod tests {
                     at_ms: 0,
                     frame: first.clone(),
                     footer_caption: None,
+                    pointer: None,
                 },
                 VideoFrame {
                     at_ms: 1000,
                     frame: second.clone(),
                     footer_caption: None,
+                    pointer: None,
                 },
                 VideoFrame {
                     at_ms: 2000,
                     frame: first.clone(),
                     footer_caption: None,
+                    pointer: None,
                 },
             ],
             &[
@@ -1018,11 +1241,13 @@ mod tests {
                     at_ms: 0,
                     frame: frame("a"),
                     footer_caption: None,
+                    pointer: None,
                 },
                 VideoFrame {
                     at_ms: 1000,
                     frame: frame("b"),
                     footer_caption: None,
+                    pointer: None,
                 },
             ],
             &[
@@ -1054,6 +1279,7 @@ mod tests {
                 at_ms: 0,
                 frame: frame("a"),
                 footer_caption: None,
+                pointer: None,
             }],
             &[
                 Entry::Marker {
@@ -1129,6 +1355,7 @@ mod tests {
             at_ms: 0,
             frame: frame("a"),
             footer_caption: None,
+            pointer: None,
         }];
 
         assert!(
@@ -1187,8 +1414,125 @@ mod tests {
     }
 
     #[test]
+    fn default_writer_remains_version_one_byte_for_byte() {
+        let temp =
+            std::env::temp_dir().join(format!("termctrl-recording-v1-{}", std::process::id()));
+        let mut writer = Writer::new(&temp, Instant::now(), 2, 1, 9, 18).unwrap();
+        writer.output(1, b"A").unwrap();
+        drop(writer);
+
+        assert_eq!(
+            fs::read_to_string(&temp).unwrap(),
+            "{\"type\":\"header\",\"version\":1,\"cols\":2,\"rows\":1,\"cell_width\":9,\"cell_height\":18}\n{\"type\":\"output\",\"at_ms\":1,\"bytes\":[65]}\n"
+        );
+        let _ = fs::remove_file(temp);
+    }
+
+    #[test]
+    fn pointer_writer_uses_version_two_and_round_trips_structured_phases() {
+        let temp =
+            std::env::temp_dir().join(format!("termctrl-recording-v2-{}", std::process::id()));
+        let mut writer = Writer::new_with_pointer(&temp, Instant::now(), 20, 10, 9, 18).unwrap();
+        writer.pointer(2, 3, PointerPhase::Press).unwrap();
+        writer.pointer(4, 5, PointerPhase::Move).unwrap();
+        writer.pointer(4, 5, PointerPhase::Release).unwrap();
+        drop(writer);
+
+        let recording = read(&temp).unwrap();
+        let _ = fs::remove_file(temp);
+        assert_eq!(recording.version, POINTER_FORMAT_VERSION);
+        assert!(matches!(
+            recording.events.as_slice(),
+            [
+                Entry::Pointer {
+                    x: 2,
+                    y: 3,
+                    phase: PointerPhase::Press,
+                    ..
+                },
+                Entry::Pointer {
+                    x: 4,
+                    y: 5,
+                    phase: PointerPhase::Move,
+                    ..
+                },
+                Entry::Pointer {
+                    x: 4,
+                    y: 5,
+                    phase: PointerPhase::Release,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn version_one_rejects_pointer_events_and_unknown_versions_are_clear() {
+        let temp = std::env::temp_dir().join(format!(
+            "termctrl-recording-invalid-version-{}",
+            std::process::id()
+        ));
+        fs::write(
+            &temp,
+            "{\"type\":\"header\",\"version\":1,\"cols\":2,\"rows\":1,\"cell_width\":9,\"cell_height\":18}\n{\"type\":\"pointer\",\"at_ms\":0,\"x\":0,\"y\":0,\"phase\":\"press\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read(&temp).err().unwrap().to_string(),
+            "recording version 1 cannot contain structured pointer events"
+        );
+        fs::write(
+            &temp,
+            "{\"type\":\"header\",\"version\":3,\"cols\":2,\"rows\":1,\"cell_width\":9,\"cell_height\":18}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read(&temp).err().unwrap().to_string(),
+            "unsupported recording version 3"
+        );
+        let _ = fs::remove_file(temp);
+    }
+
+    #[test]
+    fn replay_tracks_pointer_age_through_quiet_markers() {
+        let recording = Recording {
+            version: POINTER_FORMAT_VERSION,
+            cols: 20,
+            rows: 10,
+            cell_width: 9,
+            cell_height: 18,
+            events: vec![
+                Entry::Pointer {
+                    at_ms: 10,
+                    x: 2,
+                    y: 3,
+                    phase: PointerPhase::Press,
+                },
+                Entry::Pointer {
+                    at_ms: 20,
+                    x: 4,
+                    y: 5,
+                    phase: PointerPhase::Release,
+                },
+                Entry::Marker {
+                    at_ms: 1000,
+                    name: "later".to_owned(),
+                },
+            ],
+        };
+
+        let replay = replay(&recording, Some(1000)).unwrap();
+        let pointer = replay.pointer.unwrap();
+        assert_eq!((pointer.x, pointer.y), (4, 5));
+        assert_eq!(pointer.age_ms, 980);
+        assert_eq!(pointer.click_age_ms, Some(990));
+        assert!(!pointer.pressed);
+    }
+
+    #[test]
     fn replays_resized_recordings_on_a_stable_video_canvas() {
         let recording = Recording {
+            version: FORMAT_VERSION,
             cols: 2,
             rows: 1,
             cell_width: 9,
@@ -1227,6 +1571,7 @@ mod tests {
     #[test]
     fn replay_preserves_reflowed_scrollback_across_multiple_resizes() {
         let recording = Recording {
+            version: FORMAT_VERSION,
             cols: 10,
             rows: 3,
             cell_width: 9,
@@ -1269,11 +1614,13 @@ mod tests {
                 at_ms: 0,
                 frame: frame(""),
                 footer_caption: None,
+                pointer: None,
             },
             VideoFrame {
                 at_ms: 1,
                 frame: painted.clone(),
                 footer_caption: None,
+                pointer: None,
             },
         ];
 
@@ -1290,17 +1637,22 @@ mod tests {
                     at_ms: 0,
                     frame: initial.clone(),
                     footer_caption: None,
+                    pointer: None,
                 },
                 VideoFrame {
                     at_ms: 1,
                     frame: final_frame.clone(),
                     footer_caption: None,
+                    pointer: None,
                 },
             ],
             &options(),
         );
 
-        assert_eq!(frames, vec![0, 1]);
+        assert_eq!(
+            frames.iter().map(|sample| sample.state).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 
     #[test]
@@ -1316,17 +1668,22 @@ mod tests {
                     at_ms: 0,
                     frame: initial.clone(),
                     footer_caption: None,
+                    pointer: None,
                 },
                 VideoFrame {
                     at_ms: 100,
                     frame: final_frame.clone(),
                     footer_caption: None,
+                    pointer: None,
                 },
             ],
             &options,
         );
 
-        assert_eq!(frames, vec![0, 0, 0, 1]);
+        assert_eq!(
+            frames.iter().map(|sample| sample.state).collect::<Vec<_>>(),
+            vec![0, 0, 0, 1]
+        );
     }
 
     #[test]

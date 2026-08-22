@@ -32,6 +32,7 @@ struct Tape {
     cwd: PathBuf,
     cwd_line: Option<usize>,
     record: Option<PathBuf>,
+    pointer_recording: bool,
     env: BTreeMap<String, String>,
     opentui_host: bool,
     color: shot::ColorMode,
@@ -158,6 +159,7 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
     let mut max_bytes: Option<Located<usize>> = None;
     let mut cwd: Option<Located<PathBuf>> = None;
     let mut record: Option<Located<PathBuf>> = None;
+    let mut pointer: Option<Located<bool>> = None;
     let mut host: Option<Located<bool>> = None;
     let mut color: Option<Located<shot::ColorMode>> = None;
     let mut env = BTreeMap::new();
@@ -252,6 +254,16 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
                     "Record",
                     resolve_path(base, &tokens[1]),
                 )?;
+            }
+            "Pointer" => {
+                require_header(source, line, command, before_launch)?;
+                exact_args(source, line, &tokens, 1, "Pointer on|off")?;
+                let value = match tokens[1].as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return line_error(source, line, "Pointer must be 'on' or 'off'"),
+                };
+                set_once(source, &mut pointer, line, "Pointer", value)?;
             }
             "Env" => {
                 require_header(source, line, command, before_launch)?;
@@ -471,6 +483,13 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
             source.display()
         );
     }
+    let pointer_recording = pointer.is_some_and(|value| value.value);
+    if pointer_recording && record.is_none() {
+        bail!(
+            "{}: Pointer on requires a Record FILE.termctrl directive before Launch",
+            source.display()
+        );
+    }
     let (cell_width, cell_height) = cell.map_or((9, 18), |value| value.value);
     let cwd_line = cwd.as_ref().map(|value| value.line);
     let cwd = cwd.map_or_else(|| base.to_path_buf(), |value| value.value);
@@ -486,6 +505,7 @@ fn parse(source: &Path, text: &str) -> Result<Tape> {
         cwd,
         cwd_line,
         record: record.map(|value| value.value),
+        pointer_recording,
         env,
         opentui_host: host.is_some_and(|value| value.value),
         color: color.map_or(shot::ColorMode::Auto, |value| value.value),
@@ -510,6 +530,7 @@ fn execute(tape: Tape) -> Result<()> {
         color: tape.color,
         env: tape.env.clone(),
         inherit_env: true,
+        pointer_recording: tape.pointer_recording,
     };
     session::start(
         &tape.name,
@@ -566,7 +587,17 @@ fn execute_step(tape: &Tape, step: &Step, owned: &mut OwnedSession) -> Result<()
             session::send(&tape.name, session_input(keys, !pace.is_zero())?, *pace)?;
         }
         Step::Click { x, y, .. } => {
-            session::send(&tape.name, mouse_click(*x, *y)?, Duration::ZERO)?;
+            if tape.pointer_recording {
+                session::mouse_to_in(
+                    &tape.name,
+                    None,
+                    None,
+                    super::mouse_click_events(*x, *y)?,
+                    Duration::ZERO,
+                )?;
+            } else {
+                session::send(&tape.name, mouse_click(*x, *y)?, Duration::ZERO)?;
+            }
         }
         Step::Drag {
             from,
@@ -575,7 +606,17 @@ fn execute_step(tape: &Tape, step: &Step, owned: &mut OwnedSession) -> Result<()
             pace,
             ..
         } => {
-            session::send(&tape.name, mouse_drag(*from, *to, *steps)?, *pace)?;
+            if tape.pointer_recording {
+                session::mouse_to_in(
+                    &tape.name,
+                    None,
+                    None,
+                    super::mouse_drag_events(*from, *to, *steps)?,
+                    *pace,
+                )?;
+            } else {
+                session::send(&tape.name, mouse_drag(*from, *to, *steps)?, *pace)?;
+            }
         }
         Step::Mark { name, .. } => session::mark(&tape.name, name.clone())?,
         Step::Sleep { duration, .. } => thread::sleep(*duration),

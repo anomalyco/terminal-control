@@ -62,6 +62,8 @@ The application stays alive until `termctrl stop NAME`, so later commands intera
 same screen and application state. Persistent sessions currently require macOS or Linux. Session
 sockets are local control endpoints protected for the current user; recordings contain terminal
 output plus client and automatic host input, so treat them as sensitive artifacts.
+Add `--record-pointer` with `--record` to write opt-in recording version 2 pointer events. The
+default recording remains version 1.
 
 Example:
   termctrl start demo --host opentui --cols 112 --rows 34 -- opencode
@@ -80,6 +82,7 @@ timelines they may produce. Relative Cwd and Record paths resolve from the tape'
 
 Use Wait for application readiness and Sleep only for deliberate presentation holds. Action runs
 an explicit argv vector on the host with the tape cwd and environment; it never invokes a shell.
+`Pointer on` requires Record and captures structured click and drag events for optional rendering.
 Any failed step reports its tape line and stops the session owned by this play invocation. Video
 rendering remains a separate `termctrl video RECORDING --edit PLAN` phase.
 
@@ -146,6 +149,7 @@ the column from left to right and Y is the row from top to bottom. Workspace coo
 to the targeted pane and exclude workspace chrome and borders. Target the selected pane by default,
 one stable pane with `--pane`, or one named window's active pane with `--window`. The application
 must have mouse tracking enabled.
+Direct sessions started with `--record-pointer` also retain this click as a structured event.
 
 Examples:
   termctrl click demo 12 4
@@ -157,6 +161,7 @@ TO. Coordinates use the same zero-based, pane-local convention as `click`. `--st
 number of motion events, including the destination; short drags may emit the same cell more than
 once. Target the selected pane by default, one stable pane with `--pane`, or one named window's
 active pane with `--window`. The application must have mouse tracking enabled.
+Direct sessions started with `--record-pointer` also retain structured press, movement, and release.
 
 Examples:
   termctrl drag demo 12 4 30 4
@@ -175,6 +180,8 @@ reused. Pass `--include-startup` to retain blank startup or capability negotiati
 input, and markers until the session is closed. Video export requires `ffmpeg` to be installed.
 Pass `--footer` to add a bottom row with the clip caption, elapsed timecode, and TERMINAL CONTROL
 branding; without it, edit-plan captions render as inline annotation rows.
+Use `--pointer` to overlay structured pointer events from a version 2 recording. Pointer capture is
+opt-in at direct-session start and leaves default version 1 recordings and exports unchanged.
 
 Example:
   termctrl start demo --record captures/demo.termctrl -- opencode
@@ -341,6 +348,9 @@ struct RenderArgs {
     /// Hide the terminal cursor in rendered output.
     #[arg(long)]
     hide_cursor: bool,
+    /// Overlay structured pointer state from an opted-in session or version 2 recording.
+    #[arg(long)]
+    pointer: bool,
 }
 
 #[derive(Args)]
@@ -457,6 +467,9 @@ struct StartArgs {
     /// Write timestamped terminal output and client/host input to this private recording file.
     #[arg(long)]
     record: Option<PathBuf>,
+    /// Record structured pointer events and write recording format version 2.
+    #[arg(long, requires = "record")]
+    record_pointer: bool,
     /// Color environment policy for the terminal command.
     #[arg(long, value_enum, default_value = "auto")]
     color: ColorMode,
@@ -858,6 +871,9 @@ struct RestartArgs {
     cwd: Option<PathBuf>,
     #[arg(long)]
     record: Option<PathBuf>,
+    /// Enable structured pointer recording for the restarted session.
+    #[arg(long)]
+    record_pointer: bool,
     #[arg(long, value_enum)]
     color: Option<ColorMode>,
     #[arg(long, value_enum)]
@@ -883,6 +899,8 @@ struct ServeArgs {
     cwd: Option<PathBuf>,
     #[arg(long)]
     record: Option<PathBuf>,
+    #[arg(long)]
+    pointer_recording: bool,
     #[arg(long)]
     opentui_host: bool,
     #[arg(long, value_enum, default_value = "auto")]
@@ -974,6 +992,9 @@ struct VideoArgs {
     /// Include leading contentless startup/terminal negotiation frames.
     #[arg(long)]
     include_startup: bool,
+    /// Overlay recorded pointer movement, click feedback, and inactivity fade.
+    #[arg(long)]
+    pointer: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1158,6 +1179,7 @@ fn main() -> Result<()> {
                     tail: Duration::from_millis(args.tail_ms),
                     include_startup: args.include_startup,
                     edit: args.edit,
+                    pointer: args.pointer,
                 },
             )?;
             println!("{}", out.display());
@@ -1190,6 +1212,7 @@ fn main() -> Result<()> {
                     color: args.color.into(),
                     env: Default::default(),
                     inherit_env: true,
+                    pointer_recording: args.pointer_recording,
                 },
             )?;
         }
@@ -1215,6 +1238,7 @@ fn main() -> Result<()> {
                     color: args.color.into(),
                     env: Default::default(),
                     inherit_env: true,
+                    pointer_recording: false,
                 },
                 args.tab_position.into(),
             )?;
@@ -1397,6 +1421,7 @@ fn read_source(args: &SourceArgs, render: &RenderArgs) -> Result<shot_engine::Sh
         color: color.into(),
         env: Default::default(),
         inherit_env: true,
+        pointer_recording: false,
     };
     if args.pipe {
         shot_engine::from_pipe_command(&args.command, args.cwd.as_deref(), &options)
@@ -1453,21 +1478,21 @@ fn send(args: SendArgs) -> Result<()> {
 }
 
 fn click(args: ClickArgs) -> Result<()> {
-    session::send_to_in(
+    session::mouse_to_in(
         &args.name,
         args.window,
         args.pane,
-        mouse_click(args.x, args.y)?,
+        mouse_click_events(args.x, args.y)?,
         Duration::ZERO,
     )
 }
 
 fn drag(args: DragArgs) -> Result<()> {
-    session::send_to_in(
+    session::mouse_to_in(
         &args.name,
         args.window,
         args.pane,
-        mouse_drag(
+        mouse_drag_events(
             (args.from_x, args.from_y),
             (args.to_x, args.to_y),
             args.steps,
@@ -1477,21 +1502,67 @@ fn drag(args: DragArgs) -> Result<()> {
 }
 
 fn mouse_click(x: u16, y: u16) -> Result<Vec<Vec<u8>>> {
-    Ok(vec![sgr_mouse(0, x, y, b'M')?, sgr_mouse(0, x, y, b'm')?])
+    Ok(mouse_click_events(x, y)?
+        .into_iter()
+        .map(|event| event.bytes)
+        .collect())
 }
 
 fn mouse_drag(from: (u16, u16), to: (u16, u16), steps: u16) -> Result<Vec<Vec<u8>>> {
+    Ok(mouse_drag_events(from, to, steps)?
+        .into_iter()
+        .map(|event| event.bytes)
+        .collect())
+}
+
+fn mouse_click_events(x: u16, y: u16) -> Result<Vec<session::MouseInput>> {
+    Ok(vec![
+        session::MouseInput {
+            bytes: sgr_mouse(0, x, y, b'M')?,
+            x,
+            y,
+            phase: recording::PointerPhase::Press,
+        },
+        session::MouseInput {
+            bytes: sgr_mouse(0, x, y, b'm')?,
+            x,
+            y,
+            phase: recording::PointerPhase::Release,
+        },
+    ])
+}
+
+fn mouse_drag_events(
+    from: (u16, u16),
+    to: (u16, u16),
+    steps: u16,
+) -> Result<Vec<session::MouseInput>> {
     if steps == 0 {
         bail!("drag steps must be greater than zero");
     }
     let mut input = Vec::with_capacity(usize::from(steps) + 2);
-    input.push(sgr_mouse(0, from.0, from.1, b'M')?);
+    input.push(session::MouseInput {
+        bytes: sgr_mouse(0, from.0, from.1, b'M')?,
+        x: from.0,
+        y: from.1,
+        phase: recording::PointerPhase::Press,
+    });
     for step in 1..=steps {
         let x = interpolate(from.0, to.0, step, steps);
         let y = interpolate(from.1, to.1, step, steps);
-        input.push(sgr_mouse(32, x, y, b'M')?);
+        input.push(session::MouseInput {
+            bytes: sgr_mouse(32, x, y, b'M')?,
+            x,
+            y,
+            phase: recording::PointerPhase::Move,
+        });
     }
-    input.push(sgr_mouse(0, to.0, to.1, b'm')?);
+    input.push(session::MouseInput {
+        bytes: sgr_mouse(0, to.0, to.1, b'm')?,
+        x: to.0,
+        y: to.1,
+        phase: recording::PointerPhase::Release,
+    });
     Ok(input)
 }
 
@@ -1721,6 +1792,7 @@ fn start_session(args: &StartArgs) -> Result<()> {
         color: args.color.into(),
         env: Default::default(),
         inherit_env: true,
+        pointer_recording: args.record_pointer,
     };
     session::start(
         &args.name,
@@ -1880,6 +1952,7 @@ fn restart_session(args: &RestartArgs) -> Result<()> {
                 matches!(host, HostProfile::Opentui)
             }),
             color: args.color.map_or(previous.color, Into::into),
+            pointer_recording: previous.pointer_recording || args.record_pointer,
             ..shot_engine::Options::default()
         },
     )
@@ -1975,8 +2048,14 @@ fn write_outputs(
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let enabled = |format| formats.contains(&format);
-    let svg = (enabled(ShotFormat::Svg) || enabled(ShotFormat::Png))
-        .then(|| rendered_svg(captured, args));
+    if args.pointer && !enabled(ShotFormat::Svg) && !enabled(ShotFormat::Png) {
+        bail!("--pointer requires a rendered PNG or SVG format");
+    }
+    let svg = if enabled(ShotFormat::Svg) || enabled(ShotFormat::Png) {
+        Some(rendered_svg(captured, args)?)
+    } else {
+        None
+    };
     if let Some(svg) = svg.as_ref().filter(|_| enabled(ShotFormat::Svg)) {
         let path = out.with_extension("svg");
         fs::write(&path, svg).with_context(|| format!("write {}", path.display()))?;
@@ -2012,7 +2091,7 @@ fn write_stdout(captured: &shot_engine::Shot, args: &RenderArgs, format: ShotFor
         ShotFormat::Txt => captured.frame.text().into_bytes(),
         ShotFormat::Json => serde_json::to_vec_pretty(&captured.frame)?,
         ShotFormat::Ansi => captured.ansi.clone(),
-        ShotFormat::Svg => rendered_svg(captured, args).into_bytes(),
+        ShotFormat::Svg => rendered_svg(captured, args)?.into_bytes(),
         ShotFormat::Png => unreachable!("show validates PNG before reading source"),
         ShotFormat::Semantic => unreachable!("show handles semantic output before reading source"),
     };
@@ -2027,8 +2106,11 @@ fn write_stdout(captured: &shot_engine::Shot, args: &RenderArgs, format: ShotFor
     Ok(())
 }
 
-fn rendered_svg(captured: &shot_engine::Shot, args: &RenderArgs) -> String {
-    render::svg(
+fn rendered_svg(captured: &shot_engine::Shot, args: &RenderArgs) -> Result<String> {
+    if args.pointer && !captured.pointer_recording {
+        bail!("--pointer requires a pointer-enabled named session or version 2 recording");
+    }
+    Ok(render::svg(
         &captured.frame,
         &render::Options {
             cell_width: f32::from(args.cell_width),
@@ -2037,8 +2119,13 @@ fn rendered_svg(captured: &shot_engine::Shot, args: &RenderArgs) -> String {
             padding: args.padding,
             font_family: args.font_family.clone(),
             show_cursor: !args.hide_cursor,
+            pointer: args
+                .pointer
+                .then_some(captured.pointer)
+                .flatten()
+                .and_then(render::PointerOverlay::from_snapshot),
         },
-    )
+    ))
 }
 
 #[cfg(test)]

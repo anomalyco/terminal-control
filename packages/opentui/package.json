@@ -1,6 +1,6 @@
 {
   "name": "@kitlangton/terminal-control-opentui",
-  "version": "0.6.0",
+  "version": "1.0.0",
   "description": "Expose consistent OpenTUI semantic snapshots through Terminal Control",
   "license": "MIT",
   "repository": {

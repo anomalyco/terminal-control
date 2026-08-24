@@ -1,5 +1,7 @@
 # @kitlangton/terminal-control-linux-x64-gnu
 
+## 1.1.0
+
 ## 1.0.0
 
 ## 0.6.0

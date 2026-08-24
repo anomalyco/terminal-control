@@ -204,6 +204,69 @@ fn graphic(cell: &Cell, options: &Options) -> Option<String> {
             cell.foreground.css(),
         )
     };
+    // Powerline separators must fill their cell edge-to-edge so adjacent
+    // segments meet with no seam. Drawing them from the font leaves gaps
+    // (the glyph is narrower than the cell), so we render exact shapes.
+    let poly = |points: &[(f32, f32)]| {
+        let coords = points
+            .iter()
+            .map(|(fx, fy)| format!("{},{}", x + width * fx, y + height * fy))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            r#"<polygon points="{coords}" fill="{}"/>"#,
+            cell.foreground.css(),
+        )
+    };
+    let poly_line = |points: &[(f32, f32)]| {
+        let coords = points
+            .iter()
+            .map(|(fx, fy)| format!("{},{}", x + width * fx, y + height * fy))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            r#"<polyline points="{coords}" fill="none" stroke="{}" stroke-width="{stroke_width}"/>"#,
+            cell.foreground.css(),
+        )
+    };
+    // Half-disc with its flat edge on the left (flat_left=true) or right,
+    // bulging across the full cell width.
+    let half_disc = |flat_left: bool, filled: bool| {
+        let flat = if flat_left { x } else { x + width };
+        let sweep = if flat_left { 1 } else { 0 };
+        let (fill, stroke) = if filled {
+            (cell.foreground.css(), String::new())
+        } else {
+            (
+                "none".to_owned(),
+                format!(
+                    r#" stroke="{}" stroke-width="{stroke_width}""#,
+                    cell.foreground.css()
+                ),
+            )
+        };
+        let close = if filled { " Z" } else { "" };
+        format!(
+            r#"<path d="M {flat},{} A {},{} 0 0 {sweep} {flat},{}{close}" fill="{fill}"{stroke}/>"#,
+            y,
+            width,
+            height / 2.0,
+            y + height,
+        )
+    };
+    if let Some(graphic) = match char {
+        '\u{e0b0}' => Some(poly(&[(0.0, 0.0), (1.0, 0.5), (0.0, 1.0)])),
+        '\u{e0b2}' => Some(poly(&[(1.0, 0.0), (0.0, 0.5), (1.0, 1.0)])),
+        '\u{e0b4}' => Some(half_disc(true, true)),
+        '\u{e0b6}' => Some(half_disc(false, true)),
+        '\u{e0b1}' => Some(poly_line(&[(0.0, 0.0), (1.0, 0.5), (0.0, 1.0)])),
+        '\u{e0b3}' => Some(poly_line(&[(1.0, 0.0), (0.0, 0.5), (1.0, 1.0)])),
+        '\u{e0b5}' => Some(half_disc(true, false)),
+        '\u{e0b7}' => Some(half_disc(false, false)),
+        _ => None,
+    } {
+        return Some(graphic_opacity(cell, graphic));
+    }
     let codepoint = char as u32;
     if (0x2800..=0x28ff).contains(&codepoint) {
         return Some(graphic_opacity(
@@ -221,6 +284,12 @@ fn graphic(cell: &Cell, options: &Options) -> Option<String> {
         ));
     }
     let graphic = match char {
+        // Shade blocks: draw as the foreground color at graduated opacity so
+        // they read as a smooth gradient (e.g. a powerline fade-in) instead of
+        // the font's literal dither dots.
+        '░' => rect(x, y, width, height, Some(0.25)),
+        '▒' => rect(x, y, width, height, Some(0.5)),
+        '▓' => rect(x, y, width, height, Some(0.75)),
         '█' => single(0.0, 0.0, 1.0, 1.0),
         '▀' => single(0.0, 0.0, 1.0, 0.5),
         '▄' => single(0.0, 0.5, 1.0, 0.5),
@@ -600,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_shade_characters_as_font_glyphs() {
+    fn renders_shade_characters_as_graduated_opacity() {
         let frame = Frame {
             version: 1,
             cols: 3,
@@ -633,11 +702,70 @@ mod tests {
 
         let output = svg(&frame, &Options::default());
 
-        assert!(output.contains(">░</text>"));
-        assert!(output.contains(">▒</text>"));
-        assert!(output.contains(">▓</text>"));
-        assert!(!output.contains("opacity=\"0.25\""));
-        assert!(!output.contains("opacity=\"0.5\""));
-        assert!(!output.contains("opacity=\"0.75\""));
+        // Shade blocks render as the foreground color at graduated opacity so
+        // they read as a smooth gradient (e.g. a powerline fade-in) rather than
+        // the font's literal dither dots.
+        assert!(output.contains("opacity=\"0.25\""));
+        assert!(output.contains("opacity=\"0.5\""));
+        assert!(output.contains("opacity=\"0.75\""));
+        assert!(!output.contains(">░</text>"));
+        assert!(!output.contains(">▒</text>"));
+        assert!(!output.contains(">▓</text>"));
+    }
+
+    #[test]
+    fn renders_powerline_separators_as_shapes() {
+        let cell = |x: u16, text: &str| crate::frame::Cell {
+            x,
+            y: 0,
+            text: text.to_owned(),
+            width: 1,
+            foreground: Color {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+            background: Color { r: 0, g: 0, b: 0 },
+            attributes: Attributes {
+                faint: true,
+                ..Attributes::default()
+            },
+        };
+        let glyphs = [
+            "\u{e0b0}", "\u{e0b1}", "\u{e0b2}", "\u{e0b3}", "\u{e0b4}", "\u{e0b5}", "\u{e0b6}",
+            "\u{e0b7}",
+        ];
+        let frame = Frame {
+            version: 1,
+            cols: glyphs.len() as u16,
+            rows: 1,
+            foreground: Color {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+            background: Color { r: 0, g: 0, b: 0 },
+            cursor: None,
+            cells: glyphs
+                .into_iter()
+                .enumerate()
+                .map(|(x, glyph)| cell(x as u16, glyph))
+                .collect(),
+        };
+        let options = Options {
+            cell_width: 11.0,
+            cell_height: 23.0,
+            ..Options::default()
+        };
+
+        let output = svg(&frame, &options);
+
+        assert_eq!(output.matches("<polygon").count(), 2);
+        assert_eq!(output.matches("<polyline").count(), 2);
+        assert_eq!(output.matches("<path").count(), 4);
+        assert_eq!(output.matches("<g opacity=\"0.55\">").count(), 8);
+        for glyph in glyphs {
+            assert!(!output.contains(&format!(">{glyph}</text>")));
+        }
     }
 }

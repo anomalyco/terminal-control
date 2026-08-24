@@ -138,6 +138,66 @@ pub struct NamedSessionStatus {
     pub unavailable: Option<UnavailableReason>,
 }
 
+impl NamedSessionStatus {
+    /// Whether this discovered entry satisfies a session-list filter.
+    pub fn matches(&self, filter: &SessionFilter) -> bool {
+        if filter.state.is_some_and(|state| !state.matches(self)) {
+            return false;
+        }
+        let Some(status) = &self.status else {
+            return filter.command.is_none() && filter.cwd.is_none();
+        };
+        filter.command.as_ref().is_none_or(|needle| {
+            status
+                .launch
+                .command
+                .iter()
+                .any(|argument| argument.contains(needle))
+        }) && filter
+            .cwd
+            .as_ref()
+            .is_none_or(|cwd| status.launch.cwd == *cwd)
+    }
+}
+
+/// Optional selectors applied to discovered named sessions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionFilter {
+    pub state: Option<SessionListState>,
+    /// Case-sensitive substring matched against each command argument.
+    pub command: Option<String>,
+    /// Exact launch working directory.
+    pub cwd: Option<PathBuf>,
+}
+
+/// States addressable by session discovery filters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionListState {
+    Running,
+    Exited,
+    Stale,
+    Incompatible,
+}
+
+impl SessionListState {
+    fn matches(self, entry: &NamedSessionStatus) -> bool {
+        match self {
+            Self::Running => entry
+                .status
+                .as_ref()
+                .is_some_and(|status| status.state == SessionState::Running),
+            Self::Exited => entry
+                .status
+                .as_ref()
+                .is_some_and(|status| status.state == SessionState::Exited),
+            Self::Stale => entry.unavailable == Some(UnavailableReason::Stale),
+            Self::Incompatible => {
+                entry.unavailable == Some(UnavailableReason::IncompatibleProtocol)
+            }
+        }
+    }
+}
+
 /// Why a named session socket could not report normal status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1703,6 +1763,71 @@ mod implementation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn listed_session(name: &str, state: SessionState, cwd: &str) -> NamedSessionStatus {
+        NamedSessionStatus {
+            name: name.to_owned(),
+            status: Some(SessionStatus {
+                state,
+                exit: None,
+                cols: 80,
+                rows: 24,
+                cell_width: 9,
+                cell_height: 18,
+                idle_for_ms: None,
+                has_visible_content: false,
+                recording: false,
+                logs_truncated: false,
+                launch: SessionLaunch {
+                    command: vec!["nvim".to_owned(), "README.md".to_owned()],
+                    cwd: PathBuf::from(cwd),
+                    record: None,
+                    cols: 80,
+                    rows: 24,
+                    cell_width: 9,
+                    cell_height: 18,
+                    max_bytes: 1024,
+                    opentui_host: false,
+                    color: shot::ColorMode::Auto,
+                },
+            }),
+            error: None,
+            unavailable: None,
+        }
+    }
+
+    #[test]
+    fn filters_discovered_sessions_by_state_command_and_cwd() {
+        let running = listed_session("editor", SessionState::Running, "/repo");
+        assert!(running.matches(&SessionFilter {
+            state: Some(SessionListState::Running),
+            command: Some("README".to_owned()),
+            cwd: Some(PathBuf::from("/repo")),
+        }));
+        assert!(!running.matches(&SessionFilter {
+            state: Some(SessionListState::Exited),
+            ..SessionFilter::default()
+        }));
+        assert!(!running.matches(&SessionFilter {
+            command: Some("cargo".to_owned()),
+            ..SessionFilter::default()
+        }));
+
+        let stale = NamedSessionStatus {
+            name: "old".to_owned(),
+            status: None,
+            error: Some("connection refused".to_owned()),
+            unavailable: Some(UnavailableReason::Stale),
+        };
+        assert!(stale.matches(&SessionFilter {
+            state: Some(SessionListState::Stale),
+            ..SessionFilter::default()
+        }));
+        assert!(!stale.matches(&SessionFilter {
+            command: Some("nvim".to_owned()),
+            ..SessionFilter::default()
+        }));
+    }
 
     #[test]
     fn semantic_request_and_response_preserve_the_session_protocol() {

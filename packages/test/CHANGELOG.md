@@ -1,5 +1,16 @@
 # @kitlangton/terminal-control
 
+## 1.1.0
+
+### Minor Changes
+
+- 861ad0f: Add state, command, and working-directory filters to CLI and MCP session discovery.
+
+### Patch Changes
+
+- ca75e4e: Render shade blocks and Powerline separators as exact SVG geometry for smooth gradients and seam-free captures.
+- e54baad: Preserve terminal cursor styles in structured frames, screenshots, and videos.
+
 ## 1.0.0
 
 ### Major Changes

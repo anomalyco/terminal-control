@@ -1,31 +1,19 @@
-use std::cell::{Cell as CounterCell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
-use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RowIterator};
+use libghostty_vt::render::{CellIterator, Dirty, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{PaletteIndex, RgbColor, Underline as GhosttyUnderline};
-use libghostty_vt::{RenderState, Terminal, TerminalOptions, terminal::Mode};
+use libghostty_vt::{RenderState, Terminal, TerminalOptions};
 
 use crate::frame::{
-    Attributes, Cell, Color, Cursor, FORMAT_VERSION, Frame, Underline, indexed_color,
+    Attributes, Cell, Color, Cursor, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, FORMAT_VERSION, Frame,
+    Underline, indexed_color,
 };
-use crate::terminal_theme::TerminalTheme;
 
 pub(crate) const SCROLLBACK_ROWS: usize = 10_000;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct InputModes {
-    pub cursor_keys: bool,
-    pub keypad_keys: bool,
-    pub normal_mouse: bool,
-    pub button_mouse: bool,
-    pub any_mouse: bool,
-    pub sgr_mouse: bool,
-    pub focus_events: bool,
-    pub bracketed_paste: bool,
-}
 
 pub(crate) struct TerminalCore {
     terminal: Terminal<'static, 'static>,
@@ -33,25 +21,12 @@ pub(crate) struct TerminalCore {
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
     responses: Rc<RefCell<Vec<u8>>>,
-    bells: Rc<CounterCell<u64>>,
-    cursor_style: CursorVisualStyle,
     cached_frame: Option<Frame>,
-    revision: u64,
 }
 
 impl TerminalCore {
     pub(crate) fn new(rows: u16, cols: u16, max_scrollback: usize) -> Result<Self> {
-        Self::new_with_theme(rows, cols, max_scrollback, TerminalTheme::default())
-    }
-
-    pub(crate) fn new_with_theme(
-        rows: u16,
-        cols: u16,
-        max_scrollback: usize,
-        theme: TerminalTheme,
-    ) -> Result<Self> {
         let responses = Rc::new(RefCell::new(Vec::new()));
-        let bells = Rc::new(CounterCell::new(0_u64));
         let mut terminal = Terminal::new(TerminalOptions {
             cols,
             rows,
@@ -64,13 +39,7 @@ impl TerminalCore {
                 move |_terminal, bytes| responses.borrow_mut().extend_from_slice(bytes)
             })
             .context("configure Ghostty PTY responses")?;
-        terminal
-            .on_bell({
-                let bells = Rc::clone(&bells);
-                move |_terminal| bells.set(bells.get().saturating_add(1))
-            })
-            .context("configure Ghostty bell events")?;
-        apply_theme(&mut terminal, theme)?;
+        apply_theme(&mut terminal)?;
 
         Ok(Self {
             terminal,
@@ -78,26 +47,13 @@ impl TerminalCore {
             rows: RowIterator::new().context("create Ghostty row iterator")?,
             cells: CellIterator::new().context("create Ghostty cell iterator")?,
             responses,
-            bells,
-            cursor_style: CursorVisualStyle::Block,
             cached_frame: None,
-            revision: 0,
         })
     }
 
     pub(crate) fn apply_output(&mut self, bytes: &[u8]) -> Vec<u8> {
-        if !bytes.is_empty() {
-            self.revision = self.revision.wrapping_add(1);
-        }
         self.terminal.vt_write(bytes);
         std::mem::take(&mut self.responses.borrow_mut())
-    }
-
-    pub(crate) fn set_theme(&mut self, theme: TerminalTheme) -> Result<()> {
-        apply_theme(&mut self.terminal, theme)?;
-        self.cached_frame = None;
-        self.revision = self.revision.wrapping_add(1);
-        Ok(())
     }
 
     pub(crate) fn resize(
@@ -111,7 +67,6 @@ impl TerminalCore {
             .resize(cols, rows, u32::from(cell_width), u32::from(cell_height))
             .context("resize Ghostty terminal")?;
         self.cached_frame = None;
-        self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -131,35 +86,6 @@ impl TerminalCore {
         Ok(bytes.as_ref().to_vec())
     }
 
-    pub(crate) fn input_modes(&self) -> Result<InputModes> {
-        Ok(InputModes {
-            cursor_keys: self.terminal.mode(Mode::DECCKM)?,
-            keypad_keys: self.terminal.mode(Mode::KEYPAD_KEYS)?,
-            normal_mouse: self.terminal.mode(Mode::NORMAL_MOUSE)?,
-            button_mouse: self.terminal.mode(Mode::BUTTON_MOUSE)?,
-            any_mouse: self.terminal.mode(Mode::ANY_MOUSE)?,
-            sgr_mouse: self.terminal.mode(Mode::SGR_MOUSE)?,
-            focus_events: self.terminal.mode(Mode::FOCUS_EVENT)?,
-            bracketed_paste: self.terminal.mode(Mode::BRACKETED_PASTE)?,
-        })
-    }
-
-    pub(crate) fn title(&self) -> Result<String> {
-        Ok(self.terminal.title()?.to_owned())
-    }
-
-    pub(crate) fn take_bells(&self) -> u64 {
-        self.bells.replace(0)
-    }
-
-    pub(crate) fn cursor_style(&self) -> CursorVisualStyle {
-        self.cursor_style
-    }
-
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision
-    }
-
     pub(crate) fn frame(&mut self) -> Result<Frame> {
         let snapshot = self
             .render_state
@@ -176,9 +102,6 @@ impl TerminalCore {
         let colors = snapshot.colors().context("read Ghostty colors")?;
         let foreground = from_ghostty_color(colors.foreground);
         let background = from_ghostty_color(colors.background);
-        self.cursor_style = snapshot
-            .cursor_visual_style()
-            .context("read Ghostty cursor style")?;
         let cursor = if snapshot
             .cursor_visible()
             .context("read Ghostty cursor visibility")?
@@ -302,24 +225,19 @@ impl TerminalCore {
     }
 }
 
-fn apply_theme(terminal: &mut Terminal<'static, 'static>, theme: TerminalTheme) -> Result<()> {
+fn apply_theme(terminal: &mut Terminal<'static, 'static>) -> Result<()> {
     terminal
-        .set_default_fg_color(Some(to_ghostty_color(theme.foreground)))
+        .set_default_fg_color(Some(to_ghostty_color(DEFAULT_FOREGROUND)))
         .context("configure Ghostty foreground")?
-        .set_default_bg_color(Some(to_ghostty_color(theme.background)))
+        .set_default_bg_color(Some(to_ghostty_color(DEFAULT_BACKGROUND)))
         .context("configure Ghostty background")?
-        .set_default_cursor_color(Some(to_ghostty_color(theme.foreground)))
+        .set_default_cursor_color(Some(to_ghostty_color(DEFAULT_FOREGROUND)))
         .context("configure Ghostty cursor")?;
     let mut palette = terminal
         .default_color_palette()
         .context("read Ghostty color palette")?;
     for index in 0..=u8::MAX {
-        let color = theme
-            .ansi
-            .get(usize::from(index))
-            .copied()
-            .unwrap_or_else(|| indexed_color(index));
-        palette.set(PaletteIndex(index), to_ghostty_color(color));
+        palette.set(PaletteIndex(index), to_ghostty_color(indexed_color(index)));
     }
     terminal
         .set_default_color_palette(Some(palette))
@@ -356,8 +274,7 @@ fn from_ghostty_color(color: RgbColor) -> Color {
 #[cfg(test)]
 mod tests {
     use super::TerminalCore;
-    use crate::frame::Color;
-    use crate::terminal_theme::TerminalTheme;
+    use crate::frame::{DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, indexed_color};
 
     #[test]
     fn captures_terminal_responses() {
@@ -367,74 +284,16 @@ mod tests {
     }
 
     #[test]
-    fn exposes_title_and_bell_events() {
-        let mut terminal = TerminalCore::new(1, 20, 0).unwrap();
-        let _responses = terminal.apply_output(b"\x07\x1b]2;editor\x07");
-
-        assert_eq!(terminal.title().unwrap(), "editor");
-        assert_eq!(terminal.take_bells(), 1);
-        assert_eq!(terminal.take_bells(), 0);
-    }
-
-    #[test]
-    fn exposes_input_modes_requested_by_the_application() {
-        let mut terminal = TerminalCore::new(1, 20, 0).unwrap();
-        let _responses = terminal.apply_output(
-            b"\x1b[?1h\x1b=\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h",
-        );
-
-        let modes = terminal.input_modes().unwrap();
-        assert!(modes.cursor_keys);
-        assert!(modes.keypad_keys);
-        assert!(modes.normal_mouse);
-        assert!(modes.button_mouse);
-        assert!(modes.any_mouse);
-        assert!(modes.sgr_mouse);
-        assert!(modes.focus_events);
-        assert!(modes.bracketed_paste);
-    }
-
-    #[test]
-    fn inherited_theme_configures_defaults_and_ansi_palette() {
-        let theme = TerminalTheme {
-            foreground: Color { r: 1, g: 2, b: 3 },
-            background: Color { r: 4, g: 5, b: 6 },
-            ansi: std::array::from_fn(|index| Color {
-                r: index as u8,
-                g: 20,
-                b: 30,
-            }),
-        };
-        let mut terminal = TerminalCore::new_with_theme(1, 4, 0, theme).unwrap();
+    fn deterministic_theme_configures_defaults_and_ansi_palette() {
+        let mut terminal = TerminalCore::new(1, 4, 0).unwrap();
         let _responses = terminal.apply_output(b"A\x1b[31mB\x1b[91mC");
         let frame = terminal.frame().unwrap();
 
-        assert_eq!(frame.foreground, theme.foreground);
-        assert_eq!(frame.background, theme.background);
-        assert_eq!(frame.cells[0].foreground, theme.foreground);
-        assert_eq!(frame.cells[1].foreground, theme.ansi[1]);
-        assert_eq!(frame.cells[2].foreground, theme.ansi[9]);
-
-        let updated = TerminalTheme {
-            foreground: Color { r: 7, g: 8, b: 9 },
-            background: Color {
-                r: 10,
-                g: 11,
-                b: 12,
-            },
-            ansi: std::array::from_fn(|index| Color {
-                r: 100 + index as u8,
-                g: 40,
-                b: 50,
-            }),
-        };
-        terminal.set_theme(updated).unwrap();
-        let frame = terminal.frame().unwrap();
-        assert_eq!(frame.foreground, updated.foreground);
-        assert_eq!(frame.background, updated.background);
-        assert_eq!(frame.cells[0].foreground, updated.foreground);
-        assert_eq!(frame.cells[1].foreground, updated.ansi[1]);
-        assert_eq!(frame.cells[2].foreground, updated.ansi[9]);
+        assert_eq!(frame.foreground, DEFAULT_FOREGROUND);
+        assert_eq!(frame.background, DEFAULT_BACKGROUND);
+        assert_eq!(frame.cells[0].foreground, DEFAULT_FOREGROUND);
+        assert_eq!(frame.cells[1].foreground, indexed_color(1));
+        assert_eq!(frame.cells[2].foreground, indexed_color(9));
     }
 
     #[test]

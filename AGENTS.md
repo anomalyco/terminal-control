@@ -3,14 +3,10 @@
 ## Repository
 
 - Terminal Control is a Rust library and its `termctrl` CLI binary. Public CLI vocabulary is `show` for reading visible terminal state, `save` for explicit retained artifacts, a named `session` for the live terminal lifecycle managed by flat control commands, `logs` for readable retained output, and `video` for a recorded timeline export.
-- `packages/test` publishes the TypeScript client and Vitest adapter; `src/driver.rs` is their JSON Lines transport adapter. `src/mcp.rs` publishes the stdio MCP adapter over named sessions and workspaces.
-- A `workspace` is a persistent daemon containing ordered named windows and workspace-wide pane IDs
-  that remain stable for its lifetime. `src/workspace.rs` owns workspace state, layout, tab chrome,
-  attachment presentation, and composed recording; `src/session.rs` owns the Unix-socket adapter and
-  protocol. Keep process ownership single-threaded because Ghostty terminal objects are not `Send`
-  or `Sync`.
-- Keep `README.md`, `skills/terminal-control/SKILL.md`, `CONTEXT.md`, and the Clap help in `src/main.rs` aligned when changing commands, formats, sessions, workspaces, recording, or OpenTUI support. Deep-dive documentation lives in `docs/` (`rust-library.md`, `driver-protocol.md`, `typescript-client.md`, `releasing.md`); the README stays install- and example-first with short pointers.
-- Treat the named-session control protocol as additive. Give new response fields Serde defaults, preserve existing request shapes, bump the relevant capability constant, and return an actionable restart error when an older workspace daemon cannot support a mutation.
+- `packages/test` publishes the TypeScript client and Vitest adapter; `src/driver.rs` is their JSON Lines transport adapter. `src/mcp.rs` publishes the stdio MCP adapter over named sessions.
+- Named sessions own one terminal process and remain single-threaded because Ghostty terminal objects are not `Send` or `Sync`.
+- Keep `README.md`, `skills/terminal-control/SKILL.md`, `CONTEXT.md`, and the Clap help in `src/main.rs` aligned when changing commands, formats, sessions, recording, or OpenTUI support. Deep-dive documentation lives in `docs/` (`rust-library.md`, `driver-protocol.md`, `typescript-client.md`, `releasing.md`); the README stays install- and example-first with short pointers.
+- Treat the named-session control protocol as additive. Give new response fields Serde defaults, preserve existing request shapes, bump the relevant capability constant, and return an actionable restart error when an older daemon cannot support an operation.
 - Keep MCP tool names and schemas aligned with the concise tool inventory in `README.md`. Keep driver wire changes aligned with `docs/driver-protocol.md` and TypeScript client changes aligned with `docs/typescript-client.md`.
 - Prefer focused fixes with unit tests in the affected module.
 

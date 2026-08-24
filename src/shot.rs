@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use crate::frame::{Color, Frame, indexed_color};
 use crate::terminal_core::TerminalCore;
-use crate::terminal_theme::TerminalTheme;
 use anyhow::{Context, Result, bail};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -16,8 +15,6 @@ use serde::{Deserialize, Serialize};
 use crate::semantic;
 
 const OPENTUI_QUERY: &[u8] = b"\x1b]10;?\x07\x1b]11;?\x07";
-#[cfg(test)]
-const PALETTE_QUERY: &[u8] = b"\x1b]4;0;?\x07";
 const KITTY_QUERY: &[u8] = b"\x1b_Gi=31337";
 
 /// Configuration for observing one terminal shot or starting a live session.
@@ -369,6 +366,7 @@ pub(crate) fn configure_pty_environment(builder: &mut CommandBuilder, options: &
             builder.env("CLICOLOR_FORCE", "0");
         }
     }
+    builder.env_remove("TERMCTRL_SESSION");
     for (key, value) in &options.env {
         builder.env(key, value);
     }
@@ -398,6 +396,7 @@ fn configure_process_environment(builder: &mut ProcessCommand, options: &Options
             builder.env("CLICOLOR_FORCE", "0");
         }
     }
+    builder.env_remove("TERMCTRL_SESSION");
     builder.envs(&options.env);
     builder.env_remove(semantic::SOCKET_ENV);
 }
@@ -576,19 +575,10 @@ pub(crate) struct Host {
     color_probe: Vec<u8>,
     pixel_width: u32,
     pixel_height: u32,
-    theme: TerminalTheme,
 }
 
 impl Host {
     pub(crate) fn new(writer: Box<dyn Write + Send>, options: &Options) -> Self {
-        Self::new_with_theme(writer, options, TerminalTheme::default())
-    }
-
-    pub(crate) fn new_with_theme(
-        writer: Box<dyn Write + Send>,
-        options: &Options,
-        theme: TerminalTheme,
-    ) -> Self {
         Self {
             writer,
             enabled: options.opentui_host,
@@ -598,7 +588,6 @@ impl Host {
             color_probe: Vec::new(),
             pixel_width: u32::from(options.cols) * u32::from(options.cell_width),
             pixel_height: u32::from(options.rows) * u32::from(options.cell_height),
-            theme,
         }
     }
 
@@ -626,10 +615,6 @@ impl Host {
         self.pixel_height = u32::from(rows) * u32::from(cell_height);
     }
 
-    pub(crate) fn set_theme(&mut self, theme: TerminalTheme) {
-        self.theme = theme;
-    }
-
     pub(crate) fn respond(&mut self, output: &[u8]) -> Result<Vec<u8>> {
         if !self.enabled {
             return Ok(Vec::new());
@@ -640,18 +625,13 @@ impl Host {
         for query in take_color_queries(&mut self.color_probe) {
             match query {
                 ColorQuery::Foreground => {
-                    append_color_response(&mut response, "10", self.theme.foreground)
+                    append_color_response(&mut response, "10", crate::frame::DEFAULT_FOREGROUND)
                 }
                 ColorQuery::Background => {
-                    append_color_response(&mut response, "11", self.theme.background)
+                    append_color_response(&mut response, "11", crate::frame::DEFAULT_BACKGROUND)
                 }
                 ColorQuery::Palette(index) => {
-                    let color = self
-                        .theme
-                        .ansi
-                        .get(usize::from(index))
-                        .copied()
-                        .unwrap_or_else(|| indexed_color(index));
+                    let color = indexed_color(index);
                     append_color_response(&mut response, &format!("4;{index}"), color);
                 }
             }
@@ -984,40 +964,6 @@ mod tests {
         assert!(output.contains("\x1b[4;480;900t"));
         assert!(output.contains("\x1b]4;0;rgb:0000/0000/0000\x1b\\"));
         assert!(output.contains("\x1b_Gi=31337;EINVAL:graphics unavailable\x1b\\"));
-    }
-
-    #[test]
-    fn opentui_host_replies_with_the_inherited_theme() {
-        let result = Arc::new(Mutex::new(Vec::new()));
-        let theme = crate::terminal_theme::TerminalTheme {
-            foreground: crate::frame::Color { r: 1, g: 2, b: 3 },
-            background: crate::frame::Color { r: 4, g: 5, b: 6 },
-            ansi: std::array::from_fn(|index| crate::frame::Color {
-                r: index as u8,
-                g: 7,
-                b: 8,
-            }),
-        };
-        let mut host = Host::new_with_theme(
-            Box::new(Writer(result.clone())),
-            &Options {
-                opentui_host: true,
-                ..Options::default()
-            },
-            theme,
-        );
-
-        host.respond(OPENTUI_QUERY).unwrap();
-        host.respond(PALETTE_QUERY).unwrap();
-        host.respond(b"\x1b]4;1;?;15;?\x07\x1b]10;?\x07").unwrap();
-
-        let output = String::from_utf8(result.lock().unwrap().clone()).unwrap();
-        assert!(output.contains("\x1b]10;rgb:0101/0202/0303"));
-        assert!(output.contains("\x1b]11;rgb:0404/0505/0606"));
-        assert!(output.contains("\x1b]4;0;rgb:0000/0707/0808"));
-        assert!(output.contains("\x1b]4;1;rgb:0101/0707/0808"));
-        assert!(output.contains("\x1b]4;15;rgb:0f0f/0707/0808"));
-        assert_eq!(output.matches("\x1b]10;rgb:0101/0202/0303").count(), 2);
     }
 
     #[test]

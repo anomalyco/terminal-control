@@ -41,6 +41,8 @@ termctrl mcp
 
 MCP screen reads and interactions return the current frame immediately. Agents can opt into
 quiet-output settling with `settleMs` and `deadlineMs` when a specific transition requires it.
+`list_sessions` returns running sessions by default and accepts `state`, `command`, and `cwd`
+filters for bounded server-side discovery.
 
 | MCP task | Tools |
 | --- | --- |
@@ -109,7 +111,7 @@ termctrl stop demo
 
 - `send` accepts `text:<value>`, named keys (`enter`, `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, `page-down`), and `ctrl-a` through `ctrl-z`. Pipe exact bytes with `--stdin`.
 - `wait` blocks until text is visible; use it instead of sleeping. It defaults to five seconds.
-- `status` reports running/exited state, command, cwd, viewport, and recording path. `list` shows running sessions; `list --all` includes retained exited sessions and stale sockets.
+- `status` reports running/exited state, command, cwd, viewport, and recording path. `list` shows running sessions; use `--state`, `--command`, or `--cwd` to filter discovery, and `--all` to include every retained or unavailable entry.
 - `prune --dry-run` previews retained exited sessions and stale sockets; `prune` removes them without deleting recording artifacts.
 - `resize demo --cols 132 --rows 38` tests responsive layouts.
 - `restart demo` relaunches with the stored command, cwd, viewport, and recording settings.

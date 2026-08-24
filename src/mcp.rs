@@ -25,6 +25,40 @@ struct SessionName {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct ListSessionsRequest {
+    #[serde(default)]
+    #[schemars(description = "Session state; omit to list running sessions")]
+    state: Option<ListState>,
+    #[serde(default)]
+    #[schemars(description = "Case-sensitive substring in any command argument")]
+    command: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Launch working directory; relative paths resolve from the server")]
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+enum ListState {
+    Running,
+    Exited,
+    Stale,
+    Incompatible,
+}
+
+impl From<ListState> for session::SessionListState {
+    fn from(value: ListState) -> Self {
+        match value {
+            ListState::Running => Self::Running,
+            ListState::Exited => Self::Exited,
+            ListState::Stale => Self::Stale,
+            ListState::Incompatible => Self::Incompatible,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct ScreenRequest {
     name: String,
     #[serde(default)]
@@ -192,19 +226,32 @@ struct ScreenArtifact {
 
 #[tool_router(server_handler)]
 impl TerminalControl {
-    #[tool(description = "List running local Terminal Control sessions")]
-    async fn list_sessions(&self) -> Result<Json<SessionList>, String> {
-        blocking(|| {
+    #[tool(description = "List and filter local Terminal Control sessions")]
+    async fn list_sessions(
+        &self,
+        Parameters(request): Parameters<ListSessionsRequest>,
+    ) -> Result<Json<SessionList>, String> {
+        blocking(move || {
+            let cwd = request
+                .cwd
+                .map(fs::canonicalize)
+                .transpose()
+                .map_err(|error| format!("resolve session list working directory: {error}"))?;
+            let filter = session::SessionFilter {
+                state: Some(
+                    request
+                        .state
+                        .map(Into::into)
+                        .unwrap_or(session::SessionListState::Running),
+                ),
+                command: request.command,
+                cwd,
+            };
             let sessions = session::list().map_err(format_error)?;
             Ok(Json(SessionList {
                 sessions: sessions
                     .into_iter()
-                    .filter(|entry| {
-                        entry
-                            .status
-                            .as_ref()
-                            .is_some_and(|status| status.state == session::SessionState::Running)
-                    })
+                    .filter(|entry| entry.matches(&filter))
                     .map(|entry| {
                         let status = entry.status;
                         SessionSummary {
@@ -505,6 +552,24 @@ mod tests {
         assert_eq!(screen.deadline_ms, 0);
         assert_eq!(interact.settle_ms, 0);
         assert_eq!(interact.deadline_ms, 0);
+    }
+
+    #[test]
+    fn session_list_filters_are_optional_and_typed() {
+        let default: ListSessionsRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(default.state.is_none());
+        assert!(default.command.is_none());
+        assert!(default.cwd.is_none());
+
+        let filtered: ListSessionsRequest = serde_json::from_value(serde_json::json!({
+            "state": "exited",
+            "command": "cargo",
+            "cwd": "/repo"
+        }))
+        .unwrap();
+        assert!(matches!(filtered.state, Some(ListState::Exited)));
+        assert_eq!(filtered.command.as_deref(), Some("cargo"));
+        assert_eq!(filtered.cwd.as_deref(), Some(std::path::Path::new("/repo")));
     }
 
     #[test]

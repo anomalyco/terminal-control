@@ -424,11 +424,42 @@ struct StatusArgs {
 #[derive(Args)]
 struct ListArgs {
     /// Include retained exited sessions and stale sockets.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["running", "state"])]
     all: bool,
+    /// Explicitly select running sessions (the default).
+    #[arg(long, conflicts_with_all = ["all", "state"])]
+    running: bool,
+    /// Select one retained session state.
+    #[arg(long, value_enum, conflicts_with_all = ["all", "running"])]
+    state: Option<ListState>,
+    /// Match a case-sensitive substring in any command argument.
+    #[arg(long, value_name = "TEXT")]
+    command: Option<String>,
+    /// Match the exact launch working directory.
+    #[arg(long, value_name = "PATH")]
+    cwd: Option<PathBuf>,
     /// Write structured JSON entries.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ListState {
+    Running,
+    Exited,
+    Stale,
+    Incompatible,
+}
+
+impl From<ListState> for session::SessionListState {
+    fn from(value: ListState) -> Self {
+        match value {
+            ListState::Running => Self::Running,
+            ListState::Exited => Self::Exited,
+            ListState::Stale => Self::Stale,
+            ListState::Incompatible => Self::Incompatible,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -962,15 +993,29 @@ fn status(args: StatusArgs) -> Result<()> {
 }
 
 fn list(args: ListArgs) -> Result<()> {
+    let cwd = args
+        .cwd
+        .map(fs::canonicalize)
+        .transpose()
+        .context("resolve session list working directory")?;
+    let filter = session::SessionFilter {
+        state: if args.all {
+            None
+        } else if args.running {
+            Some(session::SessionListState::Running)
+        } else {
+            Some(
+                args.state
+                    .map(Into::into)
+                    .unwrap_or(session::SessionListState::Running),
+            )
+        },
+        command: args.command,
+        cwd,
+    };
     let sessions = session::list()?
         .into_iter()
-        .filter(|entry| {
-            args.all
-                || entry
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| status.state == session::SessionState::Running)
-        })
+        .filter(|entry| entry.matches(&filter))
         .collect::<Vec<_>>();
     if args.json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);
@@ -1385,6 +1430,30 @@ mod tests {
         assert!(
             Cli::try_parse_from(["termctrl", "wait", "demo", "ready", "--timeout", "5"]).is_ok()
         );
+    }
+
+    #[test]
+    fn parses_session_list_filters_and_rejects_conflicting_states() {
+        let cli = Cli::try_parse_from([
+            "termctrl",
+            "list",
+            "--state",
+            "exited",
+            "--command",
+            "cargo",
+            "--cwd",
+            ".",
+            "--json",
+        ])
+        .unwrap();
+        let Command::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+        assert!(matches!(args.state, Some(ListState::Exited)));
+        assert_eq!(args.command.as_deref(), Some("cargo"));
+        assert_eq!(args.cwd.as_deref(), Some(Path::new(".")));
+        assert!(Cli::try_parse_from(["termctrl", "list", "--running", "--all"]).is_err());
+        assert!(Cli::try_parse_from(["termctrl", "list", "--state", "stale", "--all"]).is_err());
     }
 
     #[test]

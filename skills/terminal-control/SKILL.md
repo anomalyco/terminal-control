@@ -108,7 +108,7 @@ Treat `.termctrl` recordings, ANSI transcripts, screen artifacts, command argume
 ## Recover From Problems
 
 - Run `termctrl status app` to inspect state and launch settings.
-- Run `termctrl list` to discover retained named sessions.
-- MCP agents can use `list_sessions` for command/cwd discovery and `get_session_status({ name })` for complete structured status without parsing CLI output.
+- Run `termctrl list` to discover running named sessions. Add `--state`, `--command`, or `--cwd` when narrowing discovery; use `--all` only when retained exited or unavailable entries are relevant.
+- MCP agents can pass `state`, `command`, or `cwd` to `list_sessions` and use `get_session_status({ name })` for complete structured status without parsing CLI output.
 - If a session socket path is too long, set `TERMCTRL_RUNTIME_DIR` to a short private directory under `/tmp` before starting sessions.
 - If `termctrl` is unavailable, install Terminal Control with `cargo install terminal-control` or ask the user which installed binary to use.

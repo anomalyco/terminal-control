@@ -19,5 +19,3 @@ mod semantic;
 pub mod session;
 pub mod shot;
 mod terminal_core;
-mod terminal_theme;
-mod workspace;

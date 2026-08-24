@@ -16,8 +16,7 @@ Examples:
   termctrl show -- my-terminal-app
   termctrl save --format png --out captures/app.png -- my-terminal-app
   termctrl start demo --host opentui -- opencode
-  termctrl run
-  termctrl attach workspace
+  termctrl run editor -- nvim
   termctrl wait demo '/connect' && termctrl send demo text:/connect enter
   termctrl show demo
   termctrl show demo --format semantic
@@ -69,44 +68,16 @@ Example:
   termctrl stop demo";
 
 const RUN_HELP: &str = "\
-Run creates or reattaches a visible Terminal Control workspace. With no arguments it uses the
-default name `workspace`. Supply a command after -- to replace the first shell when creating, or
-NAME to expose a stable explicit control socket. If NAME already exists, no command may be supplied.
-
-Each workspace starts with a `main` window. Use ctrl-b p for the command palette, ctrl-b c/w to
-create/list windows, ctrl-b l for the last window, ctrl-b n for next, and ctrl-b 0-9 to select by
-index. Use ctrl-b </> or tab dragging to reorder, and ctrl-b t to move tabs. Use ctrl-b % to split
-left/right, ctrl-b \" to split top/bottom, ctrl-b plus arrow keys or h/j/k to focus, ctrl-b H/J/K/L to resize, ctrl-b z to zoom,
-ctrl-b q to show pane ids, ctrl-b d to detach, ctrl-b ? for help, and ctrl-b ctrl-b to send a literal ctrl-b. Destructive ctrl-b x (pane), ctrl-b
-& (window), and ctrl-b Q (workspace) actions require y/n confirmation. Agents can target hidden
-windows without changing human selection. Foreground workspaces inherit the outer terminal colors.
+Run starts a PTY session in the foreground and mirrors it through the current terminal. Omit NAME
+to use the executable basename as the session name. Inferred names must be valid session names and
+must not collide with an existing session.
+The application remains directly visible and interactive in this terminal pane while agents use
+the same named-session commands to inspect its screen, send input, and resize it. The application
+exits with this foreground command; no terminal multiplexer or terminal-specific API is required.
 
 Examples:
-  termctrl run
-  termctrl new-window workspace editor -- nvim
-  termctrl windows workspace
-  termctrl current --json
-  termctrl tab-position workspace top
-  termctrl move-window workspace editor --index 0
-  termctrl show workspace --window editor
-  termctrl panes workspace
-  termctrl layout workspace --grid 2x2
-  termctrl send workspace --pane 1 text:opencode2 enter
-  termctrl focus workspace --pane 1
-  termctrl close-pane workspace --pane 1
-  termctrl resize-pane workspace --pane 1 --direction left --cells 5
-  termctrl zoom-pane workspace --pane 1
-  termctrl show workspace --pane 1
   termctrl run editor --cwd ~/src/project -- nvim
   termctrl run -- /usr/bin/nvim";
-
-const ATTACH_HELP: &str = "\
-Attach connects the current terminal to an existing detached workspace. It adopts this terminal's
-size and colors and repaints the complete workspace. A workspace accepts one human terminal at a
-time; agent controls remain available independently.
-
-Example:
-  termctrl attach workspace";
 
 const SEND_HELP: &str = "\
 Send ordered input to a live session. Text uses `text:<value>`; named keys include `enter`,
@@ -194,12 +165,9 @@ enum Command {
     /// Start a named persistent terminal application.
     #[command(after_help = START_HELP)]
     Start(StartArgs),
-    /// Enter a visible, agent-controllable terminal workspace.
+    /// Run a named, agent-controllable application visibly in this terminal.
     #[command(after_help = RUN_HELP)]
     Run(RunArgs),
-    /// Attach this terminal to an existing workspace.
-    #[command(after_help = ATTACH_HELP)]
-    Attach(AttachArgs),
     /// Wait until a named session includes visible text.
     Wait(WaitArgs),
     /// Send ordered input to a named session.
@@ -211,36 +179,6 @@ enum Command {
     List(ListArgs),
     /// Remove retained exited sessions and stale sockets.
     Prune(PruneArgs),
-    /// List panes in a running workspace.
-    Panes(PanesArgs),
-    /// List named windows in a running workspace.
-    Windows(WindowsArgs),
-    /// Resolve this pane's authoritative workspace, window, and pane identity.
-    Current(CurrentArgs),
-    /// Move a live workspace tab strip between the top and bottom.
-    TabPosition(TabPositionArgs),
-    /// Reorder one workspace window.
-    MoveWindow(MoveWindowArgs),
-    /// Create and select a named workspace window.
-    NewWindow(NewWindowArgs),
-    /// Select one named workspace window for the attached terminal.
-    SelectWindow(WindowActionArgs),
-    /// Rename one workspace window.
-    RenameWindow(RenameWindowArgs),
-    /// Terminate one workspace window and all of its panes.
-    CloseWindow(WindowActionArgs),
-    /// Declaratively arrange one, two, or four workspace panes.
-    Layout(LayoutArgs),
-    /// Intentionally move human focus to one workspace pane.
-    Focus(PaneActionArgs),
-    /// Terminate exactly one workspace pane.
-    ClosePane(PaneActionArgs),
-    /// Move one running pane into another named window without restarting it.
-    MovePane(MovePaneArgs),
-    /// Grow one pane toward a neighboring boundary.
-    ResizePane(ResizePaneArgs),
-    /// Toggle one pane between its split and full-window presentation.
-    ZoomPane(PaneActionArgs),
     /// Resize a named live session.
     Resize(ResizeArgs),
     /// Add a named moment to an active recording for later editing.
@@ -265,8 +203,6 @@ enum Command {
     Mcp,
     #[command(name = "__serve", hide = true)]
     Serve(ServeArgs),
-    #[command(name = "__serve-workspace", hide = true)]
-    ServeWorkspace(ServeWorkspaceArgs),
 }
 
 #[derive(Args)]
@@ -299,12 +235,6 @@ struct SourceArgs {
     /// Existing named terminal session to read.
     #[arg(value_name = "NAME")]
     name: Option<String>,
-    /// Read one workspace pane instead of the composed workspace.
-    #[arg(long, requires = "name")]
-    pane: Option<u32>,
-    /// Read one named workspace window instead of the selected window.
-    #[arg(long, requires = "name", conflicts_with = "pane")]
-    window: Option<String>,
     /// Terminal width in cells for command or ANSI input (default: 80).
     #[arg(long)]
     cols: Option<u16>,
@@ -329,10 +259,10 @@ struct SourceArgs {
     /// Color environment policy for a command source (default: auto for PTY, always for pipe).
     #[arg(long, value_enum)]
     color: Option<ColorMode>,
-    /// Quiet period before capture (default: 0 for named sessions, 250 for commands).
+    /// Capture after this many milliseconds without output (default: 250).
     #[arg(long)]
     settle_ms: Option<u64>,
-    /// Settling deadline (default: 0 for named sessions, 5000 for commands).
+    /// Capture or return after this deadline even if output continues (default: 5000).
     #[arg(long)]
     deadline_ms: Option<u64>,
     /// Wait this long before allowing the initial screen to settle.
@@ -421,7 +351,7 @@ struct StartArgs {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Stable local name used by later commands; defaults to `workspace` or the executable name.
+    /// Stable local name used by later session commands; defaults to the executable basename.
     #[arg(value_name = "NAME")]
     name: Option<String>,
     /// Terminal width in cells when terminal dimensions cannot be detected.
@@ -442,12 +372,9 @@ struct RunArgs {
     /// Working directory for the terminal command.
     #[arg(long)]
     cwd: Option<PathBuf>,
-    /// Record the composed workspace, including tabs, splits, and window switches.
+    /// Write timestamped terminal output and client/host input to this private recording file.
     #[arg(long)]
     record: Option<PathBuf>,
-    /// Place the persistent workspace tab strip at the top or bottom.
-    #[arg(long, value_enum, default_value = "bottom")]
-    tab_position: TabPositionArg,
     /// Color environment policy for the terminal command.
     #[arg(long, value_enum, default_value = "auto")]
     color: ColorMode,
@@ -455,20 +382,8 @@ struct RunArgs {
     #[arg(long, value_enum)]
     host: Option<HostProfile>,
     /// Command and arguments to launch, following `--`.
-    #[arg(last = true, num_args = 1.., allow_hyphen_values = true)]
+    #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
     command: Vec<String>,
-}
-
-#[derive(Args)]
-struct AttachArgs {
-    /// Existing workspace name.
-    name: String,
-    /// Terminal cell width in pixels.
-    #[arg(long, default_value_t = 9)]
-    cell_width: u16,
-    /// Terminal cell height in pixels.
-    #[arg(long, default_value_t = 18)]
-    cell_height: u16,
 }
 
 #[derive(Args)]
@@ -477,12 +392,6 @@ struct WaitArgs {
     name: String,
     /// Visible text that must appear in the session screen.
     text: String,
-    /// Target one workspace pane instead of the active pane.
-    #[arg(long)]
-    pane: Option<u32>,
-    /// Target one named workspace window's active pane.
-    #[arg(long, conflicts_with = "pane")]
-    window: Option<String>,
     /// Maximum time to wait before returning an error.
     #[arg(long, default_value_t = 5000, value_name = "MS")]
     timeout: u64,
@@ -492,12 +401,6 @@ struct WaitArgs {
 struct SendArgs {
     /// Name of a running session.
     name: String,
-    /// Target one workspace pane instead of the active pane.
-    #[arg(long)]
-    pane: Option<u32>,
-    /// Target one named workspace window's active pane.
-    #[arg(long, conflicts_with = "pane")]
-    window: Option<String>,
     /// Delay between input atoms; text is split into characters when set.
     #[arg(long, default_value_t = 0)]
     pace_ms: u64,
@@ -533,166 +436,6 @@ struct PruneArgs {
     /// Show removable entries without deleting them.
     #[arg(long)]
     dry_run: bool,
-}
-
-#[derive(Args)]
-struct PanesArgs {
-    /// Name of a running workspace.
-    name: String,
-    /// List one named window instead of the selected window.
-    #[arg(long)]
-    window: Option<String>,
-    /// Write structured JSON pane entries.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Args)]
-struct WindowsArgs {
-    /// Name of a running workspace.
-    name: String,
-    /// Write structured JSON window entries.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Args)]
-struct CurrentArgs {
-    /// Workspace name; defaults to TERMCTRL_WORKSPACE from the current pane.
-    #[arg(value_name = "NAME")]
-    name: Option<String>,
-    /// Stable pane id; defaults to TERMCTRL_PANE_ID from the current pane.
-    #[arg(long)]
-    pane: Option<u32>,
-    /// Write structured JSON context.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Args)]
-struct TabPositionArgs {
-    /// Name of a running workspace.
-    name: String,
-    /// New live tab strip position.
-    #[arg(value_enum)]
-    position: TabPositionArg,
-}
-
-#[derive(Args)]
-struct MoveWindowArgs {
-    /// Name of a running workspace.
-    name: String,
-    /// Exact window name returned by `termctrl windows`.
-    window: String,
-    /// Final zero-based tab index.
-    #[arg(long)]
-    index: usize,
-}
-
-#[derive(Args)]
-struct NewWindowArgs {
-    /// Name of a running workspace.
-    name: String,
-    /// Unique window name; defaults to window-N.
-    #[arg(value_name = "WINDOW")]
-    window: Option<String>,
-    /// Working directory for the new window's first pane.
-    #[arg(long)]
-    cwd: Option<PathBuf>,
-    /// Command and arguments for the first pane; defaults to $SHELL.
-    #[arg(last = true, num_args = 1.., allow_hyphen_values = true)]
-    command: Vec<String>,
-}
-
-#[derive(Args)]
-struct WindowActionArgs {
-    /// Name of a running workspace.
-    name: String,
-    /// Exact window name returned by `termctrl windows`.
-    window: String,
-}
-
-#[derive(Args)]
-struct RenameWindowArgs {
-    /// Name of a running workspace.
-    name: String,
-    /// Existing window name.
-    window: String,
-    /// New unique window name.
-    new_name: String,
-}
-
-#[derive(Args)]
-struct LayoutArgs {
-    /// Name of a running workspace.
-    name: String,
-    /// Arrange one named window without selecting it.
-    #[arg(long)]
-    window: Option<String>,
-    /// Desired grid: 1x1, 2x1, 1x2, or 2x2.
-    #[arg(long, value_parser = parse_grid)]
-    grid: (u16, u16),
-    /// Command for the first pane created while growing the layout; defaults to $SHELL.
-    #[arg(last = true, allow_hyphen_values = true)]
-    command: Vec<String>,
-}
-
-#[derive(Args)]
-struct PaneActionArgs {
-    /// Name of a running workspace.
-    name: String,
-    /// Stable pane id returned by `termctrl panes`.
-    #[arg(long)]
-    pane: u32,
-}
-
-#[derive(Args)]
-struct MovePaneArgs {
-    /// Name of a running workspace.
-    name: String,
-    /// Globally stable pane id returned by `termctrl panes`.
-    #[arg(long)]
-    pane: u32,
-    /// Exact destination window name.
-    #[arg(long)]
-    window: String,
-    /// Stack below the destination's active pane instead of splitting to its right.
-    #[arg(long)]
-    vertical: bool,
-}
-
-#[derive(Args)]
-struct ResizePaneArgs {
-    /// Name of a running workspace.
-    name: String,
-    /// Globally stable pane id returned by `termctrl panes`.
-    #[arg(long)]
-    pane: u32,
-    /// Boundary toward which the pane should grow.
-    #[arg(long, value_enum)]
-    direction: PaneResizeDirection,
-    /// Number of terminal cells by which to move the boundary.
-    #[arg(long, default_value_t = 1)]
-    cells: u16,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum PaneResizeDirection {
-    Left,
-    Right,
-    Up,
-    Down,
-}
-
-impl From<PaneResizeDirection> for session::PaneDirection {
-    fn from(direction: PaneResizeDirection) -> Self {
-        match direction {
-            PaneResizeDirection::Left => Self::Left,
-            PaneResizeDirection::Right => Self::Right,
-            PaneResizeDirection::Up => Self::Up,
-            PaneResizeDirection::Down => Self::Down,
-        }
-    }
 }
 
 #[derive(Args)]
@@ -734,9 +477,6 @@ struct MarkersArgs {
 struct LogsArgs {
     /// Name of a running or inspectable exited session.
     name: String,
-    /// Read the active pane logs from one named workspace window.
-    #[arg(long)]
-    window: Option<String>,
     /// Write exact retained ANSI/VT stream bytes instead of readable retained output.
     #[arg(long)]
     ansi: bool,
@@ -804,36 +544,6 @@ struct ServeArgs {
 }
 
 #[derive(Args)]
-struct ServeWorkspaceArgs {
-    #[arg(long)]
-    name: String,
-    #[arg(long)]
-    socket: PathBuf,
-    #[arg(long)]
-    cwd: Option<PathBuf>,
-    #[arg(long)]
-    record: Option<PathBuf>,
-    #[arg(long, value_enum, default_value = "bottom")]
-    tab_position: TabPositionArg,
-    #[arg(long)]
-    opentui_host: bool,
-    #[arg(long, value_enum, default_value = "auto")]
-    color: ColorMode,
-    #[arg(long)]
-    cols: u16,
-    #[arg(long)]
-    rows: u16,
-    #[arg(long)]
-    cell_width: u16,
-    #[arg(long)]
-    cell_height: u16,
-    #[arg(long)]
-    max_bytes: usize,
-    #[arg(last = true, allow_hyphen_values = true)]
-    command: Vec<String>,
-}
-
-#[derive(Args)]
 struct VideoArgs {
     /// Recording created by `termctrl start --record`.
     input: PathBuf,
@@ -894,21 +604,6 @@ enum ColorMode {
     Never,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum TabPositionArg {
-    Top,
-    Bottom,
-}
-
-impl From<TabPositionArg> for session::TabPosition {
-    fn from(position: TabPositionArg) -> Self {
-        match position {
-            TabPositionArg::Top => Self::Top,
-            TabPositionArg::Bottom => Self::Bottom,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum ShotFormat {
     /// PNG image.
@@ -944,84 +639,13 @@ fn main() -> Result<()> {
             println!("{}", args.name);
         }
         Command::Run(args) => run_session(&args)?,
-        Command::Attach(args) => attach_session(&args)?,
         Command::Wait(args) => {
-            session::wait_for_in(
-                &args.name,
-                args.window,
-                args.pane,
-                args.text,
-                Duration::from_millis(args.timeout),
-            )?;
+            session::wait(&args.name, args.text, Duration::from_millis(args.timeout))?;
         }
         Command::Send(args) => send(args)?,
         Command::Status(args) => status(args)?,
         Command::List(args) => list(args)?,
         Command::Prune(args) => prune(args)?,
-        Command::Panes(args) => panes(args)?,
-        Command::Windows(args) => windows(args)?,
-        Command::Current(args) => current(args)?,
-        Command::TabPosition(args) => {
-            let windows = session::set_workspace_tab_position(&args.name, args.position.into())?;
-            print_windows(&windows, true)?;
-        }
-        Command::MoveWindow(args) => {
-            let windows = session::move_workspace_window(&args.name, args.window, args.index)?;
-            print_windows(&windows, true)?;
-        }
-        Command::NewWindow(args) => {
-            let windows =
-                session::create_workspace_window(&args.name, args.window, args.command, args.cwd)?;
-            print_windows(&windows, true)?;
-        }
-        Command::SelectWindow(args) => {
-            let windows = session::select_workspace_window(&args.name, args.window)?;
-            print_windows(&windows, true)?;
-        }
-        Command::RenameWindow(args) => {
-            let windows = session::rename_workspace_window(&args.name, args.window, args.new_name)?;
-            print_windows(&windows, true)?;
-        }
-        Command::CloseWindow(args) => {
-            let windows = session::close_workspace_window(&args.name, args.window)?;
-            print_windows(&windows, true)?;
-        }
-        Command::Layout(args) => {
-            let panes = session::set_workspace_layout_in_window(
-                &args.name,
-                args.window,
-                args.grid.0,
-                args.grid.1,
-                args.command,
-            )?;
-            print_panes(&panes, true)?;
-        }
-        Command::Focus(args) => {
-            let panes = session::focus_workspace_pane(&args.name, args.pane)?;
-            print_panes(&panes, true)?;
-        }
-        Command::ClosePane(args) => {
-            let panes = session::close_workspace_pane(&args.name, args.pane)?;
-            print_panes(&panes, true)?;
-        }
-        Command::MovePane(args) => {
-            let windows =
-                session::move_workspace_pane(&args.name, args.pane, args.window, args.vertical)?;
-            print_windows(&windows, true)?;
-        }
-        Command::ResizePane(args) => {
-            let panes = session::resize_workspace_pane(
-                &args.name,
-                args.pane,
-                args.direction.into(),
-                args.cells,
-            )?;
-            print_panes(&panes, true)?;
-        }
-        Command::ZoomPane(args) => {
-            let panes = session::toggle_workspace_zoom(&args.name, args.pane)?;
-            print_panes(&panes, true)?;
-        }
         Command::Resize(args) => {
             validate_terminal_size(args.cols, args.rows)?;
             session::resize(
@@ -1092,32 +716,6 @@ fn main() -> Result<()> {
                 },
             )?;
         }
-        Command::ServeWorkspace(args) => {
-            session::serve_workspace(
-                args.name,
-                args.socket,
-                args.command,
-                args.cwd,
-                args.record,
-                shot_engine::Options {
-                    cols: args.cols,
-                    rows: args.rows,
-                    cell_width: args.cell_width,
-                    cell_height: args.cell_height,
-                    settle: Duration::ZERO,
-                    deadline: Duration::ZERO,
-                    input: Vec::new(),
-                    initial_delay: Duration::ZERO,
-                    wait_for: None,
-                    max_bytes: args.max_bytes,
-                    opentui_host: args.opentui_host,
-                    color: args.color.into(),
-                    env: Default::default(),
-                    inherit_env: true,
-                },
-                args.tab_position.into(),
-            )?;
-        }
     }
     Ok(())
 }
@@ -1167,18 +765,17 @@ fn show_semantic(args: &ShowArgs) -> Result<()> {
         || render.pixel_ratio != 2.0
         || render.hide_cursor
     {
-        bail!("semantic output supports only NAME, --window, --pane, and --deadline-ms");
+        bail!("semantic output supports only NAME and --deadline-ms");
     }
     let name = source
         .name
         .as_deref()
-        .context("semantic output requires a named session or workspace")?;
+        .context("semantic output requires a named session")?;
     let timeout = Duration::from_millis(source.deadline_ms.unwrap_or(1000));
     if timeout.is_zero() {
         bail!("--deadline-ms must be greater than zero for semantic output");
     }
-    let snapshot =
-        session::semantic_snapshot_in(name, source.window.clone(), source.pane, timeout)?;
+    let snapshot = session::semantic_snapshot(name, timeout)?;
     println!("{}", serde_json::to_string_pretty(&snapshot)?);
     Ok(())
 }
@@ -1231,7 +828,7 @@ fn read_source(args: &SourceArgs, render: &RenderArgs) -> Result<shot_engine::Sh
         {
             bail!("named-session reads support rendering, --settle-ms, and --deadline-ms only");
         }
-        return session::show_in(name, args.window.clone(), args.pane, settle, deadline);
+        return session::show(name, settle, deadline);
     }
     let cols = args.cols.unwrap_or(defaults.cols);
     let rows = args.rows.unwrap_or(defaults.rows);
@@ -1305,15 +902,13 @@ fn read_source(args: &SourceArgs, render: &RenderArgs) -> Result<shot_engine::Sh
 }
 
 fn capture_timing(args: &SourceArgs, defaults: &shot_engine::Options) -> (Duration, Duration) {
-    let default_settle = if args.name.is_some() {
-        0
+    let (default_settle, default_deadline) = if args.name.is_some() {
+        (0, 0)
     } else {
-        defaults.settle.as_millis() as u64
-    };
-    let default_deadline = if args.name.is_some() {
-        0
-    } else {
-        defaults.deadline.as_millis() as u64
+        (
+            defaults.settle.as_millis() as u64,
+            defaults.deadline.as_millis() as u64,
+        )
     };
     (
         Duration::from_millis(args.settle_ms.unwrap_or(default_settle)),
@@ -1341,13 +936,7 @@ fn send(args: SendArgs) -> Result<()> {
         }
         session_input(&args.input, args.pace_ms > 0)?
     };
-    session::send_to_in(
-        &args.name,
-        args.window,
-        args.pane,
-        input,
-        Duration::from_millis(args.pace_ms),
-    )?;
+    session::send(&args.name, input, Duration::from_millis(args.pace_ms))?;
     Ok(())
 }
 
@@ -1370,80 +959,6 @@ fn status(args: StatusArgs) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn current(args: CurrentArgs) -> Result<()> {
-    let workspace = std::env::var("TERMCTRL_WORKSPACE").ok();
-    let session_name = std::env::var("TERMCTRL_SESSION").ok();
-    if args.name.is_none() && workspace.is_none() {
-        if args.pane.is_some() {
-            bail!("--pane requires a workspace name or TERMCTRL_WORKSPACE");
-        }
-        let name = session_name.context(
-            "not running inside a named Terminal Control session; provide a workspace NAME",
-        )?;
-        let status = session::status(&name)?;
-        if args.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "session": name,
-                    "workspace": null,
-                    "pane": null,
-                    "state": session_state(status.state),
-                    "command": status.launch.command,
-                    "cwd": status.launch.cwd,
-                }))?
-            );
-        } else {
-            println!("session: {name}");
-            println!("state: {}", session_state(status.state));
-            println!("cwd: {}", status.launch.cwd.display());
-            println!("command: {}", status.launch.command.join(" "));
-        }
-        return Ok(());
-    }
-    let name = args.name.or_else(|| workspace.clone()).context(
-        "not running inside a Terminal Control workspace; provide NAME or set TERMCTRL_WORKSPACE",
-    )?;
-    let inherited_pane = std::env::var("TERMCTRL_PANE_ID").ok();
-    let pane = resolve_current_pane(
-        args.pane,
-        &name,
-        workspace.as_deref(),
-        inherited_pane.as_deref(),
-    )?;
-    let context = session::workspace_context(&name, pane)?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&context)?);
-    } else {
-        println!("workspace: {}", context.workspace);
-        println!(
-            "window: {} ({}:{})",
-            context.window_index, context.window_id, context.window
-        );
-        println!("pane: {}", context.pane);
-        println!("tabs: {}", context.tab_position.as_str());
-    }
-    Ok(())
-}
-
-fn resolve_current_pane(
-    explicit: Option<u32>,
-    workspace: &str,
-    inherited_workspace: Option<&str>,
-    inherited_pane: Option<&str>,
-) -> Result<Option<u32>> {
-    if explicit.is_some() || inherited_workspace != Some(workspace) {
-        return Ok(explicit);
-    }
-    inherited_pane
-        .map(|value| {
-            value
-                .parse::<u32>()
-                .with_context(|| format!("invalid TERMCTRL_PANE_ID {value:?}"))
-        })
-        .transpose()
 }
 
 fn list(args: ListArgs) -> Result<()> {
@@ -1517,10 +1032,7 @@ fn prune(args: PruneArgs) -> Result<()> {
 }
 
 fn logs(args: LogsArgs) -> Result<()> {
-    let bytes = match args.window {
-        Some(window) => session::logs_window(&args.name, window, args.ansi)?,
-        None => session::logs(&args.name, args.ansi)?,
-    };
+    let bytes = session::logs(&args.name, args.ansi)?;
     io::stdout()
         .write_all(&bytes)
         .context("write session logs")?;
@@ -1574,123 +1086,31 @@ fn start_session(args: &StartArgs) -> Result<()> {
 fn run_session(args: &RunArgs) -> Result<()> {
     let name = match args.name.as_deref() {
         Some(name) => name.to_owned(),
-        None if args.command.is_empty() => "workspace".to_owned(),
         None => session::infer_name(&args.command)?,
     };
     let (cols, rows) = crossterm::terminal::size().unwrap_or((args.cols, args.rows));
-    validate_workspace_size(cols, rows)?;
-    let options = shot_engine::Options {
-        cols,
-        rows,
-        cell_width: args.cell_width,
-        cell_height: args.cell_height,
-        max_bytes: args.max_bytes,
-        opentui_host: matches!(args.host, Some(HostProfile::Opentui)),
-        color: args.color.into(),
-        ..shot_engine::Options::default()
-    };
-    session::run_foreground(
+    validate_terminal_size(cols, rows)?;
+    let exit = session::run_foreground(
         &name,
         &args.command,
         args.cwd.as_deref(),
         args.record.as_deref(),
-        &options,
-        args.tab_position.into(),
-    )
-}
-
-fn attach_session(args: &AttachArgs) -> Result<()> {
-    let (cols, rows) = crossterm::terminal::size()
-        .context("read current terminal size for workspace attachment")?;
-    validate_workspace_size(cols, rows)?;
-    session::attach(
-        &args.name,
         &shot_engine::Options {
             cols,
             rows,
             cell_width: args.cell_width,
             cell_height: args.cell_height,
+            max_bytes: args.max_bytes,
+            opentui_host: matches!(args.host, Some(HostProfile::Opentui)),
+            color: args.color.into(),
             ..shot_engine::Options::default()
         },
-    )
-}
-
-fn panes(args: PanesArgs) -> Result<()> {
-    let panes = session::panes_in_window(&args.name, args.window)?;
-    print_panes(&panes, args.json)
-}
-
-fn windows(args: WindowsArgs) -> Result<()> {
-    let windows = session::windows(&args.name)?;
-    print_windows(&windows, args.json)
-}
-
-fn print_windows(windows: &[session::WindowStatus], json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(windows)?);
-        return Ok(());
+    )?;
+    if exit.success {
+        Ok(())
+    } else {
+        std::process::exit(i32::try_from(exit.code).unwrap_or(1).max(1));
     }
-    for window in windows {
-        let activity = window
-            .activity_kinds
-            .iter()
-            .map(|kind| kind.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        println!(
-            "{}\t{}\t{}\t{} panes\t{}x{}\t{}",
-            window.index,
-            if window.active { "active" } else { "" },
-            window.name,
-            window.pane_count,
-            window.cols,
-            window.rows,
-            activity,
-        );
-    }
-    Ok(())
-}
-
-fn print_panes(panes: &[session::PaneStatus], json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(&panes)?);
-        return Ok(());
-    }
-    for pane in panes {
-        let position = format!("{},{}", pane.x, pane.y);
-        let title = pane
-            .title
-            .chars()
-            .filter(|character| !character.is_control())
-            .collect::<String>();
-        println!(
-            "{}\t{}\t{}\t{}x{}\t{}\t{}",
-            pane.id,
-            if pane.active { "active" } else { "" },
-            position,
-            pane.cols,
-            pane.rows,
-            title,
-            pane.command.join(" ")
-        );
-    }
-    Ok(())
-}
-
-fn parse_grid(value: &str) -> std::result::Result<(u16, u16), String> {
-    let Some((columns, rows)) = value.split_once('x') else {
-        return Err("grid must be 1x1, 2x1, 1x2, or 2x2".to_owned());
-    };
-    let columns = columns
-        .parse::<u16>()
-        .map_err(|_| "grid columns must be 1 or 2".to_owned())?;
-    let rows = rows
-        .parse::<u16>()
-        .map_err(|_| "grid rows must be 1 or 2".to_owned())?;
-    if !(1..=2).contains(&columns) || !(1..=2).contains(&rows) {
-        return Err("grid must be 1x1, 2x1, 1x2, or 2x2".to_owned());
-    }
-    Ok((columns, rows))
 }
 
 fn restart_session(args: &RestartArgs) -> Result<()> {
@@ -1793,14 +1213,6 @@ fn session_input(events: &[String], paced: bool) -> Result<Vec<Vec<u8>>> {
 fn validate_terminal_size(cols: u16, rows: u16) -> Result<()> {
     if cols == 0 || rows == 0 {
         bail!("terminal dimensions must be greater than zero");
-    }
-    Ok(())
-}
-
-fn validate_workspace_size(cols: u16, rows: u16) -> Result<()> {
-    validate_terminal_size(cols, rows)?;
-    if rows < 2 {
-        bail!("workspace needs at least two rows for content and tabs");
     }
     Ok(())
 }
@@ -1953,7 +1365,37 @@ mod tests {
     }
 
     #[test]
-    fn named_screen_reads_are_immediate_without_explicit_zero_flags() {
+    fn parses_flat_session_control_commands() {
+        assert!(Cli::try_parse_from(["termctrl", "run", "editor", "--", "nvim", "."]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "status", "demo", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "list", "--all", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "prune", "--dry-run"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "show", "demo", "--format", "semantic"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "termctrl", "resize", "demo", "--cols", "120", "--rows", "40"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["termctrl", "send", "demo", "--stdin"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "mark", "demo", "before-send"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "markers", "captures/demo.termctrl"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "logs", "demo", "--ansi"]).is_ok());
+        assert!(Cli::try_parse_from(["termctrl", "restart", "demo"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["termctrl", "wait", "demo", "ready", "--timeout", "5"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_removed_workspace_commands() {
+        assert!(Cli::try_parse_from(["termctrl", "attach", "demo"]).is_err());
+        assert!(Cli::try_parse_from(["termctrl", "panes", "demo"]).is_err());
+        assert!(Cli::try_parse_from(["termctrl", "run"]).is_err());
+    }
+
+    #[test]
+    fn named_screen_reads_are_immediate_by_default() {
         let defaults = shot_engine::Options::default();
         let cli = Cli::try_parse_from(["termctrl", "show", "demo"]).unwrap();
         let Command::Show(args) = cli.command else {
@@ -1972,187 +1414,10 @@ mod tests {
             capture_timing(&args.source, &defaults),
             (defaults.settle, defaults.deadline)
         );
-
-        let cli = Cli::try_parse_from([
-            "termctrl",
-            "show",
-            "demo",
-            "--settle-ms",
-            "25",
-            "--deadline-ms",
-            "500",
-        ])
-        .unwrap();
-        let Command::Show(args) = cli.command else {
-            panic!("expected show command");
-        };
-        assert_eq!(
-            capture_timing(&args.source, &defaults),
-            (Duration::from_millis(25), Duration::from_millis(500))
-        );
     }
 
     #[test]
-    fn parses_flat_session_control_commands() {
-        assert!(Cli::try_parse_from(["termctrl", "run"]).is_ok());
-        let cli =
-            Cli::try_parse_from(["termctrl", "run", "workspace", "--tab-position", "top"]).unwrap();
-        let Command::Run(run) = cli.command else {
-            panic!("expected run command");
-        };
-        assert!(matches!(run.tab_position, TabPositionArg::Top));
-        assert!(Cli::try_parse_from(["termctrl", "attach", "workspace"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "run", "editor", "--", "nvim", "."]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "panes", "workspace", "--json"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "windows", "workspace", "--json"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "current", "--json"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "current", "workspace", "--pane", "3"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "tab-position", "workspace", "top"]).is_ok());
-        assert!(
-            Cli::try_parse_from([
-                "termctrl",
-                "move-window",
-                "workspace",
-                "editor",
-                "--index",
-                "0"
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "termctrl",
-                "new-window",
-                "workspace",
-                "editor",
-                "--cwd",
-                "/tmp",
-                "--",
-                "nvim",
-                ".",
-            ])
-            .is_ok()
-        );
-        assert!(Cli::try_parse_from(["termctrl", "select-window", "workspace", "editor"]).is_ok());
-        assert!(
-            Cli::try_parse_from(["termctrl", "rename-window", "workspace", "editor", "code",])
-                .is_ok()
-        );
-        assert!(Cli::try_parse_from(["termctrl", "close-window", "workspace", "code"]).is_ok());
-        assert!(
-            Cli::try_parse_from([
-                "termctrl",
-                "move-pane",
-                "workspace",
-                "--pane",
-                "3",
-                "--window",
-                "code",
-                "--vertical",
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "termctrl",
-                "panes",
-                "workspace",
-                "--window",
-                "editor",
-                "--json"
-            ])
-            .is_ok()
-        );
-        assert!(Cli::try_parse_from(["termctrl", "layout", "workspace", "--grid", "2x2"]).is_ok());
-        let cli = Cli::try_parse_from([
-            "termctrl",
-            "layout",
-            "workspace",
-            "--grid",
-            "2x1",
-            "--",
-            "nvim",
-            "--clean",
-        ])
-        .unwrap();
-        let Command::Layout(layout) = cli.command else {
-            panic!("expected layout command");
-        };
-        assert_eq!(layout.command, ["nvim", "--clean"]);
-        assert!(
-            Cli::try_parse_from([
-                "termctrl",
-                "layout",
-                "workspace",
-                "--window",
-                "editor",
-                "--grid",
-                "2x2"
-            ])
-            .is_ok()
-        );
-        assert!(Cli::try_parse_from(["termctrl", "focus", "workspace", "--pane", "2"]).is_ok());
-        assert!(
-            Cli::try_parse_from(["termctrl", "close-pane", "workspace", "--pane", "2"]).is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "termctrl",
-                "resize-pane",
-                "workspace",
-                "--pane",
-                "2",
-                "--direction",
-                "left",
-                "--cells",
-                "5",
-            ])
-            .is_ok()
-        );
-        assert!(Cli::try_parse_from(["termctrl", "zoom-pane", "workspace", "--pane", "2"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "layout", "workspace", "--grid", "3x2"]).is_err());
-        assert!(
-            Cli::try_parse_from(["termctrl", "send", "workspace", "--pane", "1", "enter"]).is_ok()
-        );
-        assert!(Cli::try_parse_from(["termctrl", "show", "workspace", "--pane", "1"]).is_ok());
-        assert!(
-            Cli::try_parse_from(["termctrl", "show", "workspace", "--window", "editor"]).is_ok()
-        );
-        assert!(Cli::try_parse_from(["termctrl", "status", "demo", "--json"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "show", "demo", "--format", "semantic"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "list"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "list", "--all", "--json"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "prune", "--dry-run"]).is_ok());
-        assert!(
-            Cli::try_parse_from([
-                "termctrl", "resize", "demo", "--cols", "120", "--rows", "40"
-            ])
-            .is_ok()
-        );
-        assert!(Cli::try_parse_from(["termctrl", "send", "demo", "--stdin"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "mark", "demo", "before-send"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "markers", "captures/demo.termctrl"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "logs", "demo", "--ansi"]).is_ok());
-        assert!(Cli::try_parse_from(["termctrl", "restart", "demo"]).is_ok());
-        assert!(
-            Cli::try_parse_from(["termctrl", "wait", "demo", "ready", "--timeout", "5"]).is_ok()
-        );
-    }
-
-    #[test]
-    fn parses_semantic_show_format() {
-        let cli =
-            Cli::try_parse_from(["termctrl", "show", "demo", "--format", "semantic"]).unwrap();
-        let Command::Show(args) = cli.command else {
-            panic!("expected show command");
-        };
-
-        assert_eq!(args.source.name.as_deref(), Some("demo"));
-        assert_eq!(args.format, ShotFormat::Semantic);
-    }
-
-    #[test]
-    fn semantic_show_rejects_ignored_source_options() {
+    fn semantic_show_rejects_other_sources() {
         let cli = Cli::try_parse_from([
             "termctrl",
             "show",
@@ -2169,36 +1434,8 @@ mod tests {
 
         assert_eq!(
             show_semantic(&args).unwrap_err().to_string(),
-            "semantic output supports only NAME, --window, --pane, and --deadline-ms"
+            "semantic output supports only NAME and --deadline-ms"
         );
-    }
-
-    #[test]
-    fn current_context_uses_inherited_pane_only_for_the_same_workspace() {
-        assert_eq!(
-            resolve_current_pane(None, "workspace", Some("workspace"), Some("7")).unwrap(),
-            Some(7)
-        );
-        assert_eq!(
-            resolve_current_pane(None, "other", Some("workspace"), Some("7")).unwrap(),
-            None
-        );
-        assert_eq!(
-            resolve_current_pane(Some(3), "other", Some("workspace"), Some("7")).unwrap(),
-            Some(3)
-        );
-        assert!(resolve_current_pane(None, "workspace", Some("workspace"), Some("bad")).is_err());
-    }
-
-    #[test]
-    fn parses_default_shell_workspace() {
-        let cli = Cli::try_parse_from(["termctrl", "run"]).unwrap();
-        let Command::Run(args) = cli.command else {
-            panic!("expected run command");
-        };
-
-        assert_eq!(args.name, None);
-        assert!(args.command.is_empty());
     }
 
     #[test]
@@ -2292,8 +1529,6 @@ mod tests {
     fn rejects_zero_terminal_dimensions() {
         assert!(validate_terminal_size(0, 24).is_err());
         assert!(validate_terminal_size(80, 0).is_err());
-        assert!(validate_workspace_size(80, 1).is_err());
-        assert!(validate_workspace_size(80, 2).is_ok());
     }
 
     #[test]

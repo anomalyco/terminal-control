@@ -16,27 +16,6 @@ A named terminal application that remains available across waiting, input, resiz
 
 An embedded session owns the same live terminal lifecycle in-process; the named CLI session commands are an adapter for interacting with that lifecycle across invocations.
 
-### Workspace
-
-A persistent daemon containing ordered named windows. Each window owns embedded sessions, called
-panes, in an independent recursive split layout with weighted boundaries and reversible pane zoom.
-Window names are stable exact selectors, numeric indexes are mutable presentation order, and pane IDs
-are workspace-wide and stable for the workspace lifetime. A private ID-only layout tree is
-authoritative for geometry, focus, resizing, zoom restoration, and close promotion while pane objects
-retain process ownership.
-
-A workspace has zero or one human terminal attachment. Disconnecting preserves every window and
-pane; `run NAME` or `attach NAME` adopts the new terminal's geometry and theme and repaints the
-selected window. Hidden windows continue pumping output and expose unread output, bell, and
-surviving-window pane-exit activity. Workspace panes receive stable environment identity, while the
-workspace resolves current membership dynamically after rename or pane movement.
-
-The one-row tab strip is workspace chrome and can move between the top and bottom. Attachment
-presentation owns tab selection and reorder, prefix decoding, the command palette, last-window
-history, transient notices, geometry synchronization, input modes, inherited colors, and
-damage-based painting. Workspace recording serializes that composed presentation as one replayable
-timeline, including while detached.
-
 ### Driver
 
 A versioned JSON Lines stdin/stdout adapter over embedded sessions for external agent tooling and the TypeScript test client. A driver process can manage multiple isolated sessions without exposing terminal process details to its client. Its capture response includes the reason capture completed so test clients can distinguish settled screen state from deadline fallback, and can optionally include ANSI or rendered SVG failure evidence.

@@ -61,6 +61,7 @@ pub struct Cursor {
     pub y: u16,
     pub color: Color,
     pub blinking: bool,
+    #[serde(default)]
     pub style: CursorStyle,
 }
 
@@ -283,6 +284,19 @@ mod tests {
                 b: 128
             }
         );
+    }
+
+    #[test]
+    fn defaults_cursor_style_for_older_frames() {
+        let cursor: Cursor = serde_json::from_value(serde_json::json!({
+            "x": 1,
+            "y": 2,
+            "color": { "r": 3, "g": 4, "b": 5 },
+            "blinking": false
+        }))
+        .unwrap();
+
+        assert_eq!(cursor.style, CursorStyle::Block);
     }
 
     #[test]

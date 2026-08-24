@@ -17,7 +17,7 @@ use crate::session::Session;
 use crate::shot::{ColorMode, Options};
 
 /// Current JSON Lines protocol version spoken by `termctrl driver`.
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Serve isolated embedded sessions over newline-delimited JSON requests and responses.
 ///

@@ -24,7 +24,7 @@ increment `protocolVersion`; clients reject unsupported versions rather than gue
 ## Example Requests
 
 ```json
-{"type":"hello","protocolVersion":1,"terminalControlVersion":"<installed-version>"}
+{"type":"hello","protocolVersion":2,"terminalControlVersion":"<installed-version>"}
 {"id":1,"method":"launch","sessionId":"app","params":{"command":["my-terminal-app"],"cols":100,"rows":30,"inheritEnv":false,"env":{"TERM":"xterm-256color"}}}
 {"id":2,"method":"waitForText","sessionId":"app","params":{"text":"Ready","timeoutMs":5000}}
 {"id":3,"method":"send","sessionId":"app","params":{"input":[{"type":"text","value":"help"},{"type":"key","value":"enter"}]}}

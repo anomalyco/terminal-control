@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::frame::{Cell, Frame, Underline};
+use crate::frame::{Cell, CursorStyle, Frame, Underline};
 
 mod box_drawing;
 
@@ -62,12 +62,37 @@ pub fn svg(frame: &Frame, options: &Options) -> String {
     {
         let x = options.padding + f32::from(cursor.x) * options.cell_width;
         let y = options.padding + f32::from(cursor.y) * options.cell_height;
-        output.push_str(&format!(
-            r#"<rect x="{x}" y="{y}" width="{}" height="{}" fill="{}" opacity="0.32"/>"#,
-            options.cell_width,
-            options.cell_height,
-            cursor.color.css(),
-        ));
+        let (x, y, width, height) = match cursor.style {
+            CursorStyle::Block | CursorStyle::Hollow => {
+                (x, y, options.cell_width, options.cell_height)
+            }
+            CursorStyle::Underline => {
+                let height = (options.cell_height * 0.15).max(1.0);
+                (
+                    x,
+                    y + options.cell_height - height,
+                    options.cell_width,
+                    height,
+                )
+            }
+            CursorStyle::Bar => (
+                x,
+                y,
+                (options.cell_width * 0.15).max(1.0),
+                options.cell_height,
+            ),
+        };
+        if cursor.style == CursorStyle::Hollow {
+            output.push_str(&format!(
+                r#"<rect x="{x}" y="{y}" width="{width}" height="{height}" fill="none" stroke="{}" stroke-width="1" opacity="0.32"/>"#,
+                cursor.color.css(),
+            ));
+        } else {
+            output.push_str(&format!(
+                r#"<rect x="{x}" y="{y}" width="{width}" height="{height}" fill="{}" opacity="0.32"/>"#,
+                cursor.color.css(),
+            ));
+        }
     }
     output.push_str("</g></svg>");
     output
@@ -415,7 +440,42 @@ fn xml(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{Attributes, Color, Frame, Underline};
+    use crate::frame::{Attributes, Color, CursorStyle, Frame, Underline};
+    use crate::shot;
+
+    #[test]
+    fn renders_bar_cursor_from_terminal_state() {
+        let shot = shot::from_ansi(b"\x1b[6 q".to_vec(), 1, 1, 1024).unwrap();
+
+        let output = svg(&shot.frame, &Options::default());
+
+        assert!(output.contains(
+            r##"<rect x="18" y="18" width="1.35" height="18" fill="#c9d1d9" opacity="0.32"/>"##
+        ));
+    }
+
+    #[test]
+    fn renders_underline_cursor_from_terminal_state() {
+        let shot = shot::from_ansi(b"\x1b[4 q".to_vec(), 1, 1, 1024).unwrap();
+
+        let output = svg(&shot.frame, &Options::default());
+
+        assert!(output.contains(
+            r##"<rect x="18" y="33.3" width="9" height="2.7" fill="#c9d1d9" opacity="0.32"/>"##
+        ));
+    }
+
+    #[test]
+    fn renders_hollow_cursor_as_an_outline() {
+        let mut shot = shot::from_ansi(Vec::new(), 1, 1, 1024).unwrap();
+        shot.frame.cursor.as_mut().unwrap().style = CursorStyle::Hollow;
+
+        let output = svg(&shot.frame, &Options::default());
+
+        assert!(output.contains(
+            r##"<rect x="18" y="18" width="9" height="18" fill="none" stroke="#c9d1d9" stroke-width="1" opacity="0.32"/>"##
+        ));
+    }
 
     #[test]
     fn rejects_png_allocations_above_the_pixel_limit() {

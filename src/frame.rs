@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Schema version written in every structured terminal frame.
-pub const FORMAT_VERSION: u8 = 1;
+pub const FORMAT_VERSION: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct Color {
@@ -61,6 +61,18 @@ pub struct Cursor {
     pub y: u16,
     pub color: Color,
     pub blinking: bool,
+    #[serde(default)]
+    pub style: CursorStyle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorStyle {
+    #[default]
+    Block,
+    Hollow,
+    Underline,
+    Bar,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -272,6 +284,19 @@ mod tests {
                 b: 128
             }
         );
+    }
+
+    #[test]
+    fn defaults_cursor_style_for_older_frames() {
+        let cursor: Cursor = serde_json::from_value(serde_json::json!({
+            "x": 1,
+            "y": 2,
+            "color": { "r": 3, "g": 4, "b": 5 },
+            "blinking": false
+        }))
+        .unwrap();
+
+        assert_eq!(cursor.style, CursorStyle::Block);
     }
 
     #[test]

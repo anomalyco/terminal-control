@@ -37,10 +37,11 @@ export type Cursor = {
   y: number
   color: Color
   blinking: boolean
+  style: "block" | "hollow" | "underline" | "bar"
 }
 
 export type Frame = {
-  version: 1
+  version: 2
   cols: number
   rows: number
   foreground: Color
@@ -312,7 +313,7 @@ export class TerminalControl implements AsyncDisposable {
             this.abort(new Error("termctrl driver sent more than one hello message"))
             return
           }
-          if (message.protocolVersion !== 1) {
+          if (message.protocolVersion !== 2) {
             this.abort(new Error(`unsupported termctrl protocol version ${message.protocolVersion}`))
             return
           }

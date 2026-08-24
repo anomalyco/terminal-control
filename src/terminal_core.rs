@@ -3,14 +3,14 @@ use std::rc::Rc;
 
 use anyhow::{Context, Result};
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
-use libghostty_vt::render::{CellIterator, Dirty, RowIterator};
+use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{PaletteIndex, RgbColor, Underline as GhosttyUnderline};
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
 
 use crate::frame::{
-    Attributes, Cell, Color, Cursor, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, FORMAT_VERSION, Frame,
-    Underline, indexed_color,
+    Attributes, Cell, Color, Cursor, CursorStyle, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND,
+    FORMAT_VERSION, Frame, Underline, indexed_color,
 };
 
 pub(crate) const SCROLLBACK_ROWS: usize = 10_000;
@@ -21,6 +21,7 @@ pub(crate) struct TerminalCore {
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
     responses: Rc<RefCell<Vec<u8>>>,
+    cursor_style: CursorVisualStyle,
     cached_frame: Option<Frame>,
 }
 
@@ -47,6 +48,7 @@ impl TerminalCore {
             rows: RowIterator::new().context("create Ghostty row iterator")?,
             cells: CellIterator::new().context("create Ghostty cell iterator")?,
             responses,
+            cursor_style: CursorVisualStyle::Block,
             cached_frame: None,
         })
     }
@@ -92,7 +94,13 @@ impl TerminalCore {
             .update(&self.terminal)
             .context("update Ghostty render state")?;
         let dirty = snapshot.dirty().context("read Ghostty dirty state")?;
+        let next_cursor_style = snapshot
+            .cursor_visual_style()
+            .context("read Ghostty cursor style")?;
+        let cursor_style_changed = self.cursor_style != next_cursor_style;
+        self.cursor_style = next_cursor_style;
         if dirty == Dirty::Clean
+            && !cursor_style_changed
             && let Some(frame) = &self.cached_frame
         {
             return Ok(frame.clone());
@@ -114,6 +122,7 @@ impl TerminalCore {
                     y: cursor.y,
                     color: from_ghostty_color(colors.cursor.unwrap_or(colors.foreground)),
                     blinking: snapshot.cursor_blinking().unwrap_or(false),
+                    style: frame_cursor_style(self.cursor_style),
                 })
         } else {
             None
@@ -271,16 +280,37 @@ fn from_ghostty_color(color: RgbColor) -> Color {
     }
 }
 
+fn frame_cursor_style(style: CursorVisualStyle) -> CursorStyle {
+    match style {
+        CursorVisualStyle::Block => CursorStyle::Block,
+        CursorVisualStyle::BlockHollow => CursorStyle::Hollow,
+        CursorVisualStyle::Underline => CursorStyle::Underline,
+        CursorVisualStyle::Bar => CursorStyle::Bar,
+        _ => CursorStyle::Block,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::TerminalCore;
-    use crate::frame::{DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, indexed_color};
+    use crate::frame::{CursorStyle, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, indexed_color};
 
     #[test]
     fn captures_terminal_responses() {
         let mut terminal = TerminalCore::new(1, 20, 0).unwrap();
 
         assert_eq!(terminal.apply_output(b"\x1b[5n"), b"\x1b[0n");
+    }
+
+    #[test]
+    fn updates_cursor_style_without_cell_changes() {
+        let mut terminal = TerminalCore::new(1, 20, 0).unwrap();
+        terminal.frame().unwrap();
+
+        terminal.apply_output(b"\x1b[6 q");
+        let frame = terminal.frame().unwrap();
+
+        assert_eq!(frame.cursor.unwrap().style, CursorStyle::Bar);
     }
 
     #[test]
@@ -306,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_wide_graphemes_in_frame_v1() {
+    fn preserves_wide_graphemes_in_structured_frames() {
         let mut terminal = TerminalCore::new(1, 10, 0).unwrap();
         let _responses = terminal.apply_output("A界e\u{301}".as_bytes());
         let frame = terminal.frame().unwrap();

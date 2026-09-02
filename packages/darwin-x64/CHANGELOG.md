@@ -1,5 +1,13 @@
 # @kitlangton/terminal-control-darwin-x64
 
+## 1.1.1
+
+### Patch Changes
+
+- 96c90e6: Detach background session daemons from their launcher's process group so named sessions started or restarted with the CLI survive launcher-group hangups.
+- 7499e5c: Include the existing Ghostty and libghostty-rs third-party license notices in all native npm packages.
+- 4de9fec: Answer cursor-position queries with the actual query-time cursor position when using the OpenTUI host profile, including split and repeated queries, without injecting unsolicited startup cursor reports.
+
 ## 1.1.0
 
 ## 1.0.0

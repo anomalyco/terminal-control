@@ -55,14 +55,14 @@ impl NamedSession {
         child.wait_with_output()
     }
 
-    fn launch(&mut self, operation: &str) {
-        let ready = self.runtime.join(format!("{operation}.ready"));
-        let pids = self.runtime.join(format!("{operation}.pids"));
+    fn launch(&mut self, operation: &str, generation: &str) {
+        let ready = self.runtime.join(format!("{generation}.ready"));
+        let pids = self.runtime.join(format!("{generation}.pids"));
         let mut launcher = Command::new("/bin/sh");
         launcher
             .arg("-c")
             .arg(
-                r#""$1" "$2" demo -- /bin/sh -c 'printf "%s %s\n" "$$" "$PPID" > "$1"; printf READY; exec sleep 30' fixture "$3" && : > "$4" && exec sleep 30"#,
+                r#""$1" "$2" demo -- /bin/sh -c 'printf "%s %s\n" "$$" "$PPID" > "$1"; printf READY; read -r ignored' fixture "$3" && : > "$4" && exec sleep 30"#,
             )
             .arg("termctrl-launcher")
             .arg(env!("CARGO_BIN_EXE_termctrl"))
@@ -73,7 +73,7 @@ impl NamedSession {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(
-                fs::File::create(self.runtime.join(format!("{operation}.stderr"))).unwrap(),
+                fs::File::create(self.runtime.join(format!("{generation}.stderr"))).unwrap(),
             ));
         unsafe {
             launcher.pre_exec(|| {
@@ -90,7 +90,7 @@ impl NamedSession {
             assert!(
                 launcher.try_wait().unwrap().is_none(),
                 "{operation} launcher exited early: {}",
-                fs::read_to_string(self.runtime.join(format!("{operation}.stderr")))
+                fs::read_to_string(self.runtime.join(format!("{generation}.stderr")))
                     .unwrap_or_default()
             );
             assert!(
@@ -104,7 +104,7 @@ impl NamedSession {
                 .unwrap(),
         );
         eprintln!(
-            "{operation}: launcher group {}, application/daemon {}",
+            "{operation}/{generation}: launcher group {}, application/daemon {}",
             self.launchers.last().unwrap().id(),
             fs::read_to_string(&pids).unwrap().trim()
         );
@@ -114,6 +114,7 @@ impl NamedSession {
     }
 
     fn assert_application_stopped(&self, operation: &str) {
+        // Keep the generation record for Drop: application exit does not prove daemon exit.
         let path = self.runtime.join(format!("{operation}.pids"));
         let pids = fs::read_to_string(&path).unwrap();
         let application = pids
@@ -135,7 +136,6 @@ impl NamedSession {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
-        fs::remove_file(path).unwrap();
     }
 }
 
@@ -152,47 +152,131 @@ impl Drop for NamedSession {
             }
             let _ = launcher.wait();
         }
-        // Prefer normal shutdown so a live daemon reaps its application. This is bounded
-        // even on assertion failures; the PID fallback also covers a daemon killed by SIGHUP.
-        if self
-            .output(&["stop", "demo"])
-            .is_ok_and(|output| output.status.success())
-        {
-            let _ = fs::remove_dir_all(&self.runtime);
-            return;
-        }
-        if let Ok(entries) = fs::read_dir(&self.runtime) {
-            for entry in entries.flatten() {
-                if entry.path().extension().and_then(|value| value.to_str()) != Some("pids") {
-                    continue;
+        // Snapshot every generation before shutdown can remove any runtime files.
+        let mut records = Vec::new();
+        let mut cleaned = true;
+        match fs::read_dir(&self.runtime) {
+            Ok(entries) => {
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        cleaned = false;
+                        continue;
+                    };
+                    let path = entry.path();
+                    if path.extension().and_then(|value| value.to_str()) != Some("pids") {
+                        continue;
+                    }
+                    match fs::read_to_string(&path) {
+                        Ok(pids) => records.push((path, pids)),
+                        Err(_) => cleaned = false,
+                    }
                 }
-                if let Ok(pids) = fs::read_to_string(entry.path()) {
-                    for pid in pids
-                        .split_whitespace()
-                        .filter_map(|value| value.parse::<libc::pid_t>().ok())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => cleaned = false,
+        }
+        // A successful stop only accounts for the current generation, not failed predecessors.
+        let _ = self.output(&["stop", "demo"]);
+        let owns_pid =
+            |pid: libc::pid_t, path: &PathBuf, executable: &str| -> std::io::Result<bool> {
+                if pid <= 1 || pid == std::process::id() as libc::pid_t {
+                    return Ok(false);
+                }
+                if unsafe { libc::kill(pid, 0) } < 0 {
+                    let error = std::io::Error::last_os_error();
+                    return if error.raw_os_error() == Some(libc::ESRCH) {
+                        Ok(false)
+                    } else {
+                        Err(error)
+                    };
+                }
+                let output = Command::new("/bin/ps")
+                    .args(["-ww", "-p", &pid.to_string(), "-o", "uid=,command="])
+                    .output()?;
+                if !output.status.success() {
+                    return if unsafe { libc::kill(pid, 0) } < 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
                     {
-                        if pid > 1 && pid != std::process::id() as libc::pid_t {
-                            // The application execs sleep instead of spawning descendants.
-                            // Use individual PIDs: a broken daemon may share the runner's group.
-                            unsafe {
-                                libc::kill(pid, libc::SIGKILL);
+                        Ok(false)
+                    } else {
+                        Err(std::io::Error::other(
+                            "could not verify fixture process identity",
+                        ))
+                    };
+                }
+                let line = String::from_utf8_lossy(&output.stdout);
+                let Some((uid, command)) = line.trim().split_once(char::is_whitespace) else {
+                    return Err(std::io::Error::other("invalid fixture process identity"));
+                };
+                // The application blocks in a shell builtin, retaining its unique PID-file
+                // argument. Check it and the executable/UID rather than trusting a stale PID.
+                Ok(
+                    uid.parse::<libc::uid_t>().ok() == Some(unsafe { libc::geteuid() })
+                        && command.trim_start().starts_with(executable)
+                        && command.ends_with(&format!(" fixture {}", path.display())),
+                )
+            };
+        for (path, record) in &records {
+            let Ok(pids) = record
+                .split_whitespace()
+                .map(str::parse::<libc::pid_t>)
+                .collect::<Result<Vec<_>, _>>()
+            else {
+                cleaned = false;
+                continue;
+            };
+            if pids.len() != 2 {
+                cleaned = false;
+                continue;
+            }
+            for (pid, executable) in pids.into_iter().zip([
+                "/bin/sh -c ".to_owned(),
+                format!("{} __serve ", env!("CARGO_BIN_EXE_termctrl")),
+            ]) {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut signaled = false;
+                loop {
+                    match owns_pid(pid, path, &executable) {
+                        Ok(false) => break,
+                        Ok(true) if Instant::now() < deadline => {
+                            if !signaled {
+                                // Signal only a verified individual process, never its group.
+                                if unsafe { libc::kill(pid, libc::SIGKILL) } < 0
+                                    && std::io::Error::last_os_error().raw_os_error()
+                                        != Some(libc::ESRCH)
+                                {
+                                    cleaned = false;
+                                    break;
+                                }
+                                signaled = true;
                             }
-                            thread::sleep(Duration::from_millis(20));
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        _ => {
+                            cleaned = false;
+                            break;
                         }
                     }
                 }
             }
         }
-        let _ = fs::remove_dir_all(&self.runtime);
+        if cleaned {
+            let _ = fs::remove_dir_all(&self.runtime);
+        } else {
+            eprintln!(
+                "fixture cleanup could not be verified; retaining records at {}",
+                self.runtime.display()
+            );
+        }
     }
 }
 
 fn survives_launcher_hangup(restart: bool) {
     let operation = if restart { "restart" } else { "start" };
     let mut session = NamedSession::new(operation);
-    session.launch("start");
+    session.launch("start", "start");
     if restart {
-        session.launch("restart");
+        session.launch("restart", "restart");
     }
     let pids = fs::read_to_string(session.runtime.join(format!("{operation}.pids"))).unwrap();
     let daemon = pids
@@ -266,4 +350,69 @@ fn named_session_survives_launcher_process_group_hangup() {
 #[test]
 fn restarted_session_survives_launcher_process_group_hangup() {
     survives_launcher_hangup(true);
+}
+
+#[test]
+fn cleanup_stops_every_generation_after_a_failed_restart_assertion() {
+    // Preserve an independently reachable endpoint so even the failing regression
+    // run can stop the original daemon after the buggy destructor deletes its records.
+    let backup = NamedSession::new("cleanup-backup");
+    let mut unrelated = NamedSession::new("cleanup-unrelated");
+    unrelated.launch("start", "start");
+    let mut session = NamedSession::new("cleanup");
+    session.launch("start", "start");
+    let original = fs::read_to_string(session.runtime.join("start.pids")).unwrap();
+    fs::rename(
+        session.runtime.join("demo.sock"),
+        backup.runtime.join("demo.sock"),
+    )
+    .unwrap();
+    session.launch("start", "replacement");
+    let replacement = fs::read_to_string(session.runtime.join("replacement.pids")).unwrap();
+    // Simulate stale/reused PID records using another independently owned fixture,
+    // never a shared process or the test runner itself.
+    fs::write(
+        session.runtime.join("stale.pids"),
+        fs::read_to_string(unrelated.runtime.join("start.pids")).unwrap(),
+    )
+    .unwrap();
+    let runtime = session.runtime.clone();
+
+    let failure = std::panic::catch_unwind(move || session.assert_application_stopped("start"));
+    assert!(
+        failure.is_err(),
+        "the original generation must still be running at the assertion"
+    );
+    let pids: Vec<_> = original
+        .split_whitespace()
+        .chain(replacement.split_whitespace())
+        .map(|value| value.parse::<libc::pid_t>().unwrap())
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let surviving = loop {
+        let surviving: Vec<_> = pids
+            .iter()
+            .copied()
+            .filter(|pid| unsafe { libc::kill(*pid, 0) } == 0)
+            .collect();
+        if surviving.is_empty() || Instant::now() >= deadline {
+            break surviving;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    eprintln!("failed-generation cleanup: surviving fixture PIDs {surviving:?}");
+    assert!(
+        surviving.is_empty(),
+        "cleanup left generation processes alive: {surviving:?}"
+    );
+    assert!(
+        !runtime.exists(),
+        "cleanup left its runtime directory behind"
+    );
+    let status: serde_json::Value = serde_json::from_slice(
+        &assert_success(unrelated.output(&["status", "demo", "--json"]).unwrap()).stdout,
+    )
+    .unwrap();
+    assert_eq!(status["state"], "running");
+    eprintln!("stale PID records: unrelated fixture generation remains running");
 }

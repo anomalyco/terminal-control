@@ -20,7 +20,7 @@ pub(crate) struct TerminalCore {
     render_state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
-    responses: Rc<RefCell<Vec<u8>>>,
+    responses: Rc<RefCell<Vec<Vec<u8>>>>,
     cursor_style: CursorVisualStyle,
     cached_frame: Option<Frame>,
 }
@@ -37,7 +37,8 @@ impl TerminalCore {
         terminal
             .on_pty_write({
                 let responses = Rc::clone(&responses);
-                move |_terminal, bytes| responses.borrow_mut().extend_from_slice(bytes)
+                // Preserve reply boundaries so hosts can select replies without a stream parser.
+                move |_terminal, bytes| responses.borrow_mut().push(bytes.to_vec())
             })
             .context("configure Ghostty PTY responses")?;
         apply_theme(&mut terminal)?;
@@ -53,7 +54,7 @@ impl TerminalCore {
         })
     }
 
-    pub(crate) fn apply_output(&mut self, bytes: &[u8]) -> Vec<u8> {
+    pub(crate) fn apply_output(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
         self.terminal.vt_write(bytes);
         std::mem::take(&mut self.responses.borrow_mut())
     }
@@ -299,7 +300,10 @@ mod tests {
     fn captures_terminal_responses() {
         let mut terminal = TerminalCore::new(1, 20, 0).unwrap();
 
-        assert_eq!(terminal.apply_output(b"\x1b[5n"), b"\x1b[0n");
+        assert_eq!(
+            terminal.apply_output(b"\x1b[5n\x1b[6n"),
+            vec![b"\x1b[0n".to_vec(), b"\x1b[1;1R".to_vec()]
+        );
     }
 
     #[test]

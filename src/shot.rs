@@ -507,9 +507,29 @@ pub(crate) fn respond_to_output(
     host: &mut Host,
     output: &[u8],
 ) -> Result<Vec<u8>> {
-    let ghostty_response = terminal.apply_output(output);
+    let ghostty_response = terminal
+        .apply_output(output)
+        .into_iter()
+        .filter(|reply| {
+            if !host.is_enabled() {
+                return true;
+            }
+            let Some((row, col)) = std::str::from_utf8(reply)
+                .ok()
+                .and_then(|reply| reply.strip_prefix("\x1b["))
+                .and_then(|reply| reply.strip_suffix('R'))
+                .and_then(|position| position.split_once(';'))
+            else {
+                return false;
+            };
+            [row, col]
+                .into_iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .flatten()
+        .collect::<Vec<_>>();
     if host.is_enabled() {
-        host.respond(output)
+        host.respond(output, ghostty_response)
     } else {
         if !ghostty_response.is_empty() && !host.send_if_open(&ghostty_response)? {
             return Ok(Vec::new());
@@ -615,11 +635,10 @@ impl Host {
         self.pixel_height = u32::from(rows) * u32::from(cell_height);
     }
 
-    pub(crate) fn respond(&mut self, output: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn respond(&mut self, output: &[u8], mut response: Vec<u8>) -> Result<Vec<u8>> {
         if !self.enabled {
             return Ok(Vec::new());
         }
-        let mut response = Vec::new();
         self.probe.extend_from_slice(output);
         self.color_probe.extend_from_slice(output);
         for query in take_color_queries(&mut self.color_probe) {
@@ -644,7 +663,7 @@ impl Host {
         {
             response.extend_from_slice(
                 format!(
-                        "\x1bP>|termctrl {}\x1b\\\x1b[1;1R\x1b[?1016;0$y\x1b[?2027;0$y\x1b[?2031;2$y\x1b[?1004;1$y\x1b[?2004;2$y\x1b[?2026;2$y\x1b[?0u\x1b[1;1R\x1b[1;1R\x1b[4;{};{}t\x1b[?6c",
+                        "\x1bP>|termctrl {}\x1b\\\x1b[?1016;0$y\x1b[?2027;0$y\x1b[?2031;2$y\x1b[?1004;1$y\x1b[?2004;2$y\x1b[?2026;2$y\x1b[?0u\x1b[4;{};{}t\x1b[?6c",
                         env!("CARGO_PKG_VERSION"),
                         self.pixel_height,
                         self.pixel_width,
@@ -954,10 +973,10 @@ mod tests {
             },
         );
 
-        host.respond(b"\x1b]10;?\x07").unwrap();
-        host.respond(b"\x1b]11;?\x07").unwrap();
-        host.respond(b"\x1b]4;0;?\x07").unwrap();
-        host.respond(b"\x1b_Gi=31337,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\")
+        host.respond(b"\x1b]10;?\x07", Vec::new()).unwrap();
+        host.respond(b"\x1b]11;?\x07", Vec::new()).unwrap();
+        host.respond(b"\x1b]4;0;?\x07", Vec::new()).unwrap();
+        host.respond(b"\x1b_Gi=31337,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\", Vec::new())
             .unwrap();
 
         let output = String::from_utf8(result.lock().unwrap().clone()).unwrap();
@@ -986,6 +1005,137 @@ mod tests {
 
         assert_eq!(foreground_responses, 1);
         assert_eq!(*written.lock().unwrap(), response);
+    }
+
+    #[test]
+    fn cursor_replies_preserve_query_time_positions_across_chunks() {
+        let cases: &[(&str, &[u8], &[u8])] = &[
+            ("initial", b"\x1b[6n", b"\x1b[1;1R"),
+            ("moved", b"\x1b[3;7H\x1b[6n", b"\x1b[3;7R"),
+            ("repeated", b"\x1b[6n\x1b[6n", b"\x1b[1;1R\x1b[1;1R"),
+            ("hidden", b"\x1b[?25l\x1b[4;12H\x1b[6n", b"\x1b[4;12R"),
+            (
+                "origin",
+                b"\x1b[5;20r\x1b[?6h\x1b[3;5H\x1b[6n",
+                b"\x1b[3;5R",
+            ),
+            (
+                "multiple positions",
+                b"\x1b[2;5H\x1b[6n\x1b[8;13H\x1b[6n\x1b[20;30H\x1b[6n\x1b[H",
+                b"\x1b[2;5R\x1b[8;13R\x1b[20;30R",
+            ),
+            (
+                "width probes",
+                b"\x1b[5;9H\x1b7\x1b[6n\x1b[H\x1b]66;w=1; \x1b\\\x1b[6n\x1b[H\x1b]66;s=2; \x1b\\\x1b[6n\x1b8",
+                b"\x1b[5;9R\x1b[1;1R\x1b[1;1R",
+            ),
+        ];
+        for &(name, output, expected) in cases {
+            for opentui_host in [false, true] {
+                let partitions = (0..=output.len())
+                    .map(|split| vec![&output[..split], &output[split..]])
+                    .chain(std::iter::once(output.chunks(1).collect()));
+                for chunks in partitions {
+                    let written = Arc::new(Mutex::new(Vec::new()));
+                    let mut host = Host::new(
+                        Box::new(Writer(Arc::clone(&written))),
+                        &Options {
+                            opentui_host,
+                            ..Options::default()
+                        },
+                    );
+                    let mut terminal = TerminalCore::new(24, 80, 0).unwrap();
+                    let mut response = Vec::new();
+                    let mut consumed = 0;
+                    for chunk in chunks {
+                        response
+                            .extend(respond_to_output(&mut terminal, &mut host, chunk).unwrap());
+                        consumed += chunk.len();
+                        let queries = output[..consumed]
+                            .windows(4)
+                            .filter(|window| *window == b"\x1b[6n")
+                            .count();
+                        assert_eq!(
+                            response.iter().filter(|&&byte| byte == b'R').count(),
+                            queries,
+                            "{name}, host={opentui_host}, consumed={consumed}"
+                        );
+                        assert_eq!(*written.lock().unwrap(), response);
+                    }
+                    assert_eq!(response, expected, "{name}, host={opentui_host}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_replies_mix_with_host_overrides_without_unsolicited_reports() {
+        let overrides = format!(
+            "\x1b]10;rgb:c9c9/d1d1/d9d9\x1b\\\x1b]11;rgb:0d0d/1111/1717\x1b\\\x1bP>|termctrl {}\x1b\\\x1b[?1016;0$y\x1b[?2027;0$y\x1b[?2031;2$y\x1b[?1004;1$y\x1b[?2004;2$y\x1b[?2026;2$y\x1b[?0u\x1b[4;432;720t\x1b[?6c",
+            env!("CARGO_PKG_VERSION")
+        );
+        let cases: &[(bool, &[u8], Vec<u8>)] = &[
+            (true, OPENTUI_QUERY, overrides.as_bytes().to_vec()),
+            (
+                true,
+                b"\x1b[3;7H\x1b[6n\x1b]10;?\x07\x1b]11;?\x07\x1b[5n\x1b[>0q\x1b[?u\x1b[?1016$p\x1b[H\x1b]66;w=1; \x1b\\\x1b[6n\x1b[H\x1b]66;s=2; \x1b\\\x1b[6n",
+                [b"\x1b[3;7R\x1b[1;1R\x1b[1;1R", overrides.as_bytes()].concat(),
+            ),
+            (
+                false,
+                b"\x1b[5n\x1b[3;7H\x1b[6n\x1b[?7$p",
+                b"\x1b[0n\x1b[3;7R\x1b[?7;1$y".to_vec(),
+            ),
+        ];
+        for (opentui_host, output, expected) in cases {
+            let written = Arc::new(Mutex::new(Vec::new()));
+            let mut host = Host::new(
+                Box::new(Writer(Arc::clone(&written))),
+                &Options {
+                    opentui_host: *opentui_host,
+                    ..Options::default()
+                },
+            );
+            let mut terminal = TerminalCore::new(24, 80, 0).unwrap();
+            let response = respond_to_output(&mut terminal, &mut host, output).unwrap();
+            assert_eq!(&response, expected);
+            assert_eq!(*written.lock().unwrap(), response);
+        }
+    }
+
+    #[test]
+    fn cursor_replies_ignore_only_closed_writer_errors() {
+        struct FailedWriter(std::io::ErrorKind);
+        impl Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(self.0))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for opentui_host in [false, true] {
+            for kind in [
+                std::io::ErrorKind::BrokenPipe,
+                std::io::ErrorKind::PermissionDenied,
+            ] {
+                let mut host = Host::new(
+                    Box::new(FailedWriter(kind)),
+                    &Options {
+                        opentui_host,
+                        ..Options::default()
+                    },
+                );
+                let mut terminal = TerminalCore::new(24, 80, 0).unwrap();
+                let response = respond_to_output(&mut terminal, &mut host, b"\x1b[6n");
+                if kind == std::io::ErrorKind::BrokenPipe {
+                    assert!(response.unwrap().is_empty());
+                } else {
+                    assert!(response.is_err());
+                }
+            }
+        }
     }
 
     #[test]

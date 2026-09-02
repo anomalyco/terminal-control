@@ -1064,6 +1064,7 @@ mod implementation {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::thread;
@@ -1214,6 +1215,15 @@ mod implementation {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Background sessions must survive hangups of the launcher's terminal/process group.
+        unsafe {
+            daemon.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let mut daemon = daemon.spawn().context("start session daemon")?;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

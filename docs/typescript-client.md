@@ -58,6 +58,19 @@ console.log(capture.reason, capture.text, capture.frame)
 
 ## Keyboard Input
 
+For readiness-driven demos rather than settled snapshot tests, wait for a literal marker and
+explicitly read the current screen without the default 250ms quiet period:
+
+```ts
+await session.keyboard.type("help\n")
+await session.screen.waitForText("Commands")
+const { text, frame } = await session.screen.capture({ settleMs: 0, deadlineMs: 0 })
+```
+
+Reuse that capture for both text and cells instead of making two requests. Keep the defaults when
+the whole screen must settle; a readiness marker does not guarantee that every animation stopped.
+Input is unpaced by default. `paceMs` is for intentional typing animation, not synchronization.
+
 Keyboard presses are typed as the sequences Terminal Control encodes exactly, such as `"Enter"`, `"ArrowDown"`, or `"Control+C"`. Use `session.keyboard.write(bytes)` when a test deliberately needs exact terminal bytes outside that supported key set.
 
 ## Mouse Input

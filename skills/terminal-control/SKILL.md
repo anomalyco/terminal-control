@@ -52,6 +52,18 @@ Do not treat logs as the visible state of an alternate-screen TUI.
 Named-session reads return immediately by default. Add settling only when intentionally waiting for
 quiet output. `wait` defaults to five seconds; set `--timeout` only when choosing another limit.
 
+For fast demos, keep the session alive, omit `--pace-ms` unless slow typing is intentional, and
+combine a known transition into one shell call:
+
+```bash
+termctrl send app text:help enter && termctrl wait app "Commands" && termctrl show app
+```
+
+The wait ends as soon as the text appears; its timeout is a maximum, not a fixed delay. Do not
+insert sleeps between these commands. Inspect text during interaction, save PNGs only for visual
+checks or requested evidence, and export video after driving the app. With MCP, prefer `interact`
+with `waitFor` to combine keyboard input, readiness, and a screen read in one tool call.
+
 ## Drive Input Precisely
 
 Send plain text with `text:<value>` and named keys as separate input atoms:

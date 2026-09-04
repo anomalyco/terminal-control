@@ -789,7 +789,6 @@ fn render_video_frames(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let renderer = render::PngRenderer::new();
     let render_options = render::Options {
         cell_width: f32::from(options.cell_width.unwrap_or(recording.cell_width)),
         cell_height: f32::from(options.cell_height.unwrap_or(recording.cell_height)),
@@ -798,6 +797,7 @@ fn render_video_frames(
         font_family: options.font_family.clone(),
         show_cursor: !options.hide_cursor,
     };
+    let mut renderer = VideoRenderer::new(render_options.clone(), options.pixel_ratio);
     for (index, state) in samples.iter().enumerate() {
         let path = temp.join(format!("frame-{index:06}.png"));
         let elapsed_ms = (u128::from(index as u64) * 1000 / u128::from(options.fps)) as u64;
@@ -816,14 +816,7 @@ fn render_video_frames(
         } else {
             base_keys[*state].clone()
         };
-        render_or_link(
-            &renderer,
-            &mut rendered,
-            (key, overlay),
-            &path,
-            &render_options,
-            options.pixel_ratio,
-        )?;
+        render_or_link(&mut renderer, &mut rendered, (key, overlay), &path)?;
     }
     eprintln!("Rendered {} unique screens.", rendered.len());
     eprintln!("Encoding {}...", options.out.display());
@@ -842,23 +835,52 @@ fn render_video_frames(
     Ok(())
 }
 
+struct VideoRenderer {
+    png: render::PngRenderer,
+    base: Option<(Rc<Frame>, render::Rasterized)>,
+    options: render::Options,
+    pixel_ratio: f32,
+}
+
+impl VideoRenderer {
+    fn new(options: render::Options, pixel_ratio: f32) -> Self {
+        Self {
+            png: render::PngRenderer::new(),
+            base: None,
+            options,
+            pixel_ratio,
+        }
+    }
+
+    fn render(&mut self, frame: &Rc<Frame>, overlay: &str, path: &Path) -> Result<()> {
+        // Options are constant for one export. Retain only the latest base raster, not one
+        // full-resolution bitmap per terminal state. Pointer-only changes reuse its pixels.
+        if self
+            .base
+            .as_ref()
+            .is_none_or(|(previous, _)| previous != frame)
+        {
+            let raster = self
+                .png
+                .rasterize(&render::svg(frame, &self.options), self.pixel_ratio)?;
+            self.base = Some((Rc::clone(frame), raster));
+        }
+        self.png
+            .render_overlay(&self.base.as_ref().unwrap().1, overlay, path)
+    }
+}
+
 fn render_or_link(
-    renderer: &render::PngRenderer,
+    renderer: &mut VideoRenderer,
     rendered: &mut HashMap<(Rc<Frame>, String), PathBuf>,
     key: (Rc<Frame>, String),
     path: &Path,
-    options: &render::Options,
-    pixel_ratio: f32,
 ) -> Result<()> {
     if let Some(existing) = rendered.get(&key) {
         fs::hard_link(existing, path).or_else(|_| fs::copy(existing, path).map(|_| ()))?;
         return Ok(());
     }
-    let mut svg = render::svg(&key.0, options);
-    svg.truncate(svg.len() - "</svg>".len());
-    svg.push_str(&key.1);
-    svg.push_str("</svg>");
-    renderer.render(&svg, path, pixel_ratio)?;
+    renderer.render(&key.0, &key.1, path)?;
     rendered.insert(key, path.to_path_buf());
     Ok(())
 }
@@ -1481,8 +1503,8 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("termctrl-pointer-cache-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
-        let renderer = render::PngRenderer::new();
         let options = render::Options::default();
+        let mut renderer = VideoRenderer::new(options.clone(), 1.0);
         let mut rendered = HashMap::new();
         let base = Rc::new(frame("ready"));
         let pointer = pointer::Track::new(
@@ -1495,27 +1517,23 @@ mod tests {
         );
         for (index, at_ms) in [800.0, 1050.0, 1100.0, 800.0].into_iter().enumerate() {
             render_or_link(
-                &renderer,
+                &mut renderer,
                 &mut rendered,
                 (
                     Rc::clone(&base),
                     pointer.svg(at_ms, u64::MAX, 40, 1, &options),
                 ),
                 &directory.join(format!("{index}.png")),
-                &options,
-                1.0,
             )
             .unwrap();
         }
         assert_eq!(rendered.len(), 3);
         assert!(rendered.keys().all(|(frame, _)| Rc::ptr_eq(frame, &base)));
         render_or_link(
-            &renderer,
+            &mut renderer,
             &mut rendered,
             (Rc::new(frame("ready")), String::new()),
             &directory.join("same-content.png"),
-            &options,
-            1.0,
         )
         .unwrap();
         assert_eq!(rendered.len(), 3);
@@ -1566,6 +1584,76 @@ mod tests {
                 .all(|frame| (frame.cols, frame.rows) == (4, 2))
         );
         assert_eq!(frames.last().unwrap().text(), "a");
+    }
+
+    #[test]
+    fn layered_video_rendering_matches_full_svg_pixels() {
+        use crate::mouse::{Action, MouseEvent};
+        let directory = std::env::temp_dir().join(format!("tc-layers-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let styled = crate::shot::from_ansi(
+            "\x1b[41m背景\x1b[0m\x1b[1;3;4mA&<\x1b[0m\r\n━⠋\x1b[2m faded\x1b[0m\r\n\x1b[8mhidden"
+                .as_bytes()
+                .to_vec(),
+            5,
+            24,
+            4096,
+        )
+        .unwrap()
+        .frame;
+        let mut resized = styled.clone();
+        resized.cols = 30;
+        resized.rows = 7;
+        let frames = [
+            styled.clone(),
+            with_footer(styled, Some("caption & text"), 1234),
+            resized,
+        ];
+        let pointer = pointer::Track::new(
+            &[
+                Entry::Mouse {
+                    at_ms: 200,
+                    event: MouseEvent::new(Action::Move, 0, 0),
+                    bytes: vec![],
+                },
+                Entry::Mouse {
+                    at_ms: 600,
+                    event: MouseEvent::new(Action::Click, 23, 4),
+                    bytes: vec![],
+                },
+            ],
+            PointerOptions::default(),
+        );
+        let reference = render::PngRenderer::new();
+        for ratio in [1.0, 1.5, 2.0] {
+            let options = render::Options {
+                padding: 0.5,
+                cell_width: 9.25,
+                cell_height: 18.5,
+                ..render::Options::default()
+            };
+            let mut renderer = VideoRenderer::new(options.clone(), ratio);
+            for (index, frame) in frames.iter().enumerate() {
+                let frame = Rc::new(frame.clone());
+                for at in [0.0, 150.0, 490.0, 650.0, 1300.0] {
+                    let overlay = pointer.svg(at, u64::MAX, frame.cols, frame.rows, &options);
+                    let mut svg = render::svg(&frame, &options);
+                    svg.truncate(svg.len() - "</svg>".len());
+                    svg.push_str(&overlay);
+                    svg.push_str("</svg>");
+                    let expected = directory.join("full.png");
+                    let actual = directory.join("layered.png");
+                    reference.render(&svg, &expected, ratio).unwrap();
+                    renderer.render(&frame, &overlay, &actual).unwrap();
+                    assert!(
+                        fs::read(&actual).unwrap() == fs::read(&expected).unwrap(),
+                        "different pixels at ratio {ratio}, frame {index}, time {at}"
+                    );
+                    assert!(Rc::ptr_eq(&renderer.base.as_ref().unwrap().0, &frame));
+                }
+            }
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

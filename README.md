@@ -111,12 +111,16 @@ termctrl stop demo
 
 - `send` accepts `text:<value>`, named keys (`enter`, `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, `page-down`), and `ctrl-a` through `ctrl-z`. Pipe exact bytes with `--stdin`.
 - `mouse demo move 12 4` hovers at zero-based column 12, row 4; `mouse demo click 12 4` clicks. Use `down`, `move`, then `up` to drag; `--button right`, `--shift`, `--alt`, and `--ctrl` are supported. The app must enable mouse reporting (hover needs any-event tracking).
-- `wait` blocks until text is visible; use it instead of sleeping. It defaults to five seconds.
+- `show NAME` reads immediately; `wait` returns as soon as text is visible. Its five-second default is a maximum, not a fixed delay. Use it instead of sleeping.
 - `status` reports running/exited state, command, cwd, viewport, and recording path. `list` shows running sessions; use `--state`, `--command`, or `--cwd` to filter discovery, and `--all` to include every retained or unavailable entry.
 - `prune --dry-run` previews retained exited sessions and stale sockets; `prune` removes them without deleting recording artifacts.
 - `resize demo --cols 132 --rows 38` tests responsive layouts.
 - `restart demo` relaunches with the stored command, cwd, viewport, and recording settings.
 - An exited session keeps its final screen for `show` until stopped.
+
+For fast automation, batch a known `send` → `wait` → `show` transition in one shell call, or use
+MCP `interact` with `waitFor`. Leave typing unpaced unless the demo needs it; reserve PNG saves
+for visual checks and export video after the interactions.
 
 OpenTUI applications such as OpenCode need the opt-in host handshake:
 

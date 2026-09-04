@@ -8,6 +8,7 @@
   "scripts": {
     "build:npm": "bun run --cwd packages/test build && bun run --cwd packages/opentui build",
     "test:npm": "bun run --cwd packages/test typecheck && bun run --cwd packages/test test && bun run --cwd packages/opentui typecheck && bun run --cwd packages/opentui test",
+    "bench:performance": "bun scripts/bench-performance.ts",
     "changeset": "changeset",
     "version-packages": "changeset version",
     "validate:npm": "node scripts/validate-npm-packages.mjs",

@@ -106,6 +106,13 @@ pub struct PngRenderer {
     options: resvg::usvg::Options<'static>,
 }
 
+/// A bounded video base layer; dimensions retain the SVG coordinate space at fractional scales.
+pub(crate) struct Rasterized {
+    pixmap: resvg::tiny_skia::Pixmap,
+    size: resvg::usvg::Size,
+    pixel_ratio: f32,
+}
+
 impl PngRenderer {
     pub fn new() -> Self {
         let mut options = resvg::usvg::Options::default();
@@ -114,6 +121,13 @@ impl PngRenderer {
     }
 
     pub fn render(&self, svg: &str, path: &Path, pixel_ratio: f32) -> Result<()> {
+        self.rasterize(svg, pixel_ratio)?
+            .pixmap
+            .save_png(path)
+            .context("write PNG artifact")
+    }
+
+    pub(crate) fn rasterize(&self, svg: &str, pixel_ratio: f32) -> Result<Rasterized> {
         if !pixel_ratio.is_finite() || pixel_ratio <= 0.0 {
             anyhow::bail!("PNG pixel ratio must be finite and greater than zero");
         }
@@ -140,8 +154,36 @@ impl PngRenderer {
             resvg::tiny_skia::Transform::from_scale(pixel_ratio, pixel_ratio),
             &mut pixmap.as_mut(),
         );
-        pixmap.save_png(path).context("write PNG artifact")?;
-        Ok(())
+        Ok(Rasterized {
+            pixmap,
+            size: tree.size(),
+            pixel_ratio,
+        })
+    }
+
+    pub(crate) fn render_overlay(
+        &self,
+        base: &Rasterized,
+        overlay: &str,
+        path: &Path,
+    ) -> Result<()> {
+        if overlay.is_empty() {
+            return base.pixmap.save_png(path).context("write PNG artifact");
+        }
+        let mut pixmap = base.pixmap.clone();
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}">{overlay}</svg>"#,
+            base.size.width(),
+            base.size.height()
+        );
+        let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &self.options)
+            .context("parse rendered SVG")?;
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(base.pixel_ratio, base.pixel_ratio),
+            &mut pixmap.as_mut(),
+        );
+        pixmap.save_png(path).context("write PNG artifact")
     }
 }
 

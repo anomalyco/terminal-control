@@ -301,10 +301,10 @@ struct SourceArgs {
     /// Color environment policy for a command source (default: auto for PTY, always for pipe).
     #[arg(long, value_enum)]
     color: Option<ColorMode>,
-    /// Capture after this many milliseconds without output (default: 250).
+    /// Capture after this many milliseconds without output (command default: 250; named session: 0).
     #[arg(long)]
     settle_ms: Option<u64>,
-    /// Capture or return after this deadline even if output continues (default: 5000).
+    /// Capture or return after this deadline even if output continues (command default: 5000; named session: 0).
     #[arg(long)]
     deadline_ms: Option<u64>,
     /// Wait this long before allowing the initial screen to settle.

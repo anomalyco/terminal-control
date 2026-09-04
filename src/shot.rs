@@ -84,7 +84,7 @@ pub fn from_ansi(bytes: Vec<u8>, rows: u16, cols: u16, max_bytes: usize) -> Resu
     let mut terminal = TerminalCore::new(rows, cols, 0)?;
     let _responses = terminal.apply_output(&bytes);
     Ok(Shot {
-        frame: terminal.frame()?,
+        frame: terminal.frame()?.clone(),
         ansi: bytes,
     })
 }
@@ -168,7 +168,7 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
             )?;
         }
         Ok(Shot {
-            frame: terminal.frame()?,
+            frame: terminal.frame()?.clone(),
             ansi,
         })
     })();
@@ -275,7 +275,7 @@ pub fn from_pipe_command(
             );
         }
         Ok(Shot {
-            frame: terminal.frame()?,
+            frame: terminal.frame()?.clone(),
             ansi,
         })
     })();

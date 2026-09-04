@@ -73,6 +73,16 @@ part of these metrics. Results are machine/workload-specific, not performance gu
    Regression cases compare final-only and incremental frames across v1/v2, out-of-order times,
    cutoffs, markers, Unicode, styles, cursors and multiple resizes.
 
+5. **Borrow existing snapshots:** internal text/status reads now borrow the cached terminal frame;
+   owned captures clone explicitly, and recording replay clones only distinct retained states.
+   Unedited video export also borrows its existing state list rather than deep-copying the timeline.
+   For a dense 1,001-event recording sampled at 1fps (two output frames), three-run median maximum
+   resident memory fell from 414,334,976 to 284,868,608 bytes (about 395 to 272 MiB). Sampling at 1fps
+   here isolates retained timeline work; it is not a change to video defaults or a speed claim.
+   Paired 15-run driver-interaction medians remained around 5.7–6.0ms. Forty v1/v2 screenshot/ANSI
+   comparisons, 187 decoded frames across eight synthetic video variants, and the 339-frame edited
+   real-PTY demo were identical. A retained-frame test covers later output, cursor changes, and resize.
+
 ## Guardrails / next candidates
 
 - Keep explicit quiet periods and input pacing. The TypeScript stable-capture defaults are a test

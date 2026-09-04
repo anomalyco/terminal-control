@@ -516,7 +516,7 @@ impl Session {
             if let Some(reason) = reason {
                 return Ok(CaptureResult {
                     shot: Shot {
-                        frame: self.terminal.frame()?,
+                        frame: self.terminal.frame()?.clone(),
                         ansi: self.ansi.clone(),
                     },
                     reason,
@@ -1105,7 +1105,7 @@ pub fn infer_name(command: &[String]) -> Result<String> {
 
 fn request(name: &str, request: Request) -> Result<Response> {
     validate_name(name)?;
-    let response = implementation::request(socket_path(name)?, &request)?;
+    let response = implementation::request(&socket_path(name)?, &request)?;
     if let Some(error) = response.error {
         bail!(error);
     }
@@ -1212,12 +1212,12 @@ mod implementation {
         ensure_socket_path(&runtime.join(format!("{name}.sock")))?;
         let _lock = StartLock::acquire(&runtime.join(format!("{name}.lock")))?;
         let socket = runtime.join(format!("{name}.sock"));
-        if let Ok(response) = request(socket.clone(), &Request::Stop) {
+        if let Ok(response) = request(&socket, &Request::Stop) {
             if let Some(error) = response.error {
                 bail!(error);
             }
             let deadline = Instant::now() + Duration::from_secs(2);
-            while request(socket.clone(), &Request::Ping).is_ok() {
+            while request(&socket, &Request::Ping).is_ok() {
                 if Instant::now() >= deadline {
                     bail!("timed out stopping session {name:?} before restart");
                 }
@@ -1298,7 +1298,7 @@ mod implementation {
         let mut daemon = daemon.spawn().context("start session daemon")?;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if request(socket.clone(), &Request::Ping).is_ok() {
+            if request(&socket, &Request::Ping).is_ok() {
                 return Ok(());
             }
             if let Some(status) = daemon.try_wait().context("poll session daemon")? {
@@ -1312,9 +1312,9 @@ mod implementation {
         }
     }
 
-    pub fn request(socket: PathBuf, request: &Request) -> Result<Response> {
-        ensure_socket_path(&socket)?;
-        let mut stream = UnixStream::connect(&socket).with_context(|| {
+    pub fn request(socket: &Path, request: &Request) -> Result<Response> {
+        ensure_socket_path(socket)?;
+        let mut stream = UnixStream::connect(socket).with_context(|| {
             format!("connect to session at {}; is it running?", socket.display())
         })?;
         let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut stream);
@@ -1342,7 +1342,7 @@ mod implementation {
             else {
                 continue;
             };
-            let (status, error, unavailable) = match request(path, &Request::Status) {
+            let (status, error, unavailable) = match request(&path, &Request::Status) {
                 Ok(response) => (response.status, response.error, None),
                 Err(error) => {
                     let reason = if stale_socket_error(&error) {
@@ -1386,7 +1386,7 @@ mod implementation {
                 socket.display()
             );
         }
-        match request(socket.clone(), &Request::Status) {
+        match request(&socket, &Request::Status) {
             Ok(response) => {
                 if let Some(error) = response.error {
                     bail!(error);
@@ -1398,7 +1398,7 @@ mod implementation {
                     return Ok(None);
                 }
                 if !dry_run {
-                    let response = request(socket, &Request::Stop)?;
+                    let response = request(&socket, &Request::Stop)?;
                     if let Some(error) = response.error {
                         bail!(error);
                     }
@@ -1551,7 +1551,7 @@ mod implementation {
     }
 
     fn remove_stale_socket(name: &str, socket: &Path) -> Result<()> {
-        if request(socket.to_owned(), &Request::Ping).is_ok() {
+        if request(socket, &Request::Ping).is_ok() {
             bail!("session {name:?} is already running");
         }
         match fs::remove_file(socket) {
@@ -1787,12 +1787,12 @@ mod implementation {
                 )
             });
             let deadline = Instant::now() + Duration::from_secs(2);
-            while request(socket.clone(), &Request::Ping).is_err() {
+            while request(&socket, &Request::Ping).is_err() {
                 assert!(Instant::now() < deadline, "session daemon did not start");
                 thread::sleep(Duration::from_millis(10));
             }
             request(
-                socket.clone(),
+                &socket,
                 &Request::Wait {
                     text: name.clone(),
                     timeout_ms: 2_000,
@@ -1801,7 +1801,7 @@ mod implementation {
             .unwrap();
 
             let response = request(
-                socket.clone(),
+                &socket,
                 &Request::Show {
                     settle_ms: 0,
                     deadline_ms: 0,
@@ -1809,7 +1809,7 @@ mod implementation {
             )
             .unwrap();
             assert_eq!(response.captured.unwrap().frame.text(), name);
-            request(socket, &Request::Stop).unwrap();
+            request(&socket, &Request::Stop).unwrap();
             server.join().unwrap().unwrap();
         }
     }
@@ -1842,7 +1842,7 @@ mod implementation {
     ) -> Result<()> {
         bail!("persistent sessions require Unix sockets")
     }
-    pub fn request(_: PathBuf, _: &Request) -> Result<Response> {
+    pub fn request(_: &Path, _: &Request) -> Result<Response> {
         bail!("persistent sessions require Unix sockets")
     }
     pub fn list() -> Result<Vec<NamedSessionStatus>> {

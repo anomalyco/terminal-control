@@ -258,11 +258,12 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
     };
     let edit = options.edit.as_deref().map(read_edit).transpose()?;
     let playback = Playback::new(&recording.events, edit.as_ref(), states[0].at_ms)?;
-    let states = match &edit {
-        Some(_) => edited_states(states, &playback.clips, caption_placement)?,
-        None => states.to_vec(),
-    };
-    let samples = samples(&states, options);
+    let edited = edit
+        .as_ref()
+        .map(|_| edited_states(states, &playback.clips, caption_placement))
+        .transpose()?;
+    let states = edited.as_deref().unwrap_or(states);
+    let samples = samples(states, options);
     if let Some(parent) = options
         .out
         .parent()
@@ -288,7 +289,7 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
     let result = render_video_frames(
         &temp,
         &recording,
-        &states,
+        states,
         &samples,
         options,
         pointer.as_ref(),
@@ -389,7 +390,7 @@ pub fn shot_at(path: &Path, at_ms: Option<u64>, marker: Option<&str>) -> Result<
         Ok(())
     })?;
     Ok(Shot {
-        frame: terminal.frame()?,
+        frame: terminal.frame()?.clone(),
         ansi,
     })
 }
@@ -407,11 +408,11 @@ fn states(recording: &Recording) -> Result<Vec<VideoFrame>> {
         let frame = terminal.frame()?;
         if !frames
             .last()
-            .is_some_and(|previous| previous.frame == frame)
+            .is_some_and(|previous| &previous.frame == frame)
         {
             frames.push(VideoFrame {
                 at_ms,
-                frame,
+                frame: frame.clone(),
                 footer_caption: None,
             });
         }
@@ -1088,7 +1089,7 @@ mod tests {
                 let mut frame = None;
                 let mut ansi = Vec::new();
                 replay(&recording, Some(cutoff), |terminal, _, bytes| {
-                    frame = Some(terminal.frame()?);
+                    frame = Some(terminal.frame()?.clone());
                     ansi.extend_from_slice(bytes);
                     Ok(())
                 })
@@ -1282,7 +1283,7 @@ mod tests {
     fn painted_frame() -> Frame {
         let mut terminal = TerminalCore::new(1, 2, 0).unwrap();
         let _responses = terminal.apply_output(b"\x1b[48;2;30;34;42m ");
-        terminal.frame().unwrap()
+        terminal.frame().unwrap().clone()
     }
 
     #[test]

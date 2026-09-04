@@ -157,7 +157,13 @@ impl TerminalCore {
         Ok(bytes.as_ref().to_vec())
     }
 
-    pub(crate) fn frame(&mut self) -> Result<Frame> {
+    /// Borrow the current snapshot; clone only when retaining it beyond the next terminal update.
+    pub(crate) fn frame(&mut self) -> Result<&Frame> {
+        self.update_frame()?;
+        Ok(self.cached_frame.as_ref().expect("frame cache populated"))
+    }
+
+    fn update_frame(&mut self) -> Result<()> {
         let snapshot = self
             .render_state
             .update(&self.terminal)
@@ -168,11 +174,8 @@ impl TerminalCore {
             .context("read Ghostty cursor style")?;
         let cursor_style_changed = self.cursor_style != next_cursor_style;
         self.cursor_style = next_cursor_style;
-        if dirty == Dirty::Clean
-            && !cursor_style_changed
-            && let Some(frame) = &self.cached_frame
-        {
-            return Ok(frame.clone());
+        if dirty == Dirty::Clean && !cursor_style_changed && self.cached_frame.is_some() {
+            return Ok(());
         }
         let cols = snapshot.cols().context("read Ghostty columns")?;
         let rows = snapshot.rows().context("read Ghostty rows")?;
@@ -298,8 +301,8 @@ impl TerminalCore {
             frame.cells.sort_unstable_by_key(|cell| (cell.y, cell.x));
             frame
         };
-        self.cached_frame = Some(frame.clone());
-        Ok(frame)
+        self.cached_frame = Some(frame);
+        Ok(())
     }
 }
 
@@ -424,7 +427,7 @@ mod tests {
         terminal.apply_output(b"\x1b[6 q");
         let frame = terminal.frame().unwrap();
 
-        assert_eq!(frame.cursor.unwrap().style, CursorStyle::Bar);
+        assert_eq!(frame.cursor.as_ref().unwrap().style, CursorStyle::Bar);
     }
 
     #[test]
@@ -477,12 +480,34 @@ mod tests {
         assert_eq!(terminal.frame().unwrap().text(), "alpha\nbeta");
 
         let _responses = terminal.apply_output(b"\rB");
-        let updated = terminal.frame().unwrap();
+        let updated = terminal.frame().unwrap().clone();
         assert_eq!(updated.text(), "alpha\nBeta");
-        assert_eq!(terminal.frame().unwrap(), updated);
+        assert_eq!(terminal.frame().unwrap(), &updated);
 
         let _responses = terminal.apply_output(b"\r\x1b[2K");
         assert_eq!(terminal.frame().unwrap().text(), "alpha");
+    }
+
+    #[test]
+    fn retained_snapshot_survives_later_output_cursor_changes_and_resize() {
+        let mut terminal = TerminalCore::new(3, 10, 100).unwrap();
+        terminal.apply_output("A界e\u{301}\r\nbeta".as_bytes());
+        let retained = terminal.frame().unwrap().clone();
+        let original = serde_json::to_value(&retained).unwrap();
+
+        terminal.apply_output(b"\rB\x1b[6 q");
+        let updated = terminal.frame().unwrap();
+        assert_eq!(updated.text(), "A界e\u{301}\nBeta");
+        assert_eq!(updated.cursor.as_ref().unwrap().style, CursorStyle::Bar);
+        terminal.resize(5, 4, 9, 18).unwrap();
+        assert_eq!(terminal.frame().unwrap().cols, 5);
+        terminal.apply_output(b"\x1b[2J\x1b[Hdone");
+        assert_eq!(terminal.frame().unwrap().text(), "done");
+
+        assert_eq!(serde_json::to_value(&retained).unwrap(), original);
+        assert_eq!(retained.text(), "A界e\u{301}\nbeta");
+        assert_eq!(retained.cols, 10);
+        assert_eq!(retained.cursor.unwrap().style, CursorStyle::Block);
     }
 
     #[test]
@@ -496,7 +521,8 @@ mod tests {
         let _warmup = terminal.frame().unwrap();
         let started = std::time::Instant::now();
         for _ in 0..1_000 {
-            std::hint::black_box(terminal.frame().unwrap());
+            // Keep measuring an owned snapshot, not just borrowing the cached frame.
+            std::hint::black_box(terminal.frame().unwrap().clone());
         }
         println!(
             "METRIC repeated_frame_median_proxy_us={:.1}",

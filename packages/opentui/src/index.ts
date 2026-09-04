@@ -42,9 +42,7 @@ function hasMouseListeners(renderable: Renderable) {
   return Boolean(listener) || (isRecord(listeners) && Object.keys(listeners).length > 0)
 }
 
-function receivesClick(renderer: CliRenderer, renderable: Renderable) {
-  const bounds = visibleBounds(renderer, renderable)
-  if (!bounds) return false
+function receivesClick(renderer: CliRenderer, renderable: Renderable, bounds: Pick<InteractableElement, "x" | "y" | "width" | "height">) {
   const targets = new Set(all(renderable).map((item) => item.num))
   for (let y = Math.floor(bounds.y); y < Math.ceil(bounds.y + bounds.height); y++) {
     for (let x = Math.floor(bounds.x); x < Math.ceil(bounds.x + bounds.width); x++) {
@@ -55,31 +53,31 @@ function receivesClick(renderer: CliRenderer, renderable: Renderable) {
 }
 
 export function elements(renderer: CliRenderer): InteractableElement[] {
-  return all(renderer.root)
-    .flatMap((renderable) => {
-      const bounds = visibleBounds(renderer, renderable)
-      if (!bounds) return []
-      return [
-        {
-          id: renderable.id,
-          num: renderable.num,
-          ...bounds,
-          focusable: renderable.focusable,
-          focused: renderable.focused,
-          clickable: hasMouseListeners(renderable) && receivesClick(renderer, renderable),
-          editor: renderer.currentFocusedEditor === renderable,
-        },
-      ]
-    })
-    .filter((element) => element.focusable || element.clickable || element.editor)
+  return discover(renderer).map(({ element }) => element)
+}
+
+function discover(renderer: CliRenderer) {
+  return all(renderer.root).flatMap((renderable) => {
+    const bounds = visibleBounds(renderer, renderable)
+    if (!bounds) return []
+    const element: InteractableElement = {
+      id: renderable.id,
+      num: renderable.num,
+      ...bounds,
+      focusable: renderable.focusable,
+      focused: renderable.focused,
+      clickable: hasMouseListeners(renderable) && receivesClick(renderer, renderable, bounds),
+      editor: renderer.currentFocusedEditor === renderable,
+    }
+    return element.focusable || element.clickable || element.editor ? [{ renderable, element }] : []
+  })
 }
 
 export function semanticSnapshot(renderer: CliRenderer): SemanticSnapshot {
-  const renderables = new Map(all(renderer.root).map((renderable) => [renderable.num, renderable]))
   const ids = new Set<string>()
   return {
     format: "termctrl-semantic-snapshot-v1",
-    nodes: elements(renderer).map((element) => {
+    nodes: discover(renderer).map(({ element, renderable }) => {
       const preferred = element.id || `renderable-${element.num}`
       let id = preferred
       for (let suffix = element.num; ids.has(id); suffix++) id = `${preferred}-${suffix}`
@@ -87,7 +85,7 @@ export function semanticSnapshot(renderer: CliRenderer): SemanticSnapshot {
       return {
         id,
         role: element.editor ? "textbox" : element.clickable ? "button" : "control",
-        label: label(renderer, renderables.get(element.num), element),
+        label: label(renderer, renderable, element),
         element: element.num,
         focused: element.focused || element.editor,
         disabled: false,
@@ -141,8 +139,8 @@ export function provideTerminalControl(
   })
 }
 
-function label(renderer: CliRenderer, renderable: Renderable | undefined, element: InteractableElement) {
-  if (!renderable || element.editor) return element.id || undefined
+function label(renderer: CliRenderer, renderable: Renderable, element: InteractableElement) {
+  if (element.editor) return element.id || undefined
   const text = all(renderable)
     .filter((item) => visibleBounds(renderer, item) !== undefined)
     .map((item) => Reflect.get(item, "plainText"))

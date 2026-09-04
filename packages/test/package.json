@@ -1,6 +1,6 @@
 {
   "name": "@kitlangton/terminal-control",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Typed terminal application control and testing with snapshots, recordings, and failure artifacts",
   "license": "MIT",
   "repository": {
@@ -38,10 +38,10 @@
     "prepack": "bun run build"
   },
   "optionalDependencies": {
-    "@kitlangton/terminal-control-darwin-arm64": "1.1.1",
-    "@kitlangton/terminal-control-darwin-x64": "1.1.1",
-    "@kitlangton/terminal-control-linux-arm64-gnu": "1.1.1",
-    "@kitlangton/terminal-control-linux-x64-gnu": "1.1.1"
+    "@kitlangton/terminal-control-darwin-arm64": "1.2.0",
+    "@kitlangton/terminal-control-darwin-x64": "1.2.0",
+    "@kitlangton/terminal-control-linux-arm64-gnu": "1.2.0",
+    "@kitlangton/terminal-control-linux-x64-gnu": "1.2.0"
   },
   "peerDependencies": {
     "vitest": ">=3.0.0"

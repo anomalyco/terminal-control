@@ -17,7 +17,10 @@ if (process.argv.includes("--fixture")) {
     for (let end; (end = pending.indexOf("\n")) >= 0;) {
       const value = pending.slice(0, end)
       pending = pending.slice(end + 1)
-      process.stdout.write(`\x1b[24;1H\x1b[2KACK:${value}`)
+      const acknowledge = () => process.stdout.write(`\x1b[24;1H\x1b[2KACK:${value}`)
+      // A known 1ms application response exposes latency in a wait already in flight.
+      if (process.argv.includes("--async-output")) setTimeout(acknowledge, 1)
+      else acknowledge()
     }
   })
   process.stdout.write(screen)
@@ -86,6 +89,14 @@ if (process.argv.includes("--fixture")) {
         await session.screen.waitForText(`ACK:${i}`)
         const snapshot = await session.screen.capture({ settleMs: 0, deadlineMs: 0 })
         if (!snapshot.text.includes(`ACK:${i}`)) throw new Error("stale screen")
+        return { ms: performance.now() - start }
+      })
+      await using reactive = await driver.launch({ command: [...fixture, "--async-output"] })
+      await reactive.screen.waitForText("READY")
+      await measure("driver_reactive_wait", async (i) => {
+        const start = performance.now()
+        await reactive.keyboard.type(`${i}\n`)
+        await reactive.screen.waitForText(`ACK:${i}`)
         return { ms: performance.now() - start }
       })
     }

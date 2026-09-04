@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -451,7 +451,7 @@ impl Session {
             if Instant::now() >= deadline {
                 bail!("timed out waiting for visible terminal text {text:?}");
             }
-            thread::sleep(Duration::from_millis(10));
+            self.wait_for_output(deadline)?;
         }
     }
 
@@ -652,6 +652,25 @@ impl Session {
             if !self.consume_one()? {
                 break;
             }
+        }
+        Ok(())
+    }
+
+    fn wait_for_output(&mut self, deadline: Instant) -> Result<()> {
+        // PTY output wakes readiness checks immediately. Bound the wait so process exit,
+        // semantic providers, and foreground input callbacks are still serviced regularly.
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(10));
+        if self.output_closed {
+            // A disconnected channel returns immediately; do not spin while awaiting process exit.
+            thread::sleep(timeout);
+            return Ok(());
+        }
+        match self.receive.recv_timeout(timeout) {
+            Ok(Some(output)) => self.apply_output(output)?,
+            Ok(None) | Err(RecvTimeoutError::Disconnected) => self.output_closed = true,
+            Err(RecvTimeoutError::Timeout) => {}
         }
         Ok(())
     }
@@ -1855,6 +1874,77 @@ mod implementation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn text_readiness_wait_preserves_exit_and_timeout_errors() {
+        let mut exited = super::Session::start(
+            &["sh".into(), "-c".into(), "printf final".into()],
+            None,
+            None,
+            &crate::shot::Options::default(),
+        )
+        .unwrap();
+        let error = exited
+            .wait_for_text("never", std::time::Duration::from_secs(2))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("session ended before visible terminal included")
+        );
+        assert_eq!(exited.terminal.text().unwrap(), "final");
+        let mut running = super::Session::start(
+            &["sh".into(), "-c".into(), "read line".into()],
+            None,
+            None,
+            &crate::shot::Options::default(),
+        )
+        .unwrap();
+        assert!(
+            running
+                .wait_for_text("never", std::time::Duration::ZERO)
+                .unwrap_err()
+                .to_string()
+                .contains("timed out waiting")
+        );
+    }
+
+    #[test]
+    fn output_wait_applies_bytes_and_preserves_timeout_and_eof_state() {
+        let mut session = super::Session::start(
+            &["sh".into(), "-c".into(), "read line".into()],
+            None,
+            None,
+            &crate::shot::Options::default(),
+        )
+        .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        session.receive = receive;
+        session.wait_for_output(std::time::Instant::now()).unwrap();
+        assert!(!session.output_closed);
+        send.send(Some(super::Output {
+            at_ms: 0,
+            bytes: b"ready".to_vec(),
+        }))
+        .unwrap();
+        session
+            .wait_for_output(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(session.terminal.text().unwrap(), "ready");
+        assert!(!session.output_closed);
+        drop(send);
+        session
+            .wait_for_output(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(session.output_closed);
+        assert_eq!(
+            session
+                .capture(std::time::Duration::ZERO, std::time::Duration::ZERO)
+                .unwrap()
+                .reason,
+            super::CaptureReason::OutputClosed
+        );
+    }
+
     #[test]
     fn transcript_retention_preserves_zero_exact_and_overflow_limits() {
         for (limit, expected, expected_truncated) in

@@ -18,6 +18,8 @@ cleaned up; only synthetic videos remain when `--out-dir` is specified. `ffmpeg`
 - CLI `show` on a populated 80×24 real PTY.
 - CLI `send` → literal readiness `wait` → `show`, asserting the newly acknowledged input.
 - Persistent TypeScript driver input → literal readiness → immediate capture.
+- A second driver fixture adds a known 1ms application response time so the readiness wait is
+  already in flight when output arrives; this isolates unnecessary polling latency.
 - Two-second 80×24, 60fps, 2× video exports: plain, moving pointer, pointer with footer.
   Rendering-stage times use the existing stderr progress boundaries; total includes ffmpeg.
 
@@ -48,6 +50,19 @@ part of these metrics. Results are machine/workload-specific, not performance gu
    All 121 decoded frames of each of the three exports matched the baseline exactly. A 45-case
    test compares the old full SVG to layered rendering with fades, travel, compression, clipping,
    Unicode/styles, cursor, footer, geometry changes and 1×/1.5×/2× pixel ratios.
+   The 339-frame real PTY demo with speed edits, holds, captions, and resize also matched exactly.
+
+3. **Text-readiness wakeup:** wait on the existing output channel (up to the remaining deadline,
+   capped at 10ms for callbacks/semantics) instead of sleeping past new output. Retained: the
+   reactive fixture's send + readiness wait fell from 11.70ms to 1.28ms over 15 runs. Ordinary
+   driver interaction remained around 6ms, but the 17–19ms polling outliers disappeared in this
+   sample. Stable captures, quiet waits, and process-exit waits retain their existing semantics.
+
+   **Rejected broader variant:** applying output-triggered wakeups to all wait loops also changed
+   EOF observation in the exit path and hit `natural_parent_exit_terminates_pty_holding_descendants`.
+   That broader change was removed, not masked with a retry or weakened assertion. Exit/quiet/capture
+   loops and all cleanup code remain unchanged. Investigate exit/reaping timing separately before
+   attempting that optimization again; the exact cause was not established in this pass.
 
 ## Guardrails / next candidates
 

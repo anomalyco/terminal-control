@@ -10,6 +10,7 @@
 
 ### Patch Changes
 
+- Build distributed native binaries for a baseline CPU instead of the build runner's instruction set, preventing illegal-instruction crashes on older CPUs.
 - 138ea31: Materialize only the requested recording screenshot instead of retaining every intermediate frame. Video replay no longer constructs an unused ANSI transcript. Preserve recording order, cutoff/marker behavior, and reflow across resizes.
 - b0a4d8b: Wake named-session control requests as soon as they arrive instead of waiting for an idle polling sleep, and wake text-readiness checks on PTY output. Clarify immediate screen reads, readiness-driven demo workflows, and intentional capture/typing delays without changing stable-capture defaults.
 

@@ -37,7 +37,15 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: cargo build --release
+      - run: node --test scripts/portable-zig.test.mjs
+      - run: scripts/build-portable.sh
+      - name: Verify x86-64 baseline CPU compatibility
+        if: matrix.package == 'linux-x64-gnu'
+        run: |
+          set -o pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y qemu-user
+          printf 'portable-terminal' | qemu-x86_64 -cpu qemu64 target/release/termctrl show --input - | grep -Fx portable-terminal
       - run: node scripts/native-packages.mjs "${{ matrix.package }}" "$PWD/target/release/termctrl" "$PWD/npm-artifacts"
       - uses: actions/upload-artifact@v7
         with:

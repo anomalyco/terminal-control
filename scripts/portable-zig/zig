@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+: "${TERMCTRL_REAL_ZIG:?Use scripts/build-portable.sh to select the real Zig executable}"
+
+# libghostty-vt-sys 0.2.1 otherwise lets Zig select the build host's CPU.
+# Scope the compatibility shim to Ghostty, not Zig's version probe or other builds.
+if [ "${1-}" = build ]; then
+  ghostty=false
+  cpu=
+  for arg in "$@"; do
+    case "$arg" in
+      -Demit-lib-vt=true) ghostty=true ;;
+      -Dcpu=*) cpu=$arg ;;
+    esac
+  done
+  if [ "$ghostty" = true ]; then
+    case "$cpu" in
+      '') exec "$TERMCTRL_REAL_ZIG" "$@" -Dcpu=baseline ;;
+      -Dcpu=baseline) ;;
+      *) echo "portable Ghostty builds require -Dcpu=baseline" >&2; exit 1 ;;
+    esac
+  fi
+fi
+exec "$TERMCTRL_REAL_ZIG" "$@"

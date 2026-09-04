@@ -24,6 +24,12 @@ Native packaging rejects a Rust executable whose `termctrl --version` differs fr
 manifest. The OpenTUI manifest must already match the TypeScript client before publishing. Do not
 bypass the package-set checks or publish package formats at different versions.
 
+Build distributed binaries with `scripts/build-portable.sh`, not a host-tuned Ghostty archive.
+The pinned `libghostty-vt-sys` 0.2.1 does not select a portable CPU; the script forces Zig's
+`-Dcpu=baseline` for Ghostty and clears that dependency's release build outputs before rebuilding.
+The release workflow also exercises Linux x64 on QEMU's baseline CPU. Remove the compatibility
+shim when upgrading to a published dependency that defaults to a baseline CPU itself.
+
 ## Validate The Release
 
 `bun run validate:opentui` packs the current adapter into a temporary directory and checks its

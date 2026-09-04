@@ -10,7 +10,7 @@ bun scripts/bench-performance.ts --mode all --runs 7 --out-dir /path/to/results
 
 The benchmark performs one warmup and seven measured runs per case; JSON Lines report medians,
 median absolute deviations, and raw samples. Use `--binary` to compare saved builds, and
-`--mode agent` or `--mode video` for individual experiments. Fixtures and isolated named sessions are
+`--mode agent`, `--mode video`, or `--mode replay` for individual experiments. Fixtures and isolated named sessions are
 cleaned up; only synthetic videos remain when `--out-dir` is specified. `ffmpeg` is required.
 
 ## What is measured
@@ -22,6 +22,7 @@ cleaned up; only synthetic videos remain when `--out-dir` is specified. `ffmpeg`
   already in flight when output arrives; this isolates unnecessary polling latency.
 - Two-second 80×24, 60fps, 2× video exports: plain, moving pointer, pointer with footer.
   Rendering-stage times use the existing stderr progress boundaries; total includes ffmpeg.
+- A final recording screenshot after 1,001 output events, without exporting the timeline.
 
 No arbitrary sleeps, changed default settling, or reduced frame rate are used to improve scores.
 Application startup, external model/tool-call latency, and network package installation are not
@@ -63,6 +64,14 @@ part of these metrics. Results are machine/workload-specific, not performance gu
    That broader change was removed, not masked with a retry or weakened assertion. Exit/quiet/capture
    loops and all cleanup code remain unchanged. Investigate exit/reaping timing separately before
    attempting that optimization again; the exact cause was not established in this pass.
+
+4. **Final recording screenshot:** replay previously retained every intermediate `Frame` for a
+   single requested screenshot. One private replay loop now lets screenshots retain bytes and
+   materialize only the final frame; video retains frames without building an unused transcript.
+   A dense 1,001-event probe improved from 67.76ms to 5.74ms (seven-run medians). A separate
+   `/usr/bin/time -l` measurement reported 133,201,920 → 5,275,648 bytes maximum resident memory.
+   Regression cases compare final-only and incremental frames across v1/v2, out-of-order times,
+   cutoffs, markers, Unicode, styles, cursors and multiple resizes.
 
 ## Guardrails / next candidates
 

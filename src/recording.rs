@@ -383,15 +383,14 @@ pub fn shot_at(path: &Path, at_ms: Option<u64>, marker: Option<&str>) -> Result<
             .with_context(|| format!("recording does not contain marker {marker:?}"))?,
         (None, None) => u64::MAX,
     };
-    let replay = replay(&recording, Some(at_ms))?;
+    let mut ansi = Vec::new();
+    let mut terminal = replay(&recording, Some(at_ms), |_, _, bytes| {
+        ansi.extend_from_slice(bytes);
+        Ok(())
+    })?;
     Ok(Shot {
-        frame: replay
-            .frames
-            .last()
-            .expect("replay always has an initial frame")
-            .frame
-            .clone(),
-        ansi: replay.ansi,
+        frame: terminal.frame()?,
+        ansi,
     })
 }
 
@@ -402,33 +401,42 @@ struct VideoFrame {
     footer_caption: Option<String>,
 }
 
-struct Replay {
-    ansi: Vec<u8>,
-    frames: Vec<VideoFrame>,
-}
-
 fn states(recording: &Recording) -> Result<Vec<VideoFrame>> {
-    Ok(replay(recording, None)?.frames)
+    let mut frames: Vec<VideoFrame> = Vec::new();
+    replay(recording, None, |terminal, at_ms, _| {
+        let frame = terminal.frame()?;
+        if !frames
+            .last()
+            .is_some_and(|previous| previous.frame == frame)
+        {
+            frames.push(VideoFrame {
+                at_ms,
+                frame,
+                footer_caption: None,
+            });
+        }
+        Ok(())
+    })?;
+    Ok(frames)
 }
 
-fn replay(recording: &Recording, cutoff: Option<u64>) -> Result<Replay> {
+fn replay(
+    recording: &Recording,
+    cutoff: Option<u64>,
+    mut observe: impl FnMut(&mut TerminalCore, u64, &[u8]) -> Result<()>,
+) -> Result<TerminalCore> {
     let mut terminal = TerminalCore::new(recording.rows, recording.cols, SCROLLBACK_ROWS)?;
-    let mut ansi = Vec::new();
-    let mut frames: Vec<VideoFrame> = Vec::new();
-    frames.push(VideoFrame {
-        at_ms: 0,
-        frame: terminal.frame()?,
-        footer_caption: None,
-    });
+    // Shots retain bytes and materialize only the final frame; videos retain visible states
+    // without constructing an unused transcript. Both replay exactly the same event sequence.
+    observe(&mut terminal, 0, &[])?;
     for event in &recording.events {
-        let at_ms = match event {
+        let (at_ms, bytes) = match event {
             Entry::Output { at_ms, bytes } => {
                 if cutoff.is_some_and(|cutoff| *at_ms > cutoff) {
                     continue;
                 }
-                ansi.extend_from_slice(bytes);
                 let _responses = terminal.apply_output(bytes);
-                *at_ms
+                (*at_ms, bytes.as_slice())
             }
             Entry::Resize {
                 at_ms,
@@ -441,27 +449,16 @@ fn replay(recording: &Recording, cutoff: Option<u64>) -> Result<Replay> {
                     continue;
                 }
                 terminal.resize(*cols, *rows, *cell_width, *cell_height)?;
-                *at_ms
+                (*at_ms, &[][..])
             }
             Entry::Input { .. }
             | Entry::Mouse { .. }
             | Entry::Marker { .. }
             | Entry::Header { .. } => continue,
         };
-        let frame = terminal.frame()?;
-        if frames
-            .last()
-            .is_some_and(|previous| previous.frame == frame)
-        {
-            continue;
-        }
-        frames.push(VideoFrame {
-            at_ms,
-            frame,
-            footer_caption: None,
-        });
+        observe(&mut terminal, at_ms, bytes)?;
     }
-    Ok(Replay { ansi, frames })
+    Ok(terminal)
 }
 
 fn visible_states(states: &[VideoFrame], include_startup: bool) -> &[VideoFrame] {
@@ -1015,6 +1012,102 @@ fn format_timecode(elapsed_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_shots_match_incremental_frames_across_cutoffs_and_resizes() {
+        let path =
+            std::env::temp_dir().join(format!("tc-final-shot-{}.termctrl", std::process::id()));
+        for version in [1, 2] {
+            let mut entries = vec![
+                Entry::Header {
+                    version,
+                    cols: 8,
+                    rows: 3,
+                    cell_width: 9,
+                    cell_height: 18,
+                },
+                Entry::Output {
+                    at_ms: 5,
+                    bytes: "\x1b[41mA界\x1b[0m\r\nabcdefghijk".as_bytes().to_vec(),
+                },
+                Entry::Resize {
+                    at_ms: 10,
+                    cols: 4,
+                    rows: 3,
+                    cell_width: 9,
+                    cell_height: 18,
+                },
+                Entry::Input {
+                    at_ms: 12,
+                    origin: InputOrigin::Client,
+                    bytes: b"not output".to_vec(),
+                },
+                Entry::Output {
+                    at_ms: 20,
+                    bytes: b"\x1b[6 q\x1b[1;4mtext".to_vec(),
+                },
+                // Filtering must preserve recording order, not sort or stop at the first cutoff.
+                Entry::Output {
+                    at_ms: 15,
+                    bytes: b"\x1b[0m\r\nx".to_vec(),
+                },
+                Entry::Resize {
+                    at_ms: 30,
+                    cols: 10,
+                    rows: 5,
+                    cell_width: 9,
+                    cell_height: 18,
+                },
+                Entry::Output {
+                    at_ms: 35,
+                    bytes: b"\x1b[8mhidden\x1b[0m\x1b[?25l".to_vec(),
+                },
+                Entry::Marker {
+                    at_ms: 40,
+                    name: "end".into(),
+                },
+            ];
+            if version == 2 {
+                entries.push(Entry::Mouse {
+                    at_ms: 45,
+                    event: crate::mouse::MouseEvent::new(crate::mouse::Action::Click, 0, 0),
+                    bytes: b"not output".to_vec(),
+                });
+            }
+            fs::write(
+                &path,
+                entries
+                    .iter()
+                    .map(|entry| serde_json::to_string(entry).unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            let recording = read(&path).unwrap();
+            for cutoff in [0, 5, 10, 18, 20, 30, 40, u64::MAX] {
+                let mut frame = None;
+                let mut ansi = Vec::new();
+                replay(&recording, Some(cutoff), |terminal, _, bytes| {
+                    frame = Some(terminal.frame()?);
+                    ansi.extend_from_slice(bytes);
+                    Ok(())
+                })
+                .unwrap();
+                let shot = shot_at(&path, Some(cutoff), None).unwrap();
+                assert_eq!(
+                    shot.frame,
+                    frame.unwrap(),
+                    "version {version}, cutoff {cutoff}"
+                );
+                assert_eq!(shot.ansi, ansi);
+            }
+            assert_eq!(
+                shot_at(&path, None, Some("end")).unwrap().frame,
+                shot_at(&path, None, None).unwrap().frame
+            );
+        }
+        fs::remove_file(path).unwrap();
+    }
 
     fn edited_states(
         states: &[VideoFrame],

@@ -41,7 +41,13 @@ part of these metrics. Results are machine/workload-specific, not performance gu
    the pointer over a copy. Preserve the existing full-image cache and exact output pixels.
    Baseline: 21.27s total / 20.39s rendering with pointer; 19.85s / 19.47s with pointer and footer.
    Plain export: 0.88s total / 0.37s rendering. A two-second CPU sample during active rendering
-   placed most samples in SVG/text conversion. Pending candidate measurement and pixel comparison.
+   placed most samples in SVG/text conversion.
+   Retained: pointer export fell to 2.80s total / 2.33s rendering (7.6× / 8.8× faster);
+   pointer + footer to 3.08s / 2.68s (6.5× / 7.3×). Plain export was 0.91s versus 0.88s,
+   within the baseline's 52ms median absolute deviation. Only one base raster is retained.
+   All 121 decoded frames of each of the three exports matched the baseline exactly. A 45-case
+   test compares the old full SVG to layered rendering with fades, travel, compression, clipping,
+   Unicode/styles, cursor, footer, geometry changes and 1×/1.5×/2× pixel ratios.
 
 ## Guardrails / next candidates
 

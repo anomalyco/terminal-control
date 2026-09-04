@@ -65,6 +65,27 @@ printf '%s' 'multiline prompt' | termctrl send app --stdin
 
 Use `wait` after sending input instead of sleeping or assuming that the interface has updated.
 
+For mouse-enabled applications, use typed mouse commands with zero-based cell coordinates:
+
+```bash
+termctrl mouse app move 12 4
+termctrl mouse app click 12 4
+termctrl mouse app down 12 4
+termctrl mouse app move 20 4
+termctrl mouse app up 20 4
+```
+
+`move` hovers when no button is held; down/move/up drags. `--button right` or `middle`, `--shift`,
+`--alt`, and `--ctrl` are optional. The app must enable mouse reporting; hover requires any-event
+tracking. Coordinates outside the resized viewport fail. Do not work around disabled reporting
+by injecting raw escape sequences. Restart older named sessions if the command requests it.
+
+For recorded demos, opt into `video --pointer-overlay` to show mouse input with smooth travel,
+subtle press compression, and fades. This defaults to 60 fps and does not delay actual input.
+Use `--pointer-reduced-motion` to keep fades only. Trim/speed/hold edits stay on the same source
+clock. Only typed mouse commands provide overlay evidence; raw bytes and forwarded human input
+do not. `show`/`save` remain plain terminal evidence, separate from the video overlay.
+
 ## Operate OpenTUI Applications
 
 Use the OpenTUI host handshake for applications such as OpenCode:

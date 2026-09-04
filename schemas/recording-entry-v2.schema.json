@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anomalyco/terminal-control/schemas/recording-entry-v2.schema.json",
+  "title": "Terminal Control recording JSON Lines entry v2",
+  "description": "One recording line. The first line must be a v2 header; mouse events retain delivered client input, not terminal output.",
+  "oneOf": [
+    { "$ref": "#/$defs/header" },
+    { "$ref": "recording-entry-v1.schema.json#/$defs/output" },
+    { "$ref": "recording-entry-v1.schema.json#/$defs/input" },
+    { "$ref": "recording-entry-v1.schema.json#/$defs/resize" },
+    { "$ref": "recording-entry-v1.schema.json#/$defs/marker" },
+    { "$ref": "#/$defs/mouse" }
+  ],
+  "$defs": {
+    "header": {
+      "type": "object",
+      "required": ["type", "version", "cols", "rows", "cell_width", "cell_height"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "header" },
+        "version": { "const": 2 },
+        "cols": { "$ref": "recording-entry-v1.schema.json#/$defs/terminalDimension" },
+        "rows": { "$ref": "recording-entry-v1.schema.json#/$defs/terminalDimension" },
+        "cell_width": { "$ref": "recording-entry-v1.schema.json#/$defs/dimension" },
+        "cell_height": { "$ref": "recording-entry-v1.schema.json#/$defs/dimension" }
+      }
+    },
+    "mouse": {
+      "type": "object",
+      "required": ["type", "at_ms", "event", "bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "mouse" },
+        "at_ms": { "type": "integer", "minimum": 0 },
+        "bytes": { "$ref": "recording-entry-v1.schema.json#/$defs/byteArray" },
+        "event": {
+          "type": "object",
+          "required": ["action", "x", "y"],
+          "additionalProperties": false,
+          "properties": {
+            "action": { "enum": ["move", "down", "up", "click"] },
+            "x": { "$ref": "recording-entry-v1.schema.json#/$defs/dimension" },
+            "y": { "$ref": "recording-entry-v1.schema.json#/$defs/dimension" },
+            "button": { "enum": ["left", "middle", "right"], "default": "left" },
+            "shift": { "type": "boolean", "default": false },
+            "alt": { "type": "boolean", "default": false },
+            "ctrl": { "type": "boolean", "default": false }
+          }
+        }
+      }
+    }
+  }
+}

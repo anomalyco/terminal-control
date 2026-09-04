@@ -60,6 +60,26 @@ console.log(capture.reason, capture.text, capture.frame)
 
 Keyboard presses are typed as the sequences Terminal Control encodes exactly, such as `"Enter"`, `"ArrowDown"`, or `"Control+C"`. Use `session.keyboard.write(bytes)` when a test deliberately needs exact terminal bytes outside that supported key set.
 
+## Mouse Input
+
+```ts
+await session.mouse({ action: "move", x: 12, y: 4 }) // hover
+await session.mouse({ action: "click", x: 12, y: 4 })
+await session.mouse({ action: "down", x: 12, y: 4 })
+await session.mouse({ action: "move", x: 20, y: 4 }) // drag
+await session.mouse({ action: "up", x: 20, y: 4 })
+```
+
+The exported `MouseEvent` type accepts `button: "left" | "middle" | "right"` (default left)
+and optional `shift`, `alt`, `ctrl` booleans. Positions are zero-based integer cells, validated
+against the current viewport. The app must enable mouse reporting; hover requires any-event
+tracking. A click is an immediate press/release. No visual-animation delays are added to tests.
+An older binary without the driver `mouse` capability produces an actionable update error.
+
+With recording enabled, typed mouse evidence can be visualized later with
+`termctrl video recording.termctrl --pointer-overlay --out demo.mp4`.
+Add `--pointer-reduced-motion` for fades without travel or press scaling. Screenshots stay clean.
+
 ## Vitest Matchers And Failure Evidence
 
 Standard `toMatchSnapshot()` and `toMatchInlineSnapshot()` remain the simplest snapshot format because visible text is reviewable in source control. A screen-aware assertion writes configured artifacts on failure:

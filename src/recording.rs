@@ -15,7 +15,10 @@ use crate::terminal_core::{SCROLLBACK_ROWS, TerminalCore};
 
 const MAX_VIDEO_FPS: u32 = 1000;
 /// Schema version written in the header of every `.termctrl` recording.
-pub const FORMAT_VERSION: u8 = 1;
+pub const FORMAT_VERSION: u8 = 2;
+
+mod pointer;
+pub use pointer::PointerOptions;
 
 /// One JSON Lines entry in a `.termctrl` recording timeline.
 #[derive(Serialize, Deserialize)]
@@ -36,6 +39,12 @@ pub enum Entry {
     Input {
         at_ms: u64,
         origin: InputOrigin,
+        bytes: Vec<u8>,
+    },
+    /// Successfully delivered typed mouse input, on the same clock as terminal output.
+    Mouse {
+        at_ms: u64,
+        event: crate::mouse::MouseEvent,
         bytes: Vec<u8>,
     },
     Resize {
@@ -153,6 +162,14 @@ impl Writer {
         })
     }
 
+    pub fn mouse(&mut self, event: crate::mouse::MouseEvent, bytes: Vec<u8>) -> Result<()> {
+        self.write(Entry::Mouse {
+            at_ms: self.started.elapsed().as_millis() as u64,
+            event,
+            bytes,
+        })
+    }
+
     pub fn marker(&mut self, name: &str) -> Result<()> {
         if name.is_empty() {
             bail!("marker name must not be empty");
@@ -199,6 +216,7 @@ pub struct VideoOptions {
     pub font_family: String,
     pub pixel_ratio: f32,
     pub hide_cursor: bool,
+    pub pointer_overlay: Option<PointerOptions>,
     pub footer: bool,
     pub fps: u32,
     pub tail: Duration,
@@ -214,7 +232,20 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
         bail!("--fps must not exceed {MAX_VIDEO_FPS}");
     }
     let recording = read(path)?;
-    let states = states(&recording)?;
+    let mut states = states(&recording)?;
+    let pointer = options
+        .pointer_overlay
+        .map(|options| pointer::Track::new(&recording.events, options));
+    // Mouse input can be the last meaningful event on an otherwise static screen.
+    if let Some(at_ms) = pointer.as_ref().and_then(pointer::Track::last_ms)
+        && let Some(last) = states.last()
+        && at_ms > last.at_ms
+    {
+        states.push(VideoFrame {
+            at_ms,
+            ..last.clone()
+        });
+    }
     let states = visible_states(&states, options.include_startup);
     if states.is_empty() {
         bail!("recording contains no visible output frames");
@@ -224,13 +255,10 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
     } else {
         CaptionPlacement::Inline
     };
-    let states = match &options.edit {
-        Some(path) => edited_states(
-            states,
-            &recording.events,
-            &read_edit(path)?,
-            caption_placement,
-        )?,
+    let edit = options.edit.as_deref().map(read_edit).transpose()?;
+    let playback = Playback::new(&recording.events, edit.as_ref(), states[0].at_ms)?;
+    let states = match &edit {
+        Some(edit) => edited_states(states, &recording.events, edit, caption_placement)?,
         None => states.to_vec(),
     };
     let samples = samples(&states, options);
@@ -256,7 +284,15 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("secure {}", temp.display()))?;
     }
-    let result = render_video_frames(&temp, &recording, &states, &samples, options);
+    let result = render_video_frames(
+        &temp,
+        &recording,
+        &states,
+        &samples,
+        options,
+        pointer.as_ref(),
+        &playback,
+    );
     let _ = fs::remove_dir_all(&temp);
     result
 }
@@ -295,7 +331,7 @@ pub fn read(path: &Path) -> Result<Recording> {
     else {
         bail!("recording does not start with a header");
     };
-    if version != FORMAT_VERSION {
+    if version != 1 && version != FORMAT_VERSION {
         bail!("unsupported recording version {version}");
     }
     crate::shot::validate_geometry(rows, cols)?;
@@ -310,6 +346,18 @@ pub fn read(path: &Path) -> Result<Recording> {
         .any(|entry| matches!(entry, Entry::Header { .. }))
     {
         bail!("recording contains a header after the first line");
+    }
+    let mut mouse_time = 0;
+    for event in &events {
+        if let Entry::Mouse { at_ms, .. } = event {
+            if version < 2 {
+                bail!("mouse events require recording version 2");
+            }
+            if *at_ms < mouse_time {
+                bail!("recording mouse timestamps must be nondecreasing");
+            }
+            mouse_time = *at_ms;
+        }
     }
     Ok(Recording {
         cols,
@@ -394,7 +442,10 @@ fn replay(recording: &Recording, cutoff: Option<u64>) -> Result<Replay> {
                 terminal.resize(*cols, *rows, *cell_width, *cell_height)?;
                 *at_ms
             }
-            Entry::Input { .. } | Entry::Marker { .. } | Entry::Header { .. } => continue,
+            Entry::Input { .. }
+            | Entry::Mouse { .. }
+            | Entry::Marker { .. }
+            | Entry::Header { .. } => continue,
         };
         let frame = terminal.frame()?;
         if frames
@@ -576,6 +627,70 @@ fn scale_clip_time(clip_start: u64, from: u64, at_ms: u64, speed: f64) -> u64 {
     clip_start + ((at_ms.saturating_sub(from) as f64) / speed) as u64
 }
 
+// Terminal frames are sparse; pointer animation must use playback time, not the
+// timestamp of the last terminal redraw. Holds freeze source time, cuts jump it.
+struct PlaybackClip {
+    start: u64,
+    end: u64,
+    from: u64,
+    to: u64,
+    speed: f64,
+}
+
+struct Playback {
+    origin: u64,
+    clips: Vec<PlaybackClip>,
+}
+
+impl Playback {
+    fn new(entries: &[Entry], edit: Option<&VideoEdit>, origin: u64) -> Result<Self> {
+        let mut clips = Vec::new();
+        if let Some(edit) = edit {
+            let markers = marker_times(entries)?;
+            let mut start = 0;
+            for clip in &edit.clips {
+                let from = *markers
+                    .get(&clip.from)
+                    .context("video edit references missing start marker")?;
+                let to = *markers
+                    .get(&clip.to)
+                    .context("video edit references missing end marker")?;
+                let speed = clip.speed.unwrap_or(1.0);
+                if from > to || !speed.is_finite() || speed <= 0.0 {
+                    bail!("invalid video edit range or speed");
+                }
+                let end = scale_clip_time(start, from, to, speed);
+                clips.push(PlaybackClip {
+                    start,
+                    end,
+                    from,
+                    to,
+                    speed,
+                });
+                start = end.saturating_add(clip.hold_ms.unwrap_or(0));
+            }
+        }
+        Ok(Self { origin, clips })
+    }
+
+    fn source_time(&self, at_ms: u64) -> (f64, u64) {
+        let Some(clip) = self
+            .clips
+            .iter()
+            .rfind(|clip| clip.start <= at_ms)
+            .or(self.clips.first())
+        else {
+            return (self.origin.saturating_add(at_ms) as f64, u64::MAX);
+        };
+        let time = if at_ms >= clip.end {
+            clip.to as f64
+        } else {
+            clip.from as f64 + at_ms.saturating_sub(clip.start) as f64 * clip.speed
+        };
+        (time.min(clip.to as f64), clip.to)
+    }
+}
+
 fn marker_times(entries: &[Entry]) -> Result<HashMap<String, u64>> {
     let mut markers = HashMap::new();
     for marker in marker_entries(entries) {
@@ -664,6 +779,8 @@ fn render_video_frames(
     states: &[VideoFrame],
     samples: &[usize],
     options: &VideoOptions,
+    pointer: Option<&pointer::Track>,
+    playback: &Playback,
 ) -> Result<()> {
     eprintln!("Rendering {} sampled frames...", samples.len());
     let cols = states
@@ -680,7 +797,7 @@ fn render_video_frames(
         .iter()
         .map(|state| render_key(&state.frame, cols, rows, options.hide_cursor))
         .collect::<Vec<_>>();
-    let mut rendered = HashMap::<Frame, PathBuf>::new();
+    let mut rendered = HashMap::<(Frame, String), PathBuf>::new();
     let renderer = render::PngRenderer::new();
     let render_options = render::Options {
         cell_width: f32::from(options.cell_width.unwrap_or(recording.cell_width)),
@@ -692,30 +809,42 @@ fn render_video_frames(
     };
     for (index, state) in samples.iter().enumerate() {
         let path = temp.join(format!("frame-{index:06}.png"));
-        if options.footer {
-            let key = with_footer(
+        let elapsed_ms = (u128::from(index as u64) * 1000 / u128::from(options.fps)) as u64;
+        let overlay = pointer.map_or_else(String::new, |pointer| {
+            let (source_ms, cutoff) = playback.source_time(elapsed_ms);
+            let (mut cols, mut rows) = (recording.cols, recording.rows);
+            for entry in &recording.events {
+                if let Entry::Resize {
+                    at_ms,
+                    cols: next_cols,
+                    rows: next_rows,
+                    ..
+                } = entry
+                    && *at_ms as f64 <= source_ms
+                {
+                    cols = *next_cols;
+                    rows = *next_rows;
+                }
+            }
+            pointer.svg(source_ms, cutoff, cols, rows, &render_options)
+        });
+        let key = if options.footer {
+            with_footer(
                 base_keys[*state].clone(),
                 states[*state].footer_caption.as_deref(),
-                (u128::from(index as u64) * 1000 / u128::from(options.fps)) as u64,
-            );
-            render_or_link(
-                &renderer,
-                &mut rendered,
-                &key,
-                &path,
-                &render_options,
-                options.pixel_ratio,
-            )?;
+                elapsed_ms,
+            )
         } else {
-            render_or_link(
-                &renderer,
-                &mut rendered,
-                &base_keys[*state],
-                &path,
-                &render_options,
-                options.pixel_ratio,
-            )?;
-        }
+            base_keys[*state].clone()
+        };
+        render_or_link(
+            &renderer,
+            &mut rendered,
+            (key, overlay),
+            &path,
+            &render_options,
+            options.pixel_ratio,
+        )?;
     }
     eprintln!("Rendered {} unique screens.", rendered.len());
     eprintln!("Encoding {}...", options.out.display());
@@ -736,18 +865,22 @@ fn render_video_frames(
 
 fn render_or_link(
     renderer: &render::PngRenderer,
-    rendered: &mut HashMap<Frame, PathBuf>,
-    key: &Frame,
+    rendered: &mut HashMap<(Frame, String), PathBuf>,
+    key: (Frame, String),
     path: &Path,
     options: &render::Options,
     pixel_ratio: f32,
 ) -> Result<()> {
-    if let Some(existing) = rendered.get(key) {
+    if let Some(existing) = rendered.get(&key) {
         fs::hard_link(existing, path).or_else(|_| fs::copy(existing, path).map(|_| ()))?;
         return Ok(());
     }
-    renderer.render(&render::svg(key, options), path, pixel_ratio)?;
-    rendered.insert(key.clone(), path.to_path_buf());
+    let mut svg = render::svg(&key.0, options);
+    svg.truncate(svg.len() - "</svg>".len());
+    svg.push_str(&key.1);
+    svg.push_str("</svg>");
+    renderer.render(&svg, path, pixel_ratio)?;
+    rendered.insert(key, path.to_path_buf());
     Ok(())
 }
 
@@ -873,6 +1006,49 @@ fn format_timecode(elapsed_ms: u64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pointer_clock_tracks_off_grid_cuts_speed_holds_and_repeated_clips() {
+        let entries = [
+            Entry::Marker {
+                at_ms: 1090,
+                name: "start".into(),
+            },
+            Entry::Marker {
+                at_ms: 2090,
+                name: "end".into(),
+            },
+        ];
+        let edit = VideoEdit {
+            clips: vec![
+                VideoEditClip {
+                    from: "start".into(),
+                    to: "end".into(),
+                    speed: Some(2.0),
+                    hold_ms: Some(500),
+                    caption: None,
+                },
+                VideoEditClip {
+                    from: "start".into(),
+                    to: "end".into(),
+                    speed: Some(0.5),
+                    hold_ms: None,
+                    caption: None,
+                },
+            ],
+        };
+        let playback = Playback::new(&entries, Some(&edit), 0).unwrap();
+        assert_eq!(playback.source_time(0), (1090.0, 2090));
+        assert_eq!(playback.source_time(250), (1590.0, 2090));
+        assert_eq!(playback.source_time(750), (2090.0, 2090));
+        assert_eq!(playback.source_time(1000), (1090.0, 2090));
+        assert_eq!(playback.source_time(1250), (1215.0, 2090));
+        assert_eq!(playback.source_time(9000), (2090.0, 2090));
+        assert_eq!(
+            Playback::new(&[], None, 500).unwrap().source_time(250),
+            (750.0, u64::MAX)
+        );
+    }
+
     fn frame(text: &str) -> Frame {
         Frame {
             version: 1,
@@ -905,6 +1081,7 @@ mod tests {
             font_family: String::new(),
             pixel_ratio: 1.0,
             hide_cursor: true,
+            pointer_overlay: None,
             footer: false,
             fps: 20,
             tail: Duration::ZERO,
@@ -1184,6 +1361,99 @@ mod tests {
             &recording.events[2],
             Entry::Marker { name, .. } if name == "checkpoint"
         ));
+    }
+
+    #[test]
+    fn reads_legacy_recordings_and_never_replays_mouse_bytes_as_output() {
+        use crate::mouse::{Action, MouseEvent};
+        let path =
+            std::env::temp_dir().join(format!("termctrl-mouse-format-{}", std::process::id()));
+        let header = |version| {
+            serde_json::to_string(&Entry::Header {
+                version,
+                cols: 20,
+                rows: 2,
+                cell_width: 9,
+                cell_height: 18,
+            })
+            .unwrap()
+        };
+        let output = serde_json::to_string(&Entry::Output {
+            at_ms: 1,
+            bytes: b"ready".to_vec(),
+        })
+        .unwrap();
+        fs::write(&path, format!("{}\n{output}\n", header(1))).unwrap();
+        assert_eq!(shot_at(&path, None, None).unwrap().frame.text(), "ready");
+        let mouse = |at_ms| {
+            serde_json::to_string(&Entry::Mouse {
+                at_ms,
+                event: MouseEvent::new(Action::Click, 4, 0),
+                bytes: b"not output".to_vec(),
+            })
+            .unwrap()
+        };
+        fs::write(&path, format!("{}\n{output}\n{}\n", header(2), mouse(1000))).unwrap();
+        assert_eq!(shot_at(&path, None, None).unwrap().frame.text(), "ready");
+        assert_eq!(shot_at(&path, None, None).unwrap().ansi, b"ready");
+        fs::write(&path, format!("{}\n{}\n", header(1), mouse(1000))).unwrap();
+        assert!(read(&path).err().unwrap().to_string().contains("version 2"));
+        fs::write(
+            &path,
+            format!("{}\n{}\n{}\n", header(2), mouse(1000), mouse(900)),
+        )
+        .unwrap();
+        assert!(
+            read(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("nondecreasing")
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn animated_overlay_is_part_of_the_render_cache_key() {
+        use crate::mouse::{Action, MouseEvent};
+        let directory =
+            std::env::temp_dir().join(format!("termctrl-pointer-cache-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let renderer = render::PngRenderer::new();
+        let options = render::Options::default();
+        let mut rendered = HashMap::new();
+        let pointer = pointer::Track::new(
+            &[Entry::Mouse {
+                at_ms: 1000,
+                event: MouseEvent::new(Action::Click, 2, 0),
+                bytes: vec![],
+            }],
+            PointerOptions::default(),
+        );
+        for (index, at_ms) in [800.0, 1050.0, 1100.0, 800.0].into_iter().enumerate() {
+            render_or_link(
+                &renderer,
+                &mut rendered,
+                (
+                    frame("ready"),
+                    pointer.svg(at_ms, u64::MAX, 40, 1, &options),
+                ),
+                &directory.join(format!("{index}.png")),
+                &options,
+                1.0,
+            )
+            .unwrap();
+        }
+        assert_eq!(rendered.len(), 3);
+        assert_eq!(
+            fs::read(directory.join("0.png")).unwrap(),
+            fs::read(directory.join("3.png")).unwrap()
+        );
+        assert_ne!(
+            fs::read(directory.join("1.png")).unwrap(),
+            fs::read(directory.join("2.png")).unwrap()
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -127,6 +127,17 @@ export type Viewport = {
   cellHeight?: number
 }
 
+/** Real mouse input in zero-based cells. Move hovers; down/move/up drags. */
+export type MouseEvent = {
+  action: "move" | "down" | "up" | "click"
+  x: number
+  y: number
+  button?: "left" | "middle" | "right"
+  shift?: boolean
+  alt?: boolean
+  ctrl?: boolean
+}
+
 export type LaunchOptions = {
   command: readonly [string, ...string[]]
   cwd?: string
@@ -212,6 +223,7 @@ type ProtocolHello = {
   type: "hello"
   protocolVersion: number
   terminalControlVersion: string
+  capabilities?: string[]
 }
 
 type ProtocolResponse = {
@@ -379,7 +391,12 @@ export class TerminalControl implements AsyncDisposable {
       inheritEnv: options.inheritEnv,
     }, sessionId)
     return new Session(
-      (method, params, id) => this.request(method, params, id),
+      async (method, params, id) => {
+        if (method === "mouse" && !(await this.ready).capabilities?.includes("mouse")) {
+          throw new Error("termctrl driver predates mouse input; update the binary and restart the driver")
+        }
+        return this.request(method, params, id)
+      },
       sessionId,
       this.artifacts,
       temporaryRecording,
@@ -480,6 +497,10 @@ export class Session implements AsyncDisposable {
       cellWidth: viewport.cellWidth,
       cellHeight: viewport.cellHeight,
     }, this.id)
+  }
+
+  mouse(event: MouseEvent): Promise<void> {
+    return this.request("mouse", event, this.id)
   }
 
   async recording(): Promise<Uint8Array> {

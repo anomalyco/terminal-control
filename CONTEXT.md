@@ -26,6 +26,21 @@ A timestamped terminal event timeline containing output, client or automatic hos
 
 Agents inspect marker names with `termctrl markers` and inspect exact recording moments with `termctrl show --recording ... --at-marker ...` or `--at-ms ...` before committing to a video edit plan.
 
+### Mouse Input And Pointer Overlay
+
+Mouse input is a real, typed action (`move`, `down`, `up`, or `click`) at zero-based terminal cell
+coordinates. The embedded session validates its current viewport and held button, and Ghostty
+encodes the action using the application's negotiated mouse protocol. A `move` without a held
+button is a hover; `down`/`move`/`up` is a drag. Disabled reporting fails rather than injecting
+escape sequences into an unsuspecting shell. Clicks send press/release together with no added delay.
+
+A pointer overlay is an opt-in video presentation of successfully delivered typed mouse input,
+not a terminal cell or the text cursor. Format v2 recordings store each typed mouse event and its
+actual bytes on the recording clock; readers retain v1 support. Raw input is not reverse-engineered
+into mouse events. Source-time sampling aligns animation with edited video and freezes it during
+holds. Reduced motion keeps opacity feedback without travel or press compression. Ordinary
+screenshots and screen text do not include the overlay.
+
 ### ANSI/VT Stream
 
 Raw terminal output bytes containing text and terminal control sequences. Files commonly use an `.ansi` suffix, but the suffix does not imply a separate container format.

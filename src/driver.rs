@@ -29,6 +29,7 @@ pub fn serve(reader: impl BufRead, mut writer: impl Write) -> Result<()> {
         &json!({
             "type": "hello",
             "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": ["mouse"],
             "terminalControlVersion": env!("CARGO_PKG_VERSION")
         }),
     )?;
@@ -97,6 +98,7 @@ enum Method {
     Launch(LaunchParams),
     Status,
     Send(SendParams),
+    Mouse(crate::mouse::MouseEvent),
     WaitForText(WaitForTextParams),
     WaitForIdle(WaitForIdleParams),
     WaitForExit(WaitForExitParams),
@@ -380,6 +382,10 @@ fn dispatch(sessions: &mut HashMap<String, ManagedSession>, request: Request) ->
                 Ok(Value::Null)
             })
         }
+        Method::Mouse(event) => session(sessions, &request.session_id)?.call(move |session| {
+            session.mouse(event)?;
+            Ok(Value::Null)
+        }),
         Method::WaitForText(params) => {
             session(sessions, &request.session_id)?.call(move |session| {
                 session.wait_for_text(&params.text, Duration::from_millis(params.timeout_ms))?;

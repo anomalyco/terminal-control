@@ -24,6 +24,12 @@ struct SessionName {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MouseRequest {
+    name: String,
+    event: crate::mouse::MouseEvent,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct ListSessionsRequest {
     #[serde(default)]
@@ -351,6 +357,20 @@ impl TerminalControl {
         .map(Json)
     }
 
+    #[tool(
+        description = "Send real mouse input in zero-based cells: move to hover, click, or down/move/up to drag. The application must enable mouse reporting."
+    )]
+    async fn send_mouse(
+        &self,
+        Parameters(request): Parameters<MouseRequest>,
+    ) -> Result<String, String> {
+        blocking(move || {
+            session::mouse(&request.name, request.event).map_err(format_error)?;
+            Ok(format!("sent mouse input to {}", request.name))
+        })
+        .await
+    }
+
     #[tool(description = "Resize a named terminal session")]
     async fn resize_session(
         &self,
@@ -590,6 +610,7 @@ mod tests {
                 "resize_session",
                 "save_screen",
                 "send_input",
+                "send_mouse",
                 "stop_session",
             ]
         );

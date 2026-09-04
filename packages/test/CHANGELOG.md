@@ -1,5 +1,22 @@
 # @kitlangton/terminal-control
 
+## 1.2.0
+
+### Minor Changes
+
+- d4518f4: Add typed mouse input for hover, clicks, and drags through the CLI, Rust sessions, TypeScript client, and MCP. Encode input using the application's negotiated mouse reporting mode and validate current viewport coordinates.
+
+  Add opt-in video pointer overlays with smooth travel, press feedback, fades, and reduced motion. Keep animation aligned through edits and resizes without changing real input timing. New recordings use format v2 for typed mouse evidence; current readers continue to accept v1 recordings.
+
+### Patch Changes
+
+- 138ea31: Materialize only the requested recording screenshot instead of retaining every intermediate frame. Video replay no longer constructs an unused ANSI transcript. Preserve recording order, cutoff/marker behavior, and reflow across resizes.
+- b0a4d8b: Wake named-session control requests as soon as they arrive instead of waiting for an idle polling sleep, and wake text-readiness checks on PTY output. Clarify immediate screen reads, readiness-driven demo workflows, and intentional capture/typing delays without changing stable-capture defaults.
+
+  Reuse a bounded base raster during pointer video animation instead of repeating terminal text layout for every pointer position. Preserve frame pixels, recording timing, and screenshot behavior.
+
+- d4518f4: Preserve color-query replies when terminal escape prefixes arrive across separate output chunks, exclude invisible text when trimming video startup, and keep the original test failure when automatic failure-artifact capture fails. Simplify shared input encoding, terminal ownership, and recording rendering without changing public interfaces.
+
 ## 1.1.1
 
 ### Patch Changes

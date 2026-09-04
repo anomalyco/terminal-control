@@ -26,6 +26,6 @@ jobs:
       - run: TERMCTRL_TEST_BINARY="$PWD/target/release/termctrl" bun test packages/test/src/index.test.ts
       - run: bun run --cwd packages/opentui typecheck
       - run: bun run --cwd packages/opentui test
-      - run: bun run --cwd packages/opentui release:check
+      - run: bun run validate:opentui
       - run: bun run validate:npm "$PWD/target/release/termctrl"
       - run: cargo package

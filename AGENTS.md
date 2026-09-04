@@ -23,6 +23,7 @@ cargo build --release
 bun run test:npm
 bun run build:npm
 bun run validate:npm
+bun run validate:opentui
 cargo package --list
 cargo package
 ```

@@ -1,24 +1,19 @@
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, join, resolve } from "node:path"
-import { spawnSync } from "node:child_process"
-
-const input = resolve(process.argv[2] ?? "npm-artifacts")
-const files = await readdir(input)
-const matches = files.filter(
-  (file) => file.startsWith("kitlangton-terminal-control-opentui-") && file.endsWith(".tgz"),
-)
-if (matches.length !== 1) {
-  throw new Error(`expected one OpenTUI adapter tarball in ${input}, found ${matches.length}`)
-}
-const tarball = join(input, matches[0])
-const manifest = JSON.parse(run("tar", ["-xOf", tarball, "package/package.json"]))
-if (manifest.name !== "@kitlangton/terminal-control-opentui") {
-  throw new Error(`unexpected OpenTUI adapter package name ${manifest.name}`)
-}
+import { pack, run } from "./native-packages.mjs"
 
 const temp = await mkdtemp(join(tmpdir(), "termctrl-opentui-validation-"))
 try {
+  const tarball = await inputTarball(temp)
+  const manifest = JSON.parse(run("tar", ["-xOf", tarball, "package/package.json"]))
+  if (manifest.name !== "@kitlangton/terminal-control-opentui") {
+    throw new Error(`unexpected OpenTUI adapter package name ${manifest.name}`)
+  }
+  const client = JSON.parse(await readFile(new URL("../packages/test/package.json", import.meta.url), "utf8"))
+  if (manifest.version !== client.version) {
+    throw new Error(`OpenTUI adapter is ${manifest.version}, but TypeScript client is ${client.version}; prepare aligned versions before validation`)
+  }
   for (const opentuiVersion of ["0.4.1", "0.4.5"]) {
     const consumer = join(temp, `opentui-${opentuiVersion}`)
     await mkdir(consumer, { recursive: true })
@@ -75,10 +70,13 @@ try {
   await rm(temp, { recursive: true, force: true })
 }
 
-function run(command, args, cwd) {
-  const result = spawnSync(command, args, { cwd, encoding: "utf8", stdio: "pipe" })
-  if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(" ")} failed:\n${result.stdout}\n${result.stderr}`)
+async function inputTarball(temp) {
+  if (!process.argv[2]) return pack(resolve(import.meta.dirname, "../packages/opentui"), temp)
+  const input = resolve(process.argv[2])
+  const files = await readdir(input)
+  const matches = files.filter((file) => file.startsWith("kitlangton-terminal-control-opentui-") && file.endsWith(".tgz"))
+  if (matches.length !== 1) {
+    throw new Error(`expected one OpenTUI adapter tarball in ${input}, found ${matches.length}`)
   }
-  return result.stdout
+  return join(input, matches[0])
 }

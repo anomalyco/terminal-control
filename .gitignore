@@ -1,9 +1,9 @@
 /target
 /node_modules
 /packages/*/node_modules
-/packages/*/bin/cellshot
 /packages/*/dist
 /.cellshot-artifacts
+/.termctrl-artifacts
 /npm-artifacts
 /captures
 /docs/screenshots/*.ansi

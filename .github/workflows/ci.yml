@@ -19,7 +19,14 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo build --release
+      - run: node --test scripts/portable-zig.test.mjs
+      - run: scripts/build-portable.sh
+      - name: Verify x86-64 baseline CPU compatibility
+        run: |
+          set -o pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y qemu-user
+          printf 'portable-terminal' | qemu-x86_64 -cpu qemu64 target/release/termctrl show --input - | grep -Fx portable-terminal
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun run --cwd packages/test typecheck

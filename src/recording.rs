@@ -3,6 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -258,7 +259,7 @@ pub fn video(path: &Path, options: &VideoOptions) -> Result<()> {
     let edit = options.edit.as_deref().map(read_edit).transpose()?;
     let playback = Playback::new(&recording.events, edit.as_ref(), states[0].at_ms)?;
     let states = match &edit {
-        Some(edit) => edited_states(states, &recording.events, edit, caption_placement)?,
+        Some(_) => edited_states(states, &playback.clips, caption_placement)?,
         None => states.to_vec(),
     };
     let samples = samples(&states, options);
@@ -506,12 +507,8 @@ enum CaptionPlacement {
 }
 
 fn read_edit(path: &Path) -> Result<VideoEdit> {
-    let edit = serde_json::from_slice(
-        &fs::read(path).with_context(|| format!("read {}", path.display()))?,
-    )
-    .with_context(|| format!("parse {}", path.display()))?;
-    validate_edit(&edit)?;
-    Ok(edit)
+    serde_json::from_slice(&fs::read(path).with_context(|| format!("read {}", path.display()))?)
+        .with_context(|| format!("parse {}", path.display()))
 }
 
 fn validate_edit(edit: &VideoEdit) -> Result<()> {
@@ -535,48 +532,27 @@ fn validate_edit(edit: &VideoEdit) -> Result<()> {
 
 fn edited_states(
     states: &[VideoFrame],
-    entries: &[Entry],
-    edit: &VideoEdit,
+    clips: &[PlaybackClip],
     caption_placement: CaptionPlacement,
 ) -> Result<Vec<VideoFrame>> {
-    validate_edit(edit)?;
-    let markers = marker_times(entries)?;
     let mut output = Vec::new();
-    let mut offset = 0_u64;
-    for clip in &edit.clips {
-        let from = *markers
-            .get(&clip.from)
-            .with_context(|| format!("video edit references missing marker {:?}", clip.from))?;
-        let to = *markers
-            .get(&clip.to)
-            .with_context(|| format!("video edit references missing marker {:?}", clip.to))?;
-        if from > to {
-            bail!("video edit clip {:?} ends before it starts", clip.from);
-        }
-        let speed = clip.speed.unwrap_or(1.0);
-        if !speed.is_finite() || speed <= 0.0 {
-            bail!(
-                "video edit clip {:?} speed must be greater than zero",
-                clip.from
-            );
-        }
-        let clip_start = offset;
+    for clip in clips {
         let first = states
             .iter()
-            .rfind(|state| state.at_ms <= from)
+            .rfind(|state| state.at_ms <= clip.from)
             .or_else(|| states.first())
             .context("video edit has no visible screen state")?;
         output.push(VideoFrame {
-            at_ms: offset,
+            at_ms: clip.start,
             frame: frame_with_caption(&first.frame, clip.caption.as_deref(), caption_placement),
             footer_caption: footer_caption(clip.caption.as_deref(), caption_placement),
         });
         output.extend(
             states
                 .iter()
-                .filter(|state| state.at_ms > from && state.at_ms <= to)
+                .filter(|state| state.at_ms > clip.from && state.at_ms <= clip.to)
                 .map(|state| VideoFrame {
-                    at_ms: scale_clip_time(clip_start, from, state.at_ms, speed),
+                    at_ms: scale_clip_time(clip.start, clip.from, state.at_ms, clip.speed),
                     frame: frame_with_caption(
                         &state.frame,
                         clip.caption.as_deref(),
@@ -585,23 +561,20 @@ fn edited_states(
                     footer_caption: footer_caption(clip.caption.as_deref(), caption_placement),
                 }),
         );
-        let clip_end = scale_clip_time(clip_start, from, to, speed);
-        if output.last().is_some_and(|last| last.at_ms < clip_end)
+        if output.last().is_some_and(|last| last.at_ms < clip.end)
             && let Some(last) = output.last()
         {
             output.push(VideoFrame {
-                at_ms: clip_end,
+                at_ms: clip.end,
                 frame: last.frame.clone(),
                 footer_caption: last.footer_caption.clone(),
             });
         }
-        let hold_ms = clip.hold_ms.unwrap_or(0);
-        offset = clip_end.saturating_add(hold_ms);
-        if hold_ms > 0
+        if clip.hold_ms > 0
             && let Some(last) = output.last()
         {
             output.push(VideoFrame {
-                at_ms: offset,
+                at_ms: clip.end.saturating_add(clip.hold_ms),
                 frame: last.frame.clone(),
                 footer_caption: last.footer_caption.clone(),
             });
@@ -635,6 +608,8 @@ struct PlaybackClip {
     from: u64,
     to: u64,
     speed: f64,
+    hold_ms: u64,
+    caption: Option<String>,
 }
 
 struct Playback {
@@ -646,6 +621,7 @@ impl Playback {
     fn new(entries: &[Entry], edit: Option<&VideoEdit>, origin: u64) -> Result<Self> {
         let mut clips = Vec::new();
         if let Some(edit) = edit {
+            validate_edit(edit)?;
             let markers = marker_times(entries)?;
             let mut start = 0;
             for clip in &edit.clips {
@@ -666,6 +642,8 @@ impl Playback {
                     from,
                     to,
                     speed,
+                    hold_ms: clip.hold_ms.unwrap_or(0),
+                    caption: clip.caption.clone(),
                 });
                 start = end.saturating_add(clip.hold_ms.unwrap_or(0));
             }
@@ -795,9 +773,19 @@ fn render_video_frames(
         .unwrap_or(recording.rows);
     let base_keys = states
         .iter()
-        .map(|state| render_key(&state.frame, cols, rows, options.hide_cursor))
+        .map(|state| Rc::new(render_key(&state.frame, cols, rows, options.hide_cursor)))
         .collect::<Vec<_>>();
-    let mut rendered = HashMap::<(Frame, String), PathBuf>::new();
+    let mut rendered = HashMap::<(Rc<Frame>, String), PathBuf>::new();
+    let resizes = recording
+        .events
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Resize {
+                at_ms, cols, rows, ..
+            } => Some((*at_ms, *cols, *rows)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let renderer = render::PngRenderer::new();
     let render_options = render::Options {
         cell_width: f32::from(options.cell_width.unwrap_or(recording.cell_width)),
@@ -812,28 +800,16 @@ fn render_video_frames(
         let elapsed_ms = (u128::from(index as u64) * 1000 / u128::from(options.fps)) as u64;
         let overlay = pointer.map_or_else(String::new, |pointer| {
             let (source_ms, cutoff) = playback.source_time(elapsed_ms);
-            let (mut cols, mut rows) = (recording.cols, recording.rows);
-            for entry in &recording.events {
-                if let Entry::Resize {
-                    at_ms,
-                    cols: next_cols,
-                    rows: next_rows,
-                    ..
-                } = entry
-                    && *at_ms as f64 <= source_ms
-                {
-                    cols = *next_cols;
-                    rows = *next_rows;
-                }
-            }
+            let (cols, rows) =
+                recorded_size(&resizes, source_ms).unwrap_or((recording.cols, recording.rows));
             pointer.svg(source_ms, cutoff, cols, rows, &render_options)
         });
         let key = if options.footer {
-            with_footer(
-                base_keys[*state].clone(),
+            Rc::new(with_footer(
+                base_keys[*state].as_ref().clone(),
                 states[*state].footer_caption.as_deref(),
                 elapsed_ms,
-            )
+            ))
         } else {
             base_keys[*state].clone()
         };
@@ -865,8 +841,8 @@ fn render_video_frames(
 
 fn render_or_link(
     renderer: &render::PngRenderer,
-    rendered: &mut HashMap<(Frame, String), PathBuf>,
-    key: (Frame, String),
+    rendered: &mut HashMap<(Rc<Frame>, String), PathBuf>,
+    key: (Rc<Frame>, String),
     path: &Path,
     options: &render::Options,
     pixel_ratio: f32,
@@ -892,6 +868,15 @@ fn render_key(frame: &Frame, cols: u16, rows: u16, hide_cursor: bool) -> Frame {
         frame.cursor = None;
     }
     frame
+}
+
+fn recorded_size(resizes: &[(u64, u16, u16)], source_ms: f64) -> Option<(u16, u16)> {
+    // Preserve recording order, including older recordings with out-of-order timestamps.
+    resizes
+        .iter()
+        .rev()
+        .find(|(at_ms, _, _)| *at_ms as f64 <= source_ms)
+        .map(|(_, cols, rows)| (*cols, *rows))
 }
 
 fn with_footer(mut frame: Frame, caption: Option<&str>, elapsed_ms: u64) -> Frame {
@@ -1005,6 +990,80 @@ fn format_timecode(elapsed_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn edited_states(
+        states: &[VideoFrame],
+        entries: &[Entry],
+        edit: &VideoEdit,
+        placement: CaptionPlacement,
+    ) -> Result<Vec<VideoFrame>> {
+        let playback = Playback::new(entries, Some(edit), 0)?;
+        super::edited_states(states, &playback.clips, placement)
+    }
+
+    #[test]
+    fn resolved_clips_share_boundaries_rounding_and_holds() {
+        let entries = [
+            Entry::Marker {
+                at_ms: 100,
+                name: "from".into(),
+            },
+            Entry::Marker {
+                at_ms: 200,
+                name: "to".into(),
+            },
+        ];
+        let edit = VideoEdit {
+            clips: vec![
+                VideoEditClip {
+                    from: "from".into(),
+                    to: "from".into(),
+                    speed: None,
+                    hold_ms: None,
+                    caption: None,
+                },
+                VideoEditClip {
+                    from: "from".into(),
+                    to: "to".into(),
+                    speed: Some(1.5),
+                    hold_ms: Some(25),
+                    caption: None,
+                },
+            ],
+        };
+        let playback = Playback::new(&entries, Some(&edit), 0).unwrap();
+        let states = [100, 150, 200].map(|at_ms| VideoFrame {
+            at_ms,
+            frame: frame(&at_ms.to_string()),
+            footer_caption: None,
+        });
+        let edited =
+            super::edited_states(&states, &playback.clips, CaptionPlacement::Inline).unwrap();
+        assert_eq!(
+            edited.iter().map(|state| state.at_ms).collect::<Vec<_>>(),
+            [0, 0, 33, 66, 91]
+        );
+        assert_eq!(playback.source_time(0), (100.0, 200));
+        assert_eq!(playback.source_time(33), (149.5, 200));
+        assert_eq!(playback.source_time(66), (200.0, 200));
+        assert_eq!(playback.source_time(91), (200.0, 200));
+    }
+
+    #[test]
+    fn resize_lookup_preserves_recording_order_and_backward_seeks() {
+        let resizes = [(100, 80, 24), (200, 100, 30), (200, 120, 40), (150, 60, 20)];
+        assert_eq!(recorded_size(&[], 500.0), None);
+        for time in [0, 100, 200, 149, 150, 300, 99] {
+            let expected = resizes.iter().fold(None, |previous, (at, cols, rows)| {
+                if *at <= time {
+                    Some((*cols, *rows))
+                } else {
+                    previous
+                }
+            });
+            assert_eq!(recorded_size(&resizes, time as f64), expected);
+        }
+    }
 
     #[test]
     fn pointer_clock_tracks_off_grid_cuts_speed_holds_and_repeated_clips() {
@@ -1422,6 +1481,7 @@ mod tests {
         let renderer = render::PngRenderer::new();
         let options = render::Options::default();
         let mut rendered = HashMap::new();
+        let base = Rc::new(frame("ready"));
         let pointer = pointer::Track::new(
             &[Entry::Mouse {
                 at_ms: 1000,
@@ -1435,7 +1495,7 @@ mod tests {
                 &renderer,
                 &mut rendered,
                 (
-                    frame("ready"),
+                    Rc::clone(&base),
                     pointer.svg(at_ms, u64::MAX, 40, 1, &options),
                 ),
                 &directory.join(format!("{index}.png")),
@@ -1444,6 +1504,17 @@ mod tests {
             )
             .unwrap();
         }
+        assert_eq!(rendered.len(), 3);
+        assert!(rendered.keys().all(|(frame, _)| Rc::ptr_eq(frame, &base)));
+        render_or_link(
+            &renderer,
+            &mut rendered,
+            (Rc::new(frame("ready")), String::new()),
+            &directory.join("same-content.png"),
+            &options,
+            1.0,
+        )
+        .unwrap();
         assert_eq!(rendered.len(), 3);
         assert_eq!(
             fs::read(directory.join("0.png")).unwrap(),

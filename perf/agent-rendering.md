@@ -9,8 +9,8 @@ bun scripts/bench-performance.ts --mode all --runs 7 --out-dir /path/to/results
 ```
 
 The benchmark performs one warmup and seven measured runs per case; JSON Lines report medians,
-median absolute deviations, and raw samples. Use `--binary` to compare saved builds, and `--mode
-agent` or `--mode video` for individual experiments. Fixtures and isolated named sessions are
+median absolute deviations, and raw samples. Use `--binary` to compare saved builds, and
+`--mode agent` or `--mode video` for individual experiments. Fixtures and isolated named sessions are
 cleaned up; only synthetic videos remain when `--out-dir` is specified. `ffmpeg` is required.
 
 ## What is measured
@@ -31,9 +31,9 @@ part of these metrics. Results are machine/workload-specific, not performance gu
 
 1. **Named daemon wakeup:** replace the unconditional 10ms idle sleep with `poll` on the listener.
    Requests wake immediately; the same maximum idle interval still pumps PTY/semantic output.
-  Baseline: CLI show 14.29ms, CLI interaction 37.88ms (local macOS arm64).
-  The persistent-driver interaction is already 5.88ms; its worker's `recv_timeout` wakes for
-  requests, unlike the daemon's unconditional sleep. Do not replace that with busy polling.
+   Baseline: CLI show 14.29ms, CLI interaction 37.88ms (local macOS arm64).
+   The persistent-driver interaction is already 5.88ms; its worker's `recv_timeout` wakes for
+   requests, unlike the daemon's unconditional sleep. Do not replace that with busy polling.
    Retained: 15-run control/candidate comparison was 13.75 → 5.40ms for show and
    37.48 → 10.90ms for interaction (61% / 71% lower). All 23 session tests and clippy passed.
    The first 7-run candidate gave 4.59ms / 10.56ms; the result exceeds observed scheduling noise.
@@ -72,5 +72,8 @@ part of these metrics. Results are machine/workload-specific, not performance gu
 - Do not remove mouse capability checks or legacy daemon compatibility for one fewer round trip.
 - Inspect long-transcript screen reads separately: the named protocol still carries retained ANSI
   even for text-only consumers. A selective response needs an additive compatibility design.
+  A separate seven-run probe displaying only `READY` measured 3.92ms with no backlog versus
+  19.49ms after 1MiB of output had been cleared from the screen. This overhead remains; the current
+  changes do not claim to make screen-read cost independent of transcript size.
 - PNG intermediate files and ffmpeg encoding may dominate after raster reuse. Measure before
   changing the export pipeline or trading disk traffic for raw pixel pipe bandwidth.

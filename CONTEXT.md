@@ -16,6 +16,11 @@ A named terminal application that remains available across waiting, input, resiz
 
 An embedded session owns the same live terminal lifecycle in-process; the named CLI session commands are an adapter for interacting with that lifecycle across invocations.
 
+Named `show` reads are immediate; explicit readiness waits end when their text appears. Quiet-time
+settling and input pacing are separate, intentional policies—not mandatory delays between actions.
+The TypeScript client's stable captures retain a quiet-period default for snapshot tests; demos
+can wait for readiness and explicitly capture immediately.
+
 ### Driver
 
 A versioned JSON Lines stdin/stdout adapter over embedded sessions for external agent tooling and the TypeScript test client. A driver process can manage multiple isolated sessions without exposing terminal process details to its client. Its capture response includes the reason capture completed so test clients can distinguish settled screen state from deadline fallback, and can optionally include ANSI or rendered SVG failure evidence.

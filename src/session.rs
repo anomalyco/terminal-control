@@ -1574,11 +1574,28 @@ mod implementation {
                     }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
+                    wait_for_request(listener)?;
                 }
                 Err(error) => return Err(error).context("accept session request"),
             }
         }
+    }
+
+    fn wait_for_request(listener: &UnixListener) -> Result<()> {
+        let mut descriptor = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Wake immediately for control requests, but still pump output/semantics every 10ms.
+        let result = unsafe { libc::poll(&mut descriptor, 1, 10) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != ErrorKind::Interrupted {
+                return Err(error).context("wait for session request");
+            }
+        }
+        Ok(())
     }
 
     fn handle(
@@ -1709,6 +1726,25 @@ mod implementation {
             drop(held);
             assert!(StartLock::acquire(&path).is_ok());
             let _ = fs::remove_file(path);
+        }
+
+        #[test]
+        fn control_readiness_preserves_requests_and_times_out_for_output_pumping() {
+            let socket = std::env::temp_dir().join(format!("tc-poll-{}.sock", std::process::id()));
+            let listener = bind_listener(&socket).unwrap();
+            // An idle timeout must allow the daemon to return to pumping output.
+            wait_for_request(&listener).unwrap();
+            assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+            let mut client = UnixStream::connect(&socket).unwrap();
+            client.write_all(b"request").unwrap();
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            wait_for_request(&listener).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            peer.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"request");
+            drop(listener);
+            fs::remove_file(socket).unwrap();
         }
 
         #[test]

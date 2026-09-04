@@ -33,7 +33,7 @@ if (process.argv.includes("--fixture")) {
   } })
   const runs = Number(values.runs)
   if (!Number.isInteger(runs) || runs < 1) throw new Error("runs must be a positive integer")
-  if (!["all", "agent", "video"].includes(values.mode!)) throw new Error("mode must be all, agent, or video")
+  if (!["all", "agent", "video", "replay"].includes(values.mode!)) throw new Error("mode must be all, agent, video, or replay")
   const binary = resolve(values.binary!)
   const temp = await mkdtemp(join(tmpdir(), "tp-"))
   const output = values["out-dir"] ? resolve(values["out-dir"]) : temp
@@ -63,7 +63,8 @@ if (process.argv.includes("--fixture")) {
     return text
   }
   try {
-    if (values.mode !== "video") {
+    const bytes = (text: string) => Array.from(new TextEncoder().encode(text))
+    if (values.mode === "all" || values.mode === "agent") {
       await cli(["start", "p", "--", ...fixture])
       try {
         await cli(["wait", "p", "READY"])
@@ -100,8 +101,22 @@ if (process.argv.includes("--fixture")) {
         return { ms: performance.now() - start }
       })
     }
-    if (values.mode !== "agent") {
-      const bytes = (text: string) => Array.from(new TextEncoder().encode(text))
+    if (values.mode === "all" || values.mode === "replay") {
+      const entries = [
+        { type: "header", version: 2, cols: 80, rows: 24, cell_width: 9, cell_height: 18 },
+        { type: "output", at_ms: 0, bytes: bytes(screen) },
+        ...Array.from({ length: 1000 }, (_, i) => ({ type: "output", at_ms: i + 1,
+          bytes: bytes(`\x1b[24;1Hframe:${String(i).padStart(4, "0")}`) })),
+      ]
+      const recording = join(temp, "replay.termctrl")
+      await Bun.write(recording, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n")
+      await measure("recording_final_screen", async () => {
+        const start = performance.now()
+        if (!(await cli(["show", "--recording", recording])).includes("frame:0999")) throw new Error("incorrect replay")
+        return { ms: performance.now() - start }
+      })
+    }
+    if (values.mode === "all" || values.mode === "video") {
       const entries: object[] = [
         { type: "header", version: 2, cols: 80, rows: 24, cell_width: 9, cell_height: 18 },
         { type: "output", at_ms: 0, bytes: bytes(screen) },

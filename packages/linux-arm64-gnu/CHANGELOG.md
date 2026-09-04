@@ -1,5 +1,7 @@
 # @kitlangton/terminal-control-linux-arm64-gnu
 
+## 1.2.1
+
 ## 1.2.0
 
 ## 1.1.1

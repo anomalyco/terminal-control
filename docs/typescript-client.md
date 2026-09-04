@@ -96,6 +96,10 @@ await expect(session.screen.text()).resolves.toMatchInlineSnapshot()
 
 `session.writeArtifacts(name)` and failing `toHaveScreenText(...)` assertions can write `screen.txt`, `screen.json`, `screen.svg`, `logs.txt`, and `metadata.json`. Environment variable values are redacted in metadata. `transcript.ansi` and `recording.termctrl` are opt-in because terminal streams and typed input may contain secrets.
 
+`withArtifactsOnFailure` preserves the original failure if evidence capture itself fails, and
+prints a warning for the secondary artifact error. Direct `writeArtifacts` calls still reject
+when capture or writing fails.
+
 Wrap ordinary snapshot assertions when evidence should be saved on any thrown assertion:
 
 ```ts

@@ -1,9 +1,9 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test"
 import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
-import { IncompleteCaptureError, resolveTerminalControlBinary, TerminalControl } from "./index"
+import { IncompleteCaptureError, resolveTerminalControlBinary, Session, TerminalControl } from "./index"
 import { terminalControlMatchers } from "./vitest"
 
 const binaryPath = process.env.TERMCTRL_TEST_BINARY ?? resolve(import.meta.dir, "../../../target/debug/termctrl")
@@ -18,6 +18,27 @@ afterAll(async () => {
 })
 
 describe("isolated terminal sessions", () => {
+  test("failure artifacts cannot replace the original failure", async () => {
+    const original = new Error("original assertion")
+    const captureFailure = new Error("driver unavailable")
+    let requests = 0
+    const request = async () => { requests++; throw captureFailure }
+    const warning = spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      const session = new Session(request, "fixture", { directory: "unused" })
+      expect(await session.withArtifactsOnFailure("success", async () => 7)).toBe(7)
+      expect(requests).toBe(0)
+      await expect(session.withArtifactsOnFailure("failure", async () => { throw original })).rejects.toBe(original)
+      expect(requests).toBe(1)
+      expect(warning).toHaveBeenCalledWith("Terminal Control could not write failure artifacts:", captureFailure)
+      for (const artifacts of [false, { directory: "unused", onFailure: false }] as const) {
+        await expect(new Session(request, "disabled", artifacts).withArtifactsOnFailure("failure", async () => { throw original })).rejects.toBe(original)
+      }
+      expect(requests).toBe(1)
+    } finally {
+      warning.mockRestore()
+    }
+  })
   test("delivers hover, click and drag input with recorded evidence and resized bounds", async () => {
     await using session = await terminal.launch({
       command: [process.execPath, resolve(import.meta.dir, "../fixtures/mouse.ts")],
@@ -230,6 +251,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     const metadata = await readFile(join(directory, "screen-text", "metadata.json"), "utf8")
     expect(metadata).toContain('"API_TOKEN": "[redacted]"')
     expect(metadata).not.toContain("sensitive")
+    const original = new Error("original assertion")
+    await expect(session.withArtifactsOnFailure("original", async () => { throw original })).rejects.toBe(original)
+    expect(await readFile(join(directory, "original", "screen.txt"), "utf8")).toBe("evidence")
   })
 
   test("drives an alternate-screen terminal workflow and snapshots its selected view", async () => {

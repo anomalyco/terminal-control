@@ -1128,10 +1128,8 @@ mod implementation {
 
         #[test]
         fn named_semantic_request_enforces_one_absolute_response_deadline() {
-            let path = std::env::temp_dir().join(format!(
-                "termctrl-semantic-timeout-test-{}.sock",
-                std::process::id()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("tc-deadline-{}.sock", std::process::id()));
             let _ = fs::remove_file(&path);
             let listener = UnixListener::bind(&path).unwrap();
             let peer = thread::spawn(move || {

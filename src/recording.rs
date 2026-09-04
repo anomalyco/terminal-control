@@ -481,7 +481,10 @@ fn visible_states(states: &[VideoFrame], include_startup: bool) -> &[VideoFrame]
 }
 
 fn has_non_whitespace_text(frame: &Frame) -> bool {
-    frame.cells.iter().any(|cell| !cell.text.trim().is_empty())
+    frame
+        .cells
+        .iter()
+        .any(|cell| !cell.attributes.invisible && !cell.text.trim().is_empty())
 }
 
 #[derive(Deserialize)]
@@ -1619,6 +1622,27 @@ mod tests {
         ];
 
         assert_eq!(visible_states(&frames, false)[0].frame, painted);
+    }
+
+    #[test]
+    fn invisible_text_is_not_a_visible_startup_frame() {
+        let mut hidden = frame("hidden");
+        hidden.cells[0].attributes.invisible = true;
+        let frames = [
+            VideoFrame {
+                at_ms: 0,
+                frame: hidden,
+                footer_caption: None,
+            },
+            VideoFrame {
+                at_ms: 100,
+                frame: frame("ready"),
+                footer_caption: None,
+            },
+        ];
+        assert_eq!(visible_states(&frames, false)[0].at_ms, 100);
+        assert!(visible_states(&frames[..1], false).is_empty());
+        assert_eq!(visible_states(&frames, true).len(), 2);
     }
 
     #[test]

@@ -564,7 +564,13 @@ export class Session implements AsyncDisposable {
     try {
       return await run()
     } catch (error) {
-      if (this.shouldWriteFailureArtifacts()) await this.writeArtifacts(name)
+      if (this.shouldWriteFailureArtifacts()) {
+        try {
+          await this.writeArtifacts(name)
+        } catch (artifactError) {
+          console.warn("Terminal Control could not write failure artifacts:", artifactError)
+        }
+      }
       throw error
     }
   }

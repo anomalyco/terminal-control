@@ -702,6 +702,10 @@ fn take_color_queries(probe: &mut Vec<u8>) -> Vec<ColorQuery> {
             2
         } else if probe[index] == 0x9d {
             1
+        } else if probe[index] == 0x1b && index + 1 == probe.len() {
+            // The next chunk may complete an OSC prefix. Keep only its leading ESC.
+            probe.drain(..index);
+            return queries;
         } else {
             index += 1;
             continue;
@@ -771,6 +775,59 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     struct Writer(Arc<Mutex<Vec<u8>>>);
+
+    #[test]
+    fn color_queries_survive_every_chunk_boundary_and_byte_at_a_time() {
+        for prefix in [b"\x1b]".as_slice(), b"\x9d"] {
+            for terminator in [b"\x07".as_slice(), b"\x1b\\", b"\x9c"] {
+                for (content, selectors) in [
+                    ("10;?", vec![("10", crate::frame::DEFAULT_FOREGROUND)]),
+                    ("11;?", vec![("11", crate::frame::DEFAULT_BACKGROUND)]),
+                    (
+                        "4;1;?;2;?",
+                        vec![("4;1", indexed_color(1)), ("4;2", indexed_color(2))],
+                    ),
+                ] {
+                    let query = [prefix, content.as_bytes(), terminator].concat();
+                    let mut expected = Vec::new();
+                    for (selector, color) in selectors {
+                        append_color_response(&mut expected, selector, color);
+                    }
+                    for split in 0..=query.len() {
+                        let writes = Arc::new(Mutex::new(Vec::new()));
+                        let mut host = Host::new(
+                            Box::new(Writer(Arc::clone(&writes))),
+                            &Options {
+                                opentui_host: true,
+                                ..Options::default()
+                            },
+                        );
+                        let mut terminal = TerminalCore::new(2, 20, 0).unwrap();
+                        let mut replies =
+                            respond_to_output(&mut terminal, &mut host, &query[..split]).unwrap();
+                        replies.extend(
+                            respond_to_output(&mut terminal, &mut host, &query[split..]).unwrap(),
+                        );
+                        assert_eq!(replies, expected, "query {query:?}, split {split}");
+                        assert_eq!(*writes.lock().unwrap(), expected);
+                    }
+                    let writes = Arc::new(Mutex::new(Vec::new()));
+                    let mut host = Host::new(
+                        Box::new(Writer(Arc::clone(&writes))),
+                        &Options {
+                            opentui_host: true,
+                            ..Options::default()
+                        },
+                    );
+                    let mut terminal = TerminalCore::new(2, 20, 0).unwrap();
+                    for byte in &query {
+                        respond_to_output(&mut terminal, &mut host, &[*byte]).unwrap();
+                    }
+                    assert_eq!(*writes.lock().unwrap(), expected);
+                }
+            }
+        }
+    }
 
     impl Write for Writer {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {

@@ -116,7 +116,7 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
     if let Some(cwd) = cwd {
         builder.cwd(cwd);
     }
-    let mut reader = pair.master.try_clone_reader().context("open PTY reader")?;
+    let reader = pair.master.try_clone_reader().context("open PTY reader")?;
     let writer = pair.master.take_writer().context("open PTY writer")?;
     let mut child = pair
         .slave
@@ -126,21 +126,7 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
     #[cfg(unix)]
     let process_group = child.process_id().and_then(|pid| i32::try_from(pid).ok());
     let (send, receive) = mpsc::sync_channel::<Option<Vec<u8>>>(32);
-    let _reader_thread = thread::spawn(move || {
-        let mut buffer = [0_u8; 16 * 1024];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(len) => {
-                    if send.send(Some(buffer[..len].to_vec())).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = send.send(None);
-    });
+    spawn_output_reader(reader, send);
     let result = (|| {
         let mut terminal = TerminalCore::new(options.rows, options.cols, 0)?;
         let mut ansi = Vec::new();
@@ -246,8 +232,8 @@ pub fn from_pipe_command(
     let stdout = child.stdout.take().context("open command stdout")?;
     let stderr = child.stderr.take().context("open command stderr")?;
     let (send, receive) = mpsc::sync_channel::<Option<Vec<u8>>>(32);
-    spawn_pipe_reader(stdout, send.clone());
-    spawn_pipe_reader(stderr, send);
+    spawn_output_reader(stdout, send.clone());
+    spawn_output_reader(stderr, send);
 
     let result = (|| {
         let mut terminal = TerminalCore::new(options.rows, options.cols, 0)?;
@@ -305,7 +291,7 @@ pub fn from_pipe_command(
     result
 }
 
-fn spawn_pipe_reader(
+fn spawn_output_reader(
     mut reader: impl Read + Send + 'static,
     send: mpsc::SyncSender<Option<Vec<u8>>>,
 ) {
@@ -716,6 +702,10 @@ fn take_color_queries(probe: &mut Vec<u8>) -> Vec<ColorQuery> {
             2
         } else if probe[index] == 0x9d {
             1
+        } else if probe[index] == 0x1b && index + 1 == probe.len() {
+            // The next chunk may complete an OSC prefix. Keep only its leading ESC.
+            probe.drain(..index);
+            return queries;
         } else {
             index += 1;
             continue;
@@ -785,6 +775,59 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     struct Writer(Arc<Mutex<Vec<u8>>>);
+
+    #[test]
+    fn color_queries_survive_every_chunk_boundary_and_byte_at_a_time() {
+        for prefix in [b"\x1b]".as_slice(), b"\x9d"] {
+            for terminator in [b"\x07".as_slice(), b"\x1b\\", b"\x9c"] {
+                for (content, selectors) in [
+                    ("10;?", vec![("10", crate::frame::DEFAULT_FOREGROUND)]),
+                    ("11;?", vec![("11", crate::frame::DEFAULT_BACKGROUND)]),
+                    (
+                        "4;1;?;2;?",
+                        vec![("4;1", indexed_color(1)), ("4;2", indexed_color(2))],
+                    ),
+                ] {
+                    let query = [prefix, content.as_bytes(), terminator].concat();
+                    let mut expected = Vec::new();
+                    for (selector, color) in selectors {
+                        append_color_response(&mut expected, selector, color);
+                    }
+                    for split in 0..=query.len() {
+                        let writes = Arc::new(Mutex::new(Vec::new()));
+                        let mut host = Host::new(
+                            Box::new(Writer(Arc::clone(&writes))),
+                            &Options {
+                                opentui_host: true,
+                                ..Options::default()
+                            },
+                        );
+                        let mut terminal = TerminalCore::new(2, 20, 0).unwrap();
+                        let mut replies =
+                            respond_to_output(&mut terminal, &mut host, &query[..split]).unwrap();
+                        replies.extend(
+                            respond_to_output(&mut terminal, &mut host, &query[split..]).unwrap(),
+                        );
+                        assert_eq!(replies, expected, "query {query:?}, split {split}");
+                        assert_eq!(*writes.lock().unwrap(), expected);
+                    }
+                    let writes = Arc::new(Mutex::new(Vec::new()));
+                    let mut host = Host::new(
+                        Box::new(Writer(Arc::clone(&writes))),
+                        &Options {
+                            opentui_host: true,
+                            ..Options::default()
+                        },
+                    );
+                    let mut terminal = TerminalCore::new(2, 20, 0).unwrap();
+                    for byte in &query {
+                        respond_to_output(&mut terminal, &mut host, &[*byte]).unwrap();
+                    }
+                    assert_eq!(*writes.lock().unwrap(), expected);
+                }
+            }
+        }
+    }
 
     impl Write for Writer {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {

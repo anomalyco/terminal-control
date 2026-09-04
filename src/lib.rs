@@ -11,7 +11,9 @@
 
 pub mod driver;
 pub mod frame;
+mod input;
 pub mod mcp;
+pub mod mouse;
 pub mod recording;
 pub mod render;
 mod runtime;

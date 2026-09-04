@@ -26,6 +26,11 @@ bypass the package-set checks or publish package formats at different versions.
 
 ## Validate The Release
 
+`bun run validate:opentui` packs the current adapter into a temporary directory and checks its
+public exports from clean consumers against OpenTUI 0.4.1 and 0.4.5. It rejects version mismatch
+without rewriting manifests or attempting publication. To check an already assembled artifact,
+pass its directory: `bun run validate:opentui npm-artifacts`.
+
 Run the complete local validation from `AGENTS.md`, followed by the publishable crate checks:
 
 ```bash

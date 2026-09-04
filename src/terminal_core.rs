@@ -26,6 +26,74 @@ pub(crate) struct TerminalCore {
 }
 
 impl TerminalCore {
+    pub(crate) fn mouse_bytes(
+        &self,
+        input: crate::mouse::MouseEvent,
+        held: Option<crate::mouse::Button>,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+    ) -> Result<Vec<u8>> {
+        use crate::mouse::Action;
+        use libghostty_vt::{key::Mods, mouse};
+        let width = u32::from(cell_width.max(1));
+        let height = u32::from(cell_height.max(1));
+        let mut encoder = mouse::Encoder::new()?;
+        encoder
+            .set_options_from_terminal(&self.terminal)
+            .set_any_button_pressed(held.is_some())
+            .set_size(mouse::EncoderSize {
+                screen_width: u32::from(cols) * width,
+                screen_height: u32::from(rows) * height,
+                cell_width: width,
+                cell_height: height,
+                padding_top: 0,
+                padding_bottom: 0,
+                padding_left: 0,
+                padding_right: 0,
+            });
+        let mut event = mouse::Event::new()?;
+        let mut mods = Mods::empty();
+        if input.shift {
+            mods |= Mods::SHIFT;
+        }
+        if input.alt {
+            mods |= Mods::ALT;
+        }
+        if input.ctrl {
+            mods |= Mods::CTRL;
+        }
+        event
+            .set_mods(mods)
+            .set_position(mouse::Position {
+                x: (f32::from(input.x) + 0.5) * width as f32,
+                y: (f32::from(input.y) + 0.5) * height as f32,
+            })
+            .set_button(if input.action == Action::Move {
+                held.map(Into::into)
+            } else {
+                Some(input.button.into())
+            });
+        event.set_action(match input.action {
+            Action::Move => mouse::Action::Motion,
+            Action::Up => mouse::Action::Release,
+            Action::Down | Action::Click => mouse::Action::Press,
+        });
+        let mut bytes = Vec::new();
+        encoder.encode_to_vec(&event, &mut bytes)?;
+        if input.action == Action::Click && !bytes.is_empty() {
+            event.set_action(mouse::Action::Release);
+            encoder.encode_to_vec(&event, &mut bytes)?;
+        }
+        if bytes.is_empty() {
+            anyhow::bail!(
+                "application has not enabled mouse reporting for this action; hover requires any-event tracking (DECSET 1003)"
+            );
+        }
+        Ok(bytes)
+    }
+
     pub(crate) fn new(rows: u16, cols: u16, max_scrollback: usize) -> Result<Self> {
         let responses = Rc::new(RefCell::new(Vec::new()));
         let mut terminal = Terminal::new(TerminalOptions {
@@ -293,6 +361,48 @@ fn frame_cursor_style(style: CursorVisualStyle) -> CursorStyle {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mouse_encoding_obeys_negotiated_modes_geometry_and_modifiers() {
+        use crate::mouse::{Action, Button, MouseEvent};
+        let mut terminal = super::TerminalCore::new(10, 40, 0).unwrap();
+        let event = MouseEvent::new(Action::Move, 4, 2);
+        assert!(terminal.mouse_bytes(event, None, 40, 10, 9, 18).is_err());
+        terminal.apply_output(b"\x1b[?1000h\x1b[?1006h");
+        assert!(terminal.mouse_bytes(event, None, 40, 10, 9, 18).is_err());
+        let click = MouseEvent::new(Action::Click, 4, 2);
+        assert_eq!(
+            terminal.mouse_bytes(click, None, 40, 10, 9, 18).unwrap(),
+            b"\x1b[<0;5;3M\x1b[<0;5;3m"
+        );
+        terminal.apply_output(b"\x1b[?1003h");
+        assert_eq!(
+            terminal.mouse_bytes(event, None, 40, 10, 9, 18).unwrap(),
+            b"\x1b[<35;5;3M"
+        );
+        assert_eq!(
+            terminal
+                .mouse_bytes(event, Some(Button::Left), 40, 10, 9, 18)
+                .unwrap(),
+            b"\x1b[<32;5;3M"
+        );
+        let modified = MouseEvent {
+            shift: true,
+            alt: true,
+            ctrl: true,
+            button: Button::Right,
+            ..click
+        };
+        assert_eq!(
+            terminal.mouse_bytes(modified, None, 40, 10, 9, 18).unwrap(),
+            b"\x1b[<30;5;3M\x1b[<30;5;3m"
+        );
+        terminal.apply_output(b"\x1b[?1016h");
+        assert_eq!(
+            terminal.mouse_bytes(click, None, 40, 10, 10, 20).unwrap(),
+            b"\x1b[<0;45;50M\x1b[<0;45;50m"
+        );
+    }
+
     use super::TerminalCore;
     use crate::frame::{CursorStyle, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, indexed_color};
 

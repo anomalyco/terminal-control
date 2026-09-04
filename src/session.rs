@@ -18,6 +18,7 @@ const OUTPUT_QUEUE: usize = 64;
 const OUTPUT_BATCH: usize = OUTPUT_QUEUE;
 const OUTPUT_CHUNK: usize = 1024;
 const SEMANTIC_PROTOCOL_VERSION: u8 = 6;
+const MOUSE_PROTOCOL_VERSION: u8 = 7;
 
 struct Output {
     at_ms: u64,
@@ -39,7 +40,6 @@ pub struct Session {
     ansi: Vec<u8>,
     host: Host,
     receive: Receiver<Option<Output>>,
-    max_bytes: usize,
     ansi_truncated: bool,
     output_closed: bool,
     stopped: bool,
@@ -53,6 +53,7 @@ pub struct Session {
     launch: SessionLaunch,
     mirror: Option<Box<dyn Write + Send>>,
     semantic: Option<semantic::Host>,
+    mouse_button: Option<crate::mouse::Button>,
 }
 
 /// Lifecycle state of a running or completed session.
@@ -233,9 +234,7 @@ impl Session {
         if command.is_empty() {
             bail!("provide a command after --");
         }
-        if options.cols == 0 || options.rows == 0 {
-            bail!("terminal dimensions must be greater than zero");
-        }
+        shot::validate_geometry(options.rows, options.cols)?;
         let cwd = match cwd {
             Some(cwd) if cwd.is_absolute() => cwd.to_owned(),
             Some(cwd) => std::env::current_dir()
@@ -325,7 +324,6 @@ impl Session {
             ansi: Vec::new(),
             host: Host::new(writer, &host_options),
             receive,
-            max_bytes: options.max_bytes,
             ansi_truncated: false,
             output_closed: false,
             stopped: false,
@@ -350,12 +348,58 @@ impl Session {
             },
             mirror: None,
             semantic,
+            mouse_button: None,
         })
     }
 
     /// Mirror subsequent PTY output to another terminal-facing writer.
     pub fn mirror_to(&mut self, writer: impl Write + Send + 'static) {
         self.mirror = Some(Box::new(writer));
+    }
+
+    /// Send typed mouse input using the application's active reporting mode.
+    pub fn mouse(&mut self, event: crate::mouse::MouseEvent) -> Result<()> {
+        use crate::mouse::Action;
+        self.consume_batch()?;
+        if self.has_exited()? || self.stopped {
+            bail!("session command has exited");
+        }
+        if event.x >= self.cols || event.y >= self.rows {
+            bail!(
+                "mouse position ({}, {}) is outside {}x{} viewport (zero-based cells)",
+                event.x,
+                event.y,
+                self.cols,
+                self.rows
+            );
+        }
+        match event.action {
+            Action::Down | Action::Click if self.mouse_button.is_some() => {
+                bail!("release the held mouse button before another down or click")
+            }
+            Action::Up if self.mouse_button != Some(event.button) => {
+                bail!("mouse up must match the held button")
+            }
+            _ => {}
+        }
+        let bytes = self.terminal.mouse_bytes(
+            event,
+            self.mouse_button,
+            self.cols,
+            self.rows,
+            self.cell_width,
+            self.cell_height,
+        )?;
+        self.host.send(&bytes)?;
+        match event.action {
+            Action::Down => self.mouse_button = Some(event.button),
+            Action::Up => self.mouse_button = None,
+            _ => {}
+        }
+        if let Some(recording) = &mut self.recording {
+            recording.mouse(event, bytes)?;
+        }
+        Ok(())
     }
 
     /// Send one input burst to the terminal application.
@@ -549,9 +593,7 @@ impl Session {
         cell_width: u16,
         cell_height: u16,
     ) -> Result<()> {
-        if cols == 0 || rows == 0 {
-            bail!("terminal dimensions must be greater than zero");
-        }
+        shot::validate_geometry(rows, cols)?;
         if (cols, rows, cell_width, cell_height)
             == (self.cols, self.rows, self.cell_width, self.cell_height)
         {
@@ -716,7 +758,7 @@ impl Session {
         retain_recent(
             &mut self.ansi,
             &output.bytes,
-            self.max_bytes,
+            self.launch.max_bytes,
             &mut self.ansi_truncated,
         );
         self.last_output = Some(Instant::now());
@@ -757,6 +799,7 @@ impl Drop for Session {
 enum Request {
     Ping,
     Status,
+    Mouse(crate::mouse::MouseEvent),
     Wait {
         text: String,
         timeout_ms: u64,
@@ -802,7 +845,7 @@ struct Response {
 impl Default for Response {
     fn default() -> Self {
         Self {
-            protocol_version: SEMANTIC_PROTOCOL_VERSION,
+            protocol_version: MOUSE_PROTOCOL_VERSION,
             error: None,
             captured: None,
             status: None,
@@ -878,6 +921,15 @@ pub fn send(name: &str, input: Vec<Vec<u8>>, pace: Duration) -> Result<()> {
             pace_ms: pace.as_millis() as u64,
         },
     )?;
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn mouse(name: &str, event: crate::mouse::MouseEvent) -> Result<()> {
+    if request(name, Request::Ping)?.protocol_version < MOUSE_PROTOCOL_VERSION {
+        bail!("running session predates mouse input; restart it with the current termctrl");
+    }
+    request(name, Request::Mouse(event))?;
     Ok(())
 }
 
@@ -1476,13 +1528,7 @@ mod implementation {
     }
 
     fn ensure_socket_path(path: &Path) -> Result<()> {
-        if path.as_os_str().as_encoded_bytes().len() >= 100 {
-            bail!(
-                "session socket path is too long for portable Unix sockets: {}; set TERMCTRL_RUNTIME_DIR to a shorter directory",
-                path.display()
-            );
-        }
-        Ok(())
+        crate::runtime::ensure_socket_path(path, "session socket")
     }
 
     fn remove_stale_socket(name: &str, socket: &Path) -> Result<()> {
@@ -1592,6 +1638,7 @@ mod implementation {
         match request {
             Request::Ping => {}
             Request::Status => response.status = Some(session.status()?),
+            Request::Mouse(event) => session.mouse(event)?,
             Request::Send { input, pace_ms } => {
                 session.send_all(&input, Duration::from_millis(pace_ms))?;
             }
@@ -1772,6 +1819,19 @@ mod implementation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transcript_retention_preserves_zero_exact_and_overflow_limits() {
+        for (limit, expected, expected_truncated) in
+            [(0, "", true), (3, "abc", false), (2, "bc", true)]
+        {
+            let mut bytes = Vec::new();
+            let mut truncated = false;
+            super::retain_recent(&mut bytes, b"abc", limit, &mut truncated);
+            assert_eq!(bytes, expected.as_bytes());
+            assert_eq!(truncated, expected_truncated);
+        }
+    }
+
     use super::*;
 
     fn listed_session(name: &str, state: SessionState, cwd: &str) -> NamedSessionStatus {
@@ -1851,10 +1911,7 @@ mod tests {
                 deadline_unix_ms: 1
             }
         ));
-        assert_eq!(
-            Response::default().protocol_version,
-            SEMANTIC_PROTOCOL_VERSION
-        );
+        assert_eq!(Response::default().protocol_version, MOUSE_PROTOCOL_VERSION);
     }
 
     #[cfg(unix)]
@@ -2145,6 +2202,33 @@ mod tests {
                 .to_string()
                 .contains("provide a command after --")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_checks_old_daemon_capability_before_sending_input() {
+        use crate::mouse::{Action, MouseEvent};
+        use std::os::unix::net::UnixListener;
+        let name = format!("mouse-old-{}", std::process::id());
+        let path = socket_path(&name).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Request = serde_json::from_reader(&stream).unwrap();
+            assert!(matches!(request, Request::Ping));
+            serde_json::to_writer(
+                &mut stream,
+                &Response {
+                    protocol_version: SEMANTIC_PROTOCOL_VERSION,
+                    ..Response::default()
+                },
+            )
+            .unwrap();
+        });
+        let error = mouse(&name, MouseEvent::new(Action::Click, 0, 0)).unwrap_err();
+        server.join().unwrap();
+        fs::remove_file(path).unwrap();
+        assert!(error.to_string().contains("restart"));
     }
 
     #[cfg(unix)]

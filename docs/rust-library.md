@@ -35,6 +35,13 @@ session.stop()?;
 
 `session::Session` is the embedded lifecycle interface; the flat named-session CLI commands and the external driver are adapters over the same implementation.
 
+Use `session.mouse(MouseEvent::new(Action::Move, 12, 4))` to hover and `Action::Click` to click,
+with types from `terminal_control::mouse`. Coordinates are zero-based cells; `Down`/`Move`/`Up`
+form a drag. Reporting follows the application's negotiated protocol and fails if disabled.
+Set `recording::VideoOptions::pointer_overlay` to `Some(PointerOptions::default())` to visualize
+typed mouse input at export, or use `PointerOptions { reduced_motion: true }` for fades only.
+The overlay does not modify `Frame` or screen captures.
+
 To request optional application semantics, enable the OpenTUI host profile before launch and read
 the provider with the same embedded session:
 
@@ -58,5 +65,6 @@ No connected provider returns `termctrl-semantic-snapshot-v1` with an empty `nod
 ## Versioned Structured Output
 
 - A `save --format json` capture is a `Frame` object with `version: 2`, described by `schemas/frame-v2.schema.json`.
-- A `.termctrl` recording is JSON Lines: its first line is a versioned header and subsequent lines are timed output, input, resize, or marker entries, each described by `schemas/recording-entry-v1.schema.json`.
+- A `.termctrl` recording is JSON Lines: its first line is a version-2 header and subsequent lines are timed output, input, mouse, resize, or marker entries, described by `schemas/recording-entry-v2.schema.json`. Current readers also accept version 1 (`schemas/recording-entry-v1.schema.json`). Older binaries cannot read v2 recordings.
+- A `mouse` entry contains `at_ms`, the typed `event`, and delivered `bytes`. It is client input, not output, and replay never feeds it into the terminal emulator. Mouse timestamps must be nondecreasing.
 - Recording byte arrays contain the original terminal or input bytes as integers from `0` to `255`; recordings can contain sensitive text or input.

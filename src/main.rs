@@ -107,6 +107,12 @@ input, and markers until the session is closed. Video export requires `ffmpeg` t
 Pass `--footer` to add a bottom row with the clip caption, elapsed timecode, and TERMINAL CONTROL
 branding; without it, edit-plan captions render as inline annotation rows.
 
+Pass `--pointer-overlay` to visualize typed `termctrl mouse` input with an animated arrow.
+Pointer exports default to 60 fps (otherwise 20); `--fps` overrides either. Travel arrives at the
+input instant, presses compress subtly, and idle pointers fade. `--pointer-reduced-motion` keeps
+fades without travel or scaling. No animation changes real input timing. Raw bytes and forwarded
+human input are not inferred as mouse events. `--hide-cursor` hides only the text cursor.
+
 Example:
   termctrl start demo --record captures/demo.termctrl -- opencode
   termctrl mark demo before-connect
@@ -173,6 +179,8 @@ enum Command {
     /// Send ordered input to a named session.
     #[command(after_help = SEND_HELP)]
     Send(SendArgs),
+    /// Send mouse input in zero-based cells; move hovers, down/move/up drags.
+    Mouse(MouseArgs),
     /// Inspect lifecycle state and launch settings of a named session.
     Status(StatusArgs),
     /// List named local sessions and their states.
@@ -203,6 +211,40 @@ enum Command {
     Mcp,
     #[command(name = "__serve", hide = true)]
     Serve(ServeArgs),
+}
+
+#[derive(Args)]
+struct MouseArgs {
+    name: String,
+    #[arg(value_enum)]
+    action: MouseAction,
+    /// Zero-based terminal column.
+    x: u16,
+    /// Zero-based terminal row.
+    y: u16,
+    #[arg(long, value_enum, default_value = "left")]
+    button: MouseButton,
+    #[arg(long)]
+    shift: bool,
+    #[arg(long)]
+    alt: bool,
+    #[arg(long)]
+    ctrl: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum MouseAction {
+    Move,
+    Down,
+    Up,
+    Click,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum MouseButton {
+    Left,
+    Middle,
+    Right,
 }
 
 #[derive(Args)]
@@ -576,6 +618,12 @@ struct ServeArgs {
 
 #[derive(Args)]
 struct VideoArgs {
+    /// Animate recorded typed mouse input (off by default; does not change input timing).
+    #[arg(long)]
+    pointer_overlay: bool,
+    /// Keep pointer fades but disable travel and press scaling.
+    #[arg(long, requires = "pointer_overlay")]
+    pointer_reduced_motion: bool,
     /// Recording created by `termctrl start --record`.
     input: PathBuf,
     /// Override the recorded terminal cell width in rendered pixels.
@@ -605,9 +653,9 @@ struct VideoArgs {
     /// Add a bottom footer with clip caption, elapsed timecode, and TERMINAL CONTROL branding.
     #[arg(long)]
     footer: bool,
-    /// Maximum sampled frames per second (1 to 1000).
-    #[arg(long, default_value_t = 20)]
-    fps: u32,
+    /// Maximum sampled frames per second (1 to 1000; default: 60 with pointer, otherwise 20).
+    #[arg(long)]
+    fps: Option<u32>,
     /// Marker-based JSON edit plan with clips, captions, speeds, and holds.
     #[arg(long)]
     edit: Option<PathBuf>,
@@ -674,6 +722,30 @@ fn main() -> Result<()> {
             session::wait(&args.name, args.text, Duration::from_millis(args.timeout))?;
         }
         Command::Send(args) => send(args)?,
+        Command::Mouse(args) => {
+            use terminal_control::mouse::{Action, Button, MouseEvent};
+            session::mouse(
+                &args.name,
+                MouseEvent {
+                    action: match args.action {
+                        MouseAction::Move => Action::Move,
+                        MouseAction::Down => Action::Down,
+                        MouseAction::Up => Action::Up,
+                        MouseAction::Click => Action::Click,
+                    },
+                    x: args.x,
+                    y: args.y,
+                    button: match args.button {
+                        MouseButton::Left => Button::Left,
+                        MouseButton::Middle => Button::Middle,
+                        MouseButton::Right => Button::Right,
+                    },
+                    shift: args.shift,
+                    alt: args.alt,
+                    ctrl: args.ctrl,
+                },
+            )?;
+        }
         Command::Status(args) => status(args)?,
         Command::List(args) => list(args)?,
         Command::Prune(args) => prune(args)?,
@@ -707,8 +779,13 @@ fn main() -> Result<()> {
                     font_family: args.font_family,
                     pixel_ratio: args.pixel_ratio,
                     hide_cursor: args.hide_cursor,
+                    pointer_overlay: args.pointer_overlay.then_some(recording::PointerOptions {
+                        reduced_motion: args.pointer_reduced_motion,
+                    }),
                     footer: args.footer,
-                    fps: args.fps,
+                    fps: args
+                        .fps
+                        .unwrap_or(if args.pointer_overlay { 60 } else { 20 }),
                     tail: Duration::from_millis(args.tail_ms),
                     include_startup: args.include_startup,
                     edit: args.edit,
@@ -1340,6 +1417,43 @@ fn rendered_svg(captured: &shot_engine::Shot, args: &RenderArgs) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mouse_and_pointer_options_are_explicit_and_typed() {
+        use super::*;
+        let cli = Cli::try_parse_from(["termctrl", "video", "demo.termctrl"]).unwrap();
+        let Command::Video(args) = cli.command else {
+            panic!("video")
+        };
+        assert!(!args.pointer_overlay);
+        assert!(
+            Cli::try_parse_from([
+                "termctrl",
+                "video",
+                "demo.termctrl",
+                "--pointer-reduced-motion"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "termctrl",
+                "video",
+                "demo.termctrl",
+                "--pointer-overlay",
+                "--pointer-reduced-motion"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "termctrl", "mouse", "demo", "click", "12", "4", "--button", "right", "--ctrl"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["termctrl", "mouse", "demo", "click", "-1", "4"]).is_err());
+        assert!(Cli::try_parse_from(["termctrl", "mouse", "demo", "hover", "12", "4"]).is_err());
+    }
+
     use super::*;
 
     #[test]

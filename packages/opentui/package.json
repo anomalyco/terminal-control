@@ -31,9 +31,7 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "test": "bun test src/index.test.ts",
     "typecheck": "tsc --noEmit",
-    "prepack": "npm run build",
-    "release": "node script/release.mjs",
-    "release:check": "node script/release.mjs --check"
+    "prepack": "npm run build"
   },
   "peerDependencies": {
     "@opentui/core": ">=0.4.1 <0.5.0"

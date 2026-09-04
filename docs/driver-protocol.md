@@ -6,7 +6,7 @@ External agent tooling can keep multiple embedded sessions alive through a versi
 termctrl driver
 ```
 
-The driver writes a `hello` message with protocol and Terminal Control versions, then accepts typed operations: `launch`, `status`, `send`, `waitForText`, `waitForIdle`, `waitForExit`, `capture`, `logs`, `recording`, `resize`, `stop`, and `shutdown`. It is intended for clients such as the TypeScript test client, while the shell-facing flat commands remain convenient for individual workflows.
+The driver writes a `hello` message with protocol and Terminal Control versions, then accepts typed operations: `launch`, `status`, `send`, `mouse`, `waitForText`, `waitForIdle`, `waitForExit`, `capture`, `logs`, `recording`, `resize`, `stop`, and `shutdown`. It is intended for clients such as the TypeScript test client, while the shell-facing flat commands remain convenient for individual workflows.
 
 Each request has a numeric `id`, a `method`, optional `params`, and a `sessionId` for every method
 except `shutdown`. Each line receives exactly one response or error with the same `id`:
@@ -24,7 +24,7 @@ increment `protocolVersion`; clients reject unsupported versions rather than gue
 ## Example Requests
 
 ```json
-{"type":"hello","protocolVersion":2,"terminalControlVersion":"<installed-version>"}
+{"type":"hello","protocolVersion":2,"terminalControlVersion":"<installed-version>","capabilities":["mouse"]}
 {"id":1,"method":"launch","sessionId":"app","params":{"command":["my-terminal-app"],"cols":100,"rows":30,"inheritEnv":false,"env":{"TERM":"xterm-256color"}}}
 {"id":2,"method":"waitForText","sessionId":"app","params":{"text":"Ready","timeoutMs":5000}}
 {"id":3,"method":"send","sessionId":"app","params":{"input":[{"type":"text","value":"help"},{"type":"key","value":"enter"}]}}
@@ -44,3 +44,23 @@ Raw ANSI is omitted by default; request `includeAnsi: true` for retained transcr
 ## Input Semantics
 
 Driver input is intentionally exact: text, raw bytes, known key values, and single-letter control input are supported without claiming unimplemented key chords.
+
+`mouse` is an additive capability in protocol 2. Absent `hello.capabilities` means no advertised
+capabilities; clients must check for `"mouse"` before using it, and request a binary update and
+driver restart if absent. Existing request shapes are unchanged.
+
+```json
+{"id":5,"method":"mouse","sessionId":"app","params":{"action":"move","x":12,"y":4}}
+{"id":6,"method":"mouse","sessionId":"app","params":{"action":"click","x":12,"y":4,"button":"right","shift":true}}
+```
+
+Actions are `move`, `down`, `up`, `click`. Coordinates are integer zero-based cells within the
+current viewport. `button` defaults to `left` (`middle` and `right` also supported); `shift`, `alt`,
+and `ctrl` default to false. A move uses the session's currently held button. Only one button may
+be held; up must match it, and another down/click requires releasing it first. Ghostty respects
+negotiated reporting and encoding, including pixel coordinates. Disabled reporting, unsupported
+hover, invalid coordinates, and exited sessions fail without sending input. Success returns null.
+
+Typed mouse input is retained as a format-v2 `mouse` recording entry, including actual bytes;
+there is no duplicate `input` entry. The video pointer overlay is a later export choice, not a
+driver input option. Ordinary raw byte input is never inferred to be mouse input.

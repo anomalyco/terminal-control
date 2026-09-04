@@ -47,7 +47,7 @@ filters for bounded server-side discovery.
 | MCP task | Tools |
 | --- | --- |
 | Discover | `list_sessions`, `get_session_status` |
-| Observe and drive | `get_screen`, `save_screen`, `send_input`, `interact`, `resize_session` |
+| Observe and drive | `get_screen`, `save_screen`, `send_input`, `send_mouse`, `interact`, `resize_session` |
 | End processes | `stop_session` |
 
 Then ask for terminal work in ordinary language:
@@ -110,6 +110,7 @@ termctrl stop demo
 ```
 
 - `send` accepts `text:<value>`, named keys (`enter`, `escape`, arrows, `tab`, `shift-tab`, `backspace`, `delete`, `home`, `end`, `page-up`, `page-down`), and `ctrl-a` through `ctrl-z`. Pipe exact bytes with `--stdin`.
+- `mouse demo move 12 4` hovers at zero-based column 12, row 4; `mouse demo click 12 4` clicks. Use `down`, `move`, then `up` to drag; `--button right`, `--shift`, `--alt`, and `--ctrl` are supported. The app must enable mouse reporting (hover needs any-event tracking).
 - `wait` blocks until text is visible; use it instead of sleeping. It defaults to five seconds.
 - `status` reports running/exited state, command, cwd, viewport, and recording path. `list` shows running sessions; use `--state`, `--command`, or `--cwd` to filter discovery, and `--all` to include every retained or unavailable entry.
 - `prune --dry-run` previews retained exited sessions and stale sockets; `prune` removes them without deleting recording artifacts.
@@ -192,6 +193,29 @@ An edit plan selects marker ranges with per-clip speed, captions, and optional e
 ```
 
 Without `--edit`, export preserves recorded timing. `--footer` renders captions, timecode, and branding in a bottom bar. `--tail-ms 0` removes the default one-second final hold. Keep speeds low enough for text to stay readable.
+
+### Show Mouse Interactions
+
+Mouse visualization is opt-in at export, independent of the terminal's text cursor:
+
+```bash
+termctrl start pointer-demo --record captures/pointer.termctrl -- my-mouse-enabled-tui
+termctrl wait pointer-demo "Ready"
+termctrl mouse pointer-demo move 12 4
+termctrl mouse pointer-demo click 12 4
+termctrl stop pointer-demo
+termctrl video captures/pointer.termctrl --pointer-overlay --out captures/pointer.mp4
+```
+
+The overlay uses a neutral outlined arrow, smooth 220ms travel arriving at the input instant,
+subtle press compression, and short fades. Pointer exports default to 60 fps (otherwise 20);
+`--fps` overrides either default. `--pointer-reduced-motion` keeps fades without travel or scaling.
+Edits preserve alignment through cuts, speed changes, holds, and resizes. No animation changes
+the real input or adds delays. Only typed `mouse` operations provide pointer evidence; raw bytes
+and human input forwarded by `run` are not inferred. `show` and `save` remain unadorned terminal state.
+
+New recordings use format v2; current readers also accept v1. Older binaries must be updated to
+read v2 recordings. Restart older named sessions before using the new mouse command.
 
 Recordings are JSON Lines files containing terminal output and typed input; they can include prompts or secrets. Treat them as sensitive.
 

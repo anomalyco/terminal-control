@@ -72,6 +72,25 @@ test("omits controls hidden or clipped by their ancestors", async () => {
   setup.renderer.destroy()
 })
 
+test("keeps nested discovery order and descendant labels attached to their renderable", async () => {
+  const setup = await createTestRenderer({ width: 20, height: 5 })
+  try {
+    const parent = new BoxRenderable(setup.renderer, { id: "parent", width: 12, height: 3, onMouseDown: () => {} })
+    const child = new BoxRenderable(setup.renderer, { id: "child", width: 10, height: 1, focusable: true })
+    Reflect.set(child, "plainText", " Nested   action ")
+    parent.add(child)
+    setup.renderer.root.add(parent)
+    await setup.renderOnce()
+    expect(elements(setup.renderer).map((element) => element.num)).toEqual([parent.num, child.num])
+    expect(semanticSnapshot(setup.renderer).nodes.map(({ element, label }) => ({ element, label }))).toEqual([
+      { element: parent.num, label: "Nested action" },
+      { element: child.num, label: "Nested action" },
+    ])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
 test("excludes hidden descendants from labels and reports clipped geometry", async () => {
   const setup = await createTestRenderer({ width: 20, height: 5 })
   const button = new BoxRenderable(setup.renderer, { id: "button", focusable: true, width: 5, height: 1 })

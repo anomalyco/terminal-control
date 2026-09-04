@@ -11,6 +11,7 @@
     "changeset": "changeset",
     "version-packages": "changeset version",
     "validate:npm": "node scripts/validate-npm-packages.mjs",
+    "validate:opentui": "node scripts/validate-opentui-package.mjs",
     "release-packages": "node scripts/release-packages.mjs"
   },
   "devDependencies": {

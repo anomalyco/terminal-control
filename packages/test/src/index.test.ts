@@ -1,9 +1,9 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { mkdtemp, readFile } from "node:fs/promises"
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test"
+import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
-import { IncompleteCaptureError, resolveTerminalControlBinary, TerminalControl } from "./index"
+import { IncompleteCaptureError, resolveTerminalControlBinary, Session, TerminalControl } from "./index"
 import { terminalControlMatchers } from "./vitest"
 
 const binaryPath = process.env.TERMCTRL_TEST_BINARY ?? resolve(import.meta.dir, "../../../target/debug/termctrl")
@@ -18,6 +18,82 @@ afterAll(async () => {
 })
 
 describe("isolated terminal sessions", () => {
+  test("failure artifacts cannot replace the original failure", async () => {
+    const original = new Error("original assertion")
+    const captureFailure = new Error("driver unavailable")
+    let requests = 0
+    const request = async () => { requests++; throw captureFailure }
+    const warning = spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      const session = new Session(request, "fixture", { directory: "unused" })
+      expect(await session.withArtifactsOnFailure("success", async () => 7)).toBe(7)
+      expect(requests).toBe(0)
+      await expect(session.withArtifactsOnFailure("failure", async () => { throw original })).rejects.toBe(original)
+      expect(requests).toBe(1)
+      expect(warning).toHaveBeenCalledWith("Terminal Control could not write failure artifacts:", captureFailure)
+      for (const artifacts of [false, { directory: "unused", onFailure: false }] as const) {
+        await expect(new Session(request, "disabled", artifacts).withArtifactsOnFailure("failure", async () => { throw original })).rejects.toBe(original)
+      }
+      expect(requests).toBe(1)
+    } finally {
+      warning.mockRestore()
+    }
+  })
+  test("delivers hover, click and drag input with recorded evidence and resized bounds", async () => {
+    await using session = await terminal.launch({
+      command: [process.execPath, resolve(import.meta.dir, "../fixtures/mouse.ts")],
+      viewport: { cols: 50, rows: 16 },
+      record: true,
+    })
+    await session.screen.waitForText("ready")
+    await session.mouse({ action: "move", x: 4, y: 2 })
+    await session.screen.waitForText("mouse:35:5:3:M")
+    await session.mouse({ action: "click", x: 9, y: 4, button: "right", shift: true })
+    await session.screen.waitForText("mouse:6:10:5:m")
+    await session.mouse({ action: "down", x: 3, y: 2 })
+    await session.mouse({ action: "move", x: 12, y: 3 })
+    await session.screen.waitForText("mouse:32:13:4:M")
+    await expect(session.mouse({ action: "click", x: 3, y: 2 })).rejects.toThrow("held")
+    await expect(session.mouse({ action: "up", x: 3, y: 2, button: "right" })).rejects.toThrow("match")
+    await session.mouse({ action: "up", x: 12, y: 3 })
+    await session.screen.waitForText("mouse:0:13:4:m")
+    await session.resize({ cols: 20, rows: 8 })
+    await expect(session.mouse({ action: "move", x: 20, y: 2 })).rejects.toThrow("outside")
+    await expect(session.mouse({ action: "move", x: -1, y: 2 })).rejects.toThrow()
+    await expect(session.mouse({ action: "move", x: 1.5, y: 2 })).rejects.toThrow()
+    await session.mouse({ action: "click", x: 19, y: 7 })
+    const entries = new TextDecoder().decode(await session.recording()).trim().split("\n").map((line) => JSON.parse(line))
+    expect(entries[0].version).toBe(2)
+    const mouse = entries.filter((entry) => entry.type === "mouse")
+    expect(mouse.map((entry) => entry.event.action)).toEqual(["move", "click", "down", "move", "up", "click"])
+    expect(new TextDecoder().decode(Uint8Array.from(mouse[1].bytes))).toBe("\x1b[<6;10;5M\x1b[<6;10;5m")
+    expect(mouse.every((entry, index) => entry.at_ms >= (mouse[index - 1]?.at_ms ?? 0))).toBe(true)
+  })
+
+  test("refuses mouse input when the application has not enabled reporting", async () => {
+    await using session = await terminal.launch({ command: ["sh", "-c", "printf ready; sleep 2"] })
+    await session.screen.waitForText("ready")
+    await expect(session.mouse({ action: "click", x: 1, y: 1 })).rejects.toThrow("not enabled mouse reporting")
+  })
+
+  test("keeps legacy drivers usable but requests an upgrade for mouse input", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "termctrl-legacy-driver-"))
+    const binaryPath = join(directory, "driver.js")
+    await writeFile(binaryPath, `#!${process.execPath}
+import { createInterface } from "node:readline"
+console.log(JSON.stringify({ type: "hello", protocolVersion: 2, terminalControlVersion: "1.0.0" }))
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line)
+  if (request.method === "mouse") throw new Error("must not send unsupported mouse request")
+  console.log(JSON.stringify({ type: "response", id: request.id, result: null }))
+})
+`, { mode: 0o700 })
+    await using legacy = await TerminalControl.make({ binaryPath })
+    await using session = await legacy.launch({ command: ["unused"] })
+    await session.keyboard.type("still supported")
+    await expect(session.mouse({ action: "click", x: 1, y: 1 })).rejects.toThrow("update the binary and restart the driver")
+  })
+
   test("types only implemented key descriptions", () => {
     type ImplementedKey = Parameters<import("./index").Keyboard["press"]>[0]
     const valid: ImplementedKey[] = ["Enter", "ArrowDown", "Control+C"]
@@ -175,6 +251,9 @@ describe("isolated terminal sessions", () => {
     const metadata = await readFile(join(directory, "screen-text", "metadata.json"), "utf8")
     expect(metadata).toContain('"API_TOKEN": "[redacted]"')
     expect(metadata).not.toContain("sensitive")
+    const original = new Error("original assertion")
+    await expect(session.withArtifactsOnFailure("original", async () => { throw original })).rejects.toBe(original)
+    expect(await readFile(join(directory, "original", "screen.txt"), "utf8")).toBe("evidence")
   })
 
   test("drives an alternate-screen terminal workflow and snapshots its selected view", async () => {

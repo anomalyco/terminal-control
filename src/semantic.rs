@@ -31,10 +31,9 @@ fn unix_time_ms() -> anyhow::Result<u64> {
 
 #[cfg(unix)]
 mod implementation {
-    use std::collections::BTreeSet;
     use std::fs;
     use std::io::{ErrorKind, Read, Write};
-    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -74,7 +73,7 @@ mod implementation {
         stream: UnixStream,
         input: Vec<u8>,
         application: Application,
-        capabilities: BTreeSet<String>,
+        supports_snapshot: bool,
         next_id: u64,
         pending_id: Option<u64>,
     }
@@ -356,7 +355,7 @@ mod implementation {
         fn supports_snapshot(&self) -> bool {
             self.connection
                 .as_ref()
-                .is_some_and(|connection| connection.capabilities.contains("semantic.snapshot"))
+                .is_some_and(|connection| connection.supports_snapshot)
         }
 
         fn start_snapshot(&mut self, deadline: Instant) -> Result<u64> {
@@ -372,7 +371,7 @@ mod implementation {
                         .unwrap_or_default()
                 )
             })?;
-            if !connection.capabilities.contains("semantic.snapshot") {
+            if !connection.supports_snapshot {
                 bail!(
                     "application {} does not support semantic snapshots",
                     connection.application.identity()
@@ -430,7 +429,10 @@ mod implementation {
             if hello.capabilities.iter().any(String::is_empty) {
                 bail!("application semantic capabilities must not be empty");
             }
-            let capabilities = hello.capabilities.into_iter().collect::<BTreeSet<_>>();
+            let supports_snapshot = hello
+                .capabilities
+                .iter()
+                .any(|capability| capability == "semantic.snapshot");
             let mut pending = self.pending.take().expect("pending connection exists");
             pending
                 .stream
@@ -455,7 +457,7 @@ mod implementation {
                 stream: pending.stream,
                 input: Vec::new(),
                 application: hello.application,
-                capabilities,
+                supports_snapshot,
                 next_id: 1,
                 pending_id: None,
             });
@@ -739,18 +741,19 @@ mod implementation {
         if fd < 0 {
             return Err(std::io::Error::last_os_error()).context("create session semantic socket");
         }
-        let mut fd = OwnedFd(fd);
-        let flags = unsafe { libc::fcntl(fd.0, libc::F_GETFL) };
+        // socket() returned a new descriptor; OwnedFd closes it on every error path.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
         if flags < 0
-            || unsafe { libc::fcntl(fd.0, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-            || unsafe { libc::fcntl(fd.0, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0
         {
             return Err(std::io::Error::last_os_error())
                 .context("configure session semantic socket");
         }
         let connected = unsafe {
             libc::connect(
-                fd.0,
+                fd.as_raw_fd(),
                 (&raw const address).cast::<libc::sockaddr>(),
                 address_len,
             )
@@ -762,10 +765,9 @@ mod implementation {
             {
                 return Err(error).context("connect session semantic socket");
             }
-            wait_for_connect(fd.0, deadline)?;
+            wait_for_connect(fd.as_raw_fd(), deadline)?;
         }
-        let fd = fd.take();
-        Ok(unsafe { UnixStream::from_raw_fd(fd) })
+        Ok(UnixStream::from(fd))
     }
 
     fn wait_for_connect(fd: RawFd, deadline: Instant) -> Result<()> {
@@ -814,24 +816,6 @@ mod implementation {
         }
     }
 
-    struct OwnedFd(RawFd);
-
-    impl OwnedFd {
-        fn take(&mut self) -> RawFd {
-            std::mem::replace(&mut self.0, -1)
-        }
-    }
-
-    impl Drop for OwnedFd {
-        fn drop(&mut self) {
-            if self.0 >= 0 {
-                unsafe {
-                    libc::close(self.0);
-                }
-            }
-        }
-    }
-
     #[cfg(test)]
     mod tests {
         use std::io::{BufRead, BufReader};
@@ -840,6 +824,45 @@ mod implementation {
         use std::time::Instant;
 
         use super::*;
+
+        #[test]
+        fn snapshot_support_keeps_handshake_validation_and_unknown_capabilities() {
+            for (capabilities, expected) in [
+                (vec!["other"], Ok(false)),
+                (
+                    vec!["semantic.snapshot", "semantic.snapshot", "other"],
+                    Ok(true),
+                ),
+                (
+                    vec!["semantic.snapshot", ""],
+                    Err("application semantic capabilities must not be empty"),
+                ),
+            ] {
+                let mut host = Host::bind().unwrap();
+                let (stream, _peer) = UnixStream::pair().unwrap();
+                host.pending = Some(PendingConnection {
+                    stream,
+                    input: Vec::new(),
+                    accepted_at: Instant::now(),
+                });
+                let result = host.finish_handshake(Hello {
+                    kind: "hello".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                    application: Application {
+                        name: "fixture".into(),
+                        version: None,
+                    },
+                    capabilities: capabilities.into_iter().map(str::to_owned).collect(),
+                });
+                match expected {
+                    Ok(supported) => {
+                        result.unwrap();
+                        assert_eq!(host.supports_snapshot(), supported);
+                    }
+                    Err(message) => assert_eq!(result.unwrap_err().to_string(), message),
+                }
+            }
+        }
 
         #[test]
         fn socket_reads_an_advertised_semantic_snapshot() {

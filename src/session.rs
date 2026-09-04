@@ -40,7 +40,6 @@ pub struct Session {
     ansi: Vec<u8>,
     host: Host,
     receive: Receiver<Option<Output>>,
-    max_bytes: usize,
     ansi_truncated: bool,
     output_closed: bool,
     stopped: bool,
@@ -235,9 +234,7 @@ impl Session {
         if command.is_empty() {
             bail!("provide a command after --");
         }
-        if options.cols == 0 || options.rows == 0 {
-            bail!("terminal dimensions must be greater than zero");
-        }
+        shot::validate_geometry(options.rows, options.cols)?;
         let cwd = match cwd {
             Some(cwd) if cwd.is_absolute() => cwd.to_owned(),
             Some(cwd) => std::env::current_dir()
@@ -327,7 +324,6 @@ impl Session {
             ansi: Vec::new(),
             host: Host::new(writer, &host_options),
             receive,
-            max_bytes: options.max_bytes,
             ansi_truncated: false,
             output_closed: false,
             stopped: false,
@@ -597,9 +593,7 @@ impl Session {
         cell_width: u16,
         cell_height: u16,
     ) -> Result<()> {
-        if cols == 0 || rows == 0 {
-            bail!("terminal dimensions must be greater than zero");
-        }
+        shot::validate_geometry(rows, cols)?;
         if (cols, rows, cell_width, cell_height)
             == (self.cols, self.rows, self.cell_width, self.cell_height)
         {
@@ -764,7 +758,7 @@ impl Session {
         retain_recent(
             &mut self.ansi,
             &output.bytes,
-            self.max_bytes,
+            self.launch.max_bytes,
             &mut self.ansi_truncated,
         );
         self.last_output = Some(Instant::now());
@@ -1534,13 +1528,7 @@ mod implementation {
     }
 
     fn ensure_socket_path(path: &Path) -> Result<()> {
-        if path.as_os_str().as_encoded_bytes().len() >= 100 {
-            bail!(
-                "session socket path is too long for portable Unix sockets: {}; set TERMCTRL_RUNTIME_DIR to a shorter directory",
-                path.display()
-            );
-        }
-        Ok(())
+        crate::runtime::ensure_socket_path(path, "session socket")
     }
 
     fn remove_stale_socket(name: &str, socket: &Path) -> Result<()> {
@@ -1831,6 +1819,19 @@ mod implementation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transcript_retention_preserves_zero_exact_and_overflow_limits() {
+        for (limit, expected, expected_truncated) in
+            [(0, "", true), (3, "abc", false), (2, "bc", true)]
+        {
+            let mut bytes = Vec::new();
+            let mut truncated = false;
+            super::retain_recent(&mut bytes, b"abc", limit, &mut truncated);
+            assert_eq!(bytes, expected.as_bytes());
+            assert_eq!(truncated, expected_truncated);
+        }
+    }
+
     use super::*;
 
     fn listed_session(name: &str, state: SessionState, cwd: &str) -> NamedSessionStatus {

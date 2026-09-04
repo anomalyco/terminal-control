@@ -12,6 +12,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::input::Key;
 use crate::{render, session};
 
 #[derive(Debug, Clone)]
@@ -132,25 +133,6 @@ enum Input {
     Key { key: Key },
     Control { letter: char },
     Bytes { bytes: Vec<u8> },
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-enum Key {
-    Enter,
-    Escape,
-    ArrowUp,
-    ArrowDown,
-    ArrowLeft,
-    ArrowRight,
-    Tab,
-    ShiftTab,
-    Backspace,
-    Delete,
-    Home,
-    End,
-    PageUp,
-    PageDown,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -492,32 +474,13 @@ fn encode_input(input: Vec<Input>) -> Result<Vec<Vec<u8>>, String> {
 fn encode_atom(input: Input) -> Result<Vec<u8>, String> {
     Ok(match input {
         Input::Text { text } => text.into_bytes(),
-        Input::Key { key } => key_bytes(key).to_vec(),
+        Input::Key { key } => key.bytes().to_vec(),
         Input::Control { letter } if letter.is_ascii_alphabetic() => {
             vec![(letter.to_ascii_uppercase() as u8) - b'@']
         }
         Input::Control { .. } => return Err("control input must be one ASCII letter".to_owned()),
         Input::Bytes { bytes } => bytes,
     })
-}
-
-fn key_bytes(key: Key) -> &'static [u8] {
-    match key {
-        Key::Enter => b"\r",
-        Key::Escape => b"\x1b",
-        Key::ArrowUp => b"\x1b[A",
-        Key::ArrowDown => b"\x1b[B",
-        Key::ArrowLeft => b"\x1b[D",
-        Key::ArrowRight => b"\x1b[C",
-        Key::Tab => b"\t",
-        Key::ShiftTab => b"\x1b[Z",
-        Key::Backspace => b"\x7f",
-        Key::Delete => b"\x1b[3~",
-        Key::Home => b"\x1b[H",
-        Key::End => b"\x1b[F",
-        Key::PageUp => b"\x1b[5~",
-        Key::PageDown => b"\x1b[6~",
-    }
 }
 
 fn state(value: session::SessionState) -> &'static str {
@@ -538,6 +501,15 @@ const fn default_timeout_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_keys_keep_their_encoding() {
+        for (name, expected) in crate::input::KEY_CASES {
+            let atom =
+                serde_json::from_value(serde_json::json!({"type": "key", "key": name})).unwrap();
+            assert_eq!(encode_atom(atom).unwrap(), *expected);
+        }
+    }
 
     #[test]
     fn encodes_typed_input_without_shell_escaping() {

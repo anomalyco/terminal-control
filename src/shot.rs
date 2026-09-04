@@ -116,7 +116,7 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
     if let Some(cwd) = cwd {
         builder.cwd(cwd);
     }
-    let mut reader = pair.master.try_clone_reader().context("open PTY reader")?;
+    let reader = pair.master.try_clone_reader().context("open PTY reader")?;
     let writer = pair.master.take_writer().context("open PTY writer")?;
     let mut child = pair
         .slave
@@ -126,21 +126,7 @@ pub fn from_command(command: &[String], cwd: Option<&Path>, options: &Options) -
     #[cfg(unix)]
     let process_group = child.process_id().and_then(|pid| i32::try_from(pid).ok());
     let (send, receive) = mpsc::sync_channel::<Option<Vec<u8>>>(32);
-    let _reader_thread = thread::spawn(move || {
-        let mut buffer = [0_u8; 16 * 1024];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(len) => {
-                    if send.send(Some(buffer[..len].to_vec())).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = send.send(None);
-    });
+    spawn_output_reader(reader, send);
     let result = (|| {
         let mut terminal = TerminalCore::new(options.rows, options.cols, 0)?;
         let mut ansi = Vec::new();
@@ -246,8 +232,8 @@ pub fn from_pipe_command(
     let stdout = child.stdout.take().context("open command stdout")?;
     let stderr = child.stderr.take().context("open command stderr")?;
     let (send, receive) = mpsc::sync_channel::<Option<Vec<u8>>>(32);
-    spawn_pipe_reader(stdout, send.clone());
-    spawn_pipe_reader(stderr, send);
+    spawn_output_reader(stdout, send.clone());
+    spawn_output_reader(stderr, send);
 
     let result = (|| {
         let mut terminal = TerminalCore::new(options.rows, options.cols, 0)?;
@@ -305,7 +291,7 @@ pub fn from_pipe_command(
     result
 }
 
-fn spawn_pipe_reader(
+fn spawn_output_reader(
     mut reader: impl Read + Send + 'static,
     send: mpsc::SyncSender<Option<Vec<u8>>>,
 ) {

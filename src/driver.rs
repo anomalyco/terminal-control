@@ -12,6 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::input::Key;
 use crate::render;
 use crate::session::Session;
 use crate::shot::{ColorMode, Options};
@@ -158,25 +159,6 @@ enum InputAtom {
     Key { value: Key },
     Control { value: String },
     Bytes { value: Vec<u8> },
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum Key {
-    Enter,
-    Escape,
-    ArrowUp,
-    ArrowDown,
-    ArrowLeft,
-    ArrowRight,
-    Tab,
-    ShiftTab,
-    Backspace,
-    Delete,
-    Home,
-    End,
-    PageUp,
-    PageDown,
 }
 
 #[derive(Deserialize)]
@@ -522,31 +504,12 @@ fn input_bytes(input: Vec<InputAtom>, paced: bool) -> Result<Vec<Vec<u8>>> {
                 output.extend(value.chars().map(|char| char.to_string().into_bytes()));
             }
             InputAtom::Text { value } => output.push(value.into_bytes()),
-            InputAtom::Key { value } => output.push(key_bytes(value).to_vec()),
+            InputAtom::Key { value } => output.push(value.bytes().to_vec()),
             InputAtom::Control { value } => output.push(control_bytes(&value)?),
             InputAtom::Bytes { value } => output.push(value),
         }
     }
     Ok(output)
-}
-
-fn key_bytes(key: Key) -> &'static [u8] {
-    match key {
-        Key::Enter => b"\r",
-        Key::Escape => b"\x1b",
-        Key::ArrowUp => b"\x1b[A",
-        Key::ArrowDown => b"\x1b[B",
-        Key::ArrowLeft => b"\x1b[D",
-        Key::ArrowRight => b"\x1b[C",
-        Key::Tab => b"\t",
-        Key::ShiftTab => b"\x1b[Z",
-        Key::Backspace => b"\x7f",
-        Key::Delete => b"\x1b[3~",
-        Key::Home => b"\x1b[H",
-        Key::End => b"\x1b[F",
-        Key::PageUp => b"\x1b[5~",
-        Key::PageDown => b"\x1b[6~",
-    }
 }
 
 fn control_bytes(value: &str) -> Result<Vec<u8>> {
@@ -588,25 +551,44 @@ fn write_message(writer: &mut impl Write, message: &impl Serialize) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufReader, Cursor, Write};
+    use std::io::{BufReader, Write};
     #[cfg(unix)]
     use std::os::unix::net::UnixStream;
-    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use super::*;
 
-    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for SharedWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
+    #[test]
+    fn wire_keys_keep_their_encoding_and_pacing_keeps_raw_bytes_intact() {
+        for (name, expected) in crate::input::KEY_CASES {
+            let atom = serde_json::from_value(json!({"type": "key", "value": name})).unwrap();
+            assert_eq!(
+                input_bytes(vec![atom], true).unwrap(),
+                vec![expected.to_vec()]
+            );
         }
+        let input = vec![
+            InputAtom::Text {
+                value: "a界".into(),
+            },
+            InputAtom::Bytes {
+                value: vec![0, 255],
+            },
+        ];
+        assert_eq!(
+            input_bytes(input, true).unwrap(),
+            vec![b"a".to_vec(), "界".as_bytes().to_vec(), vec![0, 255]]
+        );
+    }
 
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+    fn responses(requests: &str) -> Vec<Value> {
+        let mut output = Vec::new();
+        serve(requests.as_bytes(), &mut output).unwrap();
+        String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 
     #[cfg(unix)]
@@ -628,19 +610,7 @@ mod tests {
             r#"{"id":7,"method":"shutdown"}"#,
             "\n"
         );
-        let mut output = Vec::new();
-
-        serve(
-            BufReader::new(Cursor::new(requests.as_bytes())),
-            &mut output,
-        )
-        .unwrap();
-
-        let messages = String::from_utf8(output)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .collect::<Vec<_>>();
+        let messages = responses(requests);
         assert_eq!(messages[0]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(messages[5]["result"]["reason"], "idle");
         assert!(messages[5]["result"]["shot"]["frame"]["cells"].is_array());
@@ -665,19 +635,7 @@ mod tests {
             r#"{"id":4,"method":"shutdown"}"#,
             "\n"
         );
-        let mut output = Vec::new();
-
-        serve(
-            BufReader::new(Cursor::new(requests.as_bytes())),
-            &mut output,
-        )
-        .unwrap();
-
-        let messages = String::from_utf8(output)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .collect::<Vec<_>>();
+        let messages = responses(requests);
         assert_eq!(messages[3]["result"]["shot"]["text"], "ready");
         assert_eq!(messages[3]["result"]["shot"]["ansi"], json!([]));
     }
@@ -694,19 +652,8 @@ mod tests {
             r#"{"id":3,"method":"shutdown"}"#,
             "\n"
         );
-        let mut output = Vec::new();
-        serve(
-            BufReader::new(Cursor::new(requests.as_bytes())),
-            &mut output,
-        )
-        .unwrap();
+        let messages = responses(requests);
         unsafe { std::env::remove_var("TERMCTRL_PARENT_ONLY") };
-
-        let messages = String::from_utf8(output)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .collect::<Vec<_>>();
         assert_eq!(messages[2]["result"]["shot"]["text"], "unset:set:unset");
     }
 
@@ -723,17 +670,7 @@ mod tests {
             r#"{"id":4,"method":"shutdown"}"#,
             "\n"
         );
-        let mut output = Vec::new();
-        serve(
-            BufReader::new(Cursor::new(requests.as_bytes())),
-            &mut output,
-        )
-        .unwrap();
-        let messages = String::from_utf8(output)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .collect::<Vec<_>>();
+        let messages = responses(requests);
 
         assert_eq!(messages[2]["result"]["reason"], "exited");
         assert_eq!(messages[2]["result"]["exit"]["code"], 4);
@@ -755,16 +692,7 @@ mod tests {
     #[test]
     fn invalid_typed_request_preserves_its_id() {
         let requests = "{\"id\":41,\"method\":\"noSuchMethod\",\"sessionId\":\"app\"}\n";
-        let mut output = Vec::new();
-        serve(
-            BufReader::new(Cursor::new(requests.as_bytes())),
-            &mut output,
-        )
-        .unwrap();
-        let messages = String::from_utf8(output).unwrap();
-        let error = serde_json::from_str::<Value>(messages.lines().nth(1).unwrap()).unwrap();
-
-        assert_eq!(error["id"], 41);
+        assert_eq!(responses(requests)[1]["id"], 41);
     }
 
     #[cfg(unix)]
@@ -774,8 +702,6 @@ mod tests {
             std::env::temp_dir().join(format!("termctrl-driver-pump-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let (mut requests, input) = UnixStream::pair().unwrap();
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let writer = SharedWriter(Arc::clone(&output));
         let marker_command = format!(
             "i=0; while [ $i -lt 100 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done; : > '{}'; sleep 1",
             marker.display()
@@ -787,7 +713,7 @@ mod tests {
             "params": { "command": ["sh", "-c", marker_command] }
         }))
         .unwrap();
-        let handle = thread::spawn(move || serve(BufReader::new(input), writer).unwrap());
+        let handle = thread::spawn(move || serve(BufReader::new(input), std::io::sink()).unwrap());
         writeln!(requests, "{launch}").unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !marker.exists() && std::time::Instant::now() < deadline {
@@ -837,13 +763,7 @@ mod tests {
         .into_iter()
         .map(|request| format!("{request}\n"))
         .collect::<String>();
-        let mut output = Vec::new();
-
-        serve(
-            BufReader::new(Cursor::new(requests.into_bytes())),
-            &mut output,
-        )
-        .unwrap();
+        serve(requests.as_bytes(), std::io::sink()).unwrap();
 
         assert!(
             marker.exists(),

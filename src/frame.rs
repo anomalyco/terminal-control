@@ -95,8 +95,7 @@ impl Frame {
     }
 
     pub fn text(&self) -> String {
-        let mut rows =
-            vec![vec![String::from(" "); usize::from(self.cols)]; usize::from(self.rows)];
+        let mut rows = vec![vec![" "; usize::from(self.cols)]; usize::from(self.rows)];
         for cell in &self.cells {
             if cell.text.is_empty()
                 || cell.attributes.invisible
@@ -105,9 +104,9 @@ impl Frame {
             {
                 continue;
             }
-            rows[usize::from(cell.y)][usize::from(cell.x)] = cell.text.clone();
+            rows[usize::from(cell.y)][usize::from(cell.x)] = cell.text.as_str();
             if cell.width == 2 && cell.x + 1 < self.cols {
-                rows[usize::from(cell.y)][usize::from(cell.x + 1)].clear();
+                rows[usize::from(cell.y)][usize::from(cell.x + 1)] = "";
             }
         }
         rows.into_iter()
@@ -227,6 +226,30 @@ pub(crate) fn indexed_color(index: u8) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_preserves_cell_order_wide_edges_blank_rows_and_unicode_trimming() {
+        let mut frame = crate::shot::from_ansi(Vec::new(), 3, 4, 1024)
+            .unwrap()
+            .frame;
+        let cell = |x, y, text: &str, width| Cell {
+            x,
+            y,
+            text: text.to_owned(),
+            width,
+            foreground: DEFAULT_FOREGROUND,
+            background: DEFAULT_BACKGROUND,
+            attributes: Attributes::default(),
+        };
+        frame.cells = vec![
+            cell(0, 2, "tail\u{2003}", 1),
+            cell(1, 0, "wide", 2),
+            cell(2, 0, "Z", 1),
+            cell(0, 0, "A", 1),
+            cell(3, 0, "界", 2),
+        ];
+        assert_eq!(frame.text(), "AwideZ界\n\ntail");
+    }
 
     #[test]
     fn extracts_truecolor_backgrounds_and_text() {

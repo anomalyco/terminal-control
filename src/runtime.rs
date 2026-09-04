@@ -85,6 +85,19 @@ mod implementation {
             let error = require_absolute(Path::new("runtime")).unwrap_err();
             assert!(error.to_string().contains("must be an absolute path"));
         }
+
+        #[test]
+        fn socket_path_limit_counts_encoded_bytes() {
+            assert!(ensure_socket_path(Path::new(&"x".repeat(99)), "session socket").is_ok());
+            let error =
+                ensure_socket_path(Path::new(&"x".repeat(100)), "session socket").unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("session socket path is too long")
+            );
+            assert!(ensure_socket_path(Path::new(&"é".repeat(50)), "session socket").is_err());
+        }
     }
 }
 

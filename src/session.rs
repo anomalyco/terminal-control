@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::recording::{self, InputOrigin};
 use crate::semantic;
 use crate::shot::{self, Host, Options, Shot, respond_to_output};
-use crate::terminal_core::{SCROLLBACK_ROWS, TerminalCore};
+use crate::terminal_core::{SCROLLBACK_BYTES, TerminalCore};
 use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -243,7 +243,7 @@ impl Session {
             None => std::env::current_dir().context("resolve session working directory")?,
         };
         let cwd = fs::canonicalize(&cwd).context("canonicalize session working directory")?;
-        let terminal = TerminalCore::new(options.rows, options.cols, SCROLLBACK_ROWS)?;
+        let terminal = TerminalCore::new(options.rows, options.cols, SCROLLBACK_BYTES)?;
         let started = Instant::now();
         let recording = record
             .map(|path| {

@@ -13,7 +13,9 @@ use crate::frame::{
     FORMAT_VERSION, Frame, Underline, indexed_color,
 };
 
-pub(crate) const SCROLLBACK_ROWS: usize = 10_000;
+/// Ghostty limits scrollback by page memory in bytes, not rows. 16 MiB retains more than
+/// 10,000 rows of 120-column output.
+pub(crate) const SCROLLBACK_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) struct TerminalCore {
     terminal: Terminal<'static, 'static>,
@@ -406,7 +408,7 @@ mod tests {
         );
     }
 
-    use super::TerminalCore;
+    use super::{SCROLLBACK_BYTES, TerminalCore};
     use crate::frame::{CursorStyle, DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, indexed_color};
 
     #[test]
@@ -441,6 +443,18 @@ mod tests {
         assert_eq!(frame.cells[0].foreground, DEFAULT_FOREGROUND);
         assert_eq!(frame.cells[1].foreground, indexed_color(1));
         assert_eq!(frame.cells[2].foreground, indexed_color(9));
+    }
+
+    #[test]
+    fn scrollback_retains_thousands_of_wide_rows() {
+        let mut terminal = TerminalCore::new(40, 120, SCROLLBACK_BYTES).unwrap();
+        let output = (1..=2_000)
+            .map(|line| format!("{line:0>120}\r\n"))
+            .collect::<String>();
+        let _responses = terminal.apply_output(output.as_bytes());
+
+        let text = String::from_utf8(terminal.scrollback_text().unwrap()).unwrap();
+        assert!(text.starts_with(&format!("{:0>120}\n", 1)));
     }
 
     #[test]

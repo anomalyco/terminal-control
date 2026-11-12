@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::frame::{Attributes, Cell, Frame};
 use crate::render;
 use crate::shot::Shot;
-use crate::terminal_core::{SCROLLBACK_ROWS, TerminalCore};
+use crate::terminal_core::{SCROLLBACK_BYTES, TerminalCore};
 
 const MAX_VIDEO_FPS: u32 = 1000;
 /// Schema version written in the header of every `.termctrl` recording.
@@ -426,7 +426,7 @@ fn replay(
     cutoff: Option<u64>,
     mut observe: impl FnMut(&mut TerminalCore, u64, &[u8]) -> Result<()>,
 ) -> Result<TerminalCore> {
-    let mut terminal = TerminalCore::new(recording.rows, recording.cols, SCROLLBACK_ROWS)?;
+    let mut terminal = TerminalCore::new(recording.rows, recording.cols, SCROLLBACK_BYTES)?;
     // Shots retain bytes and materialize only the final frame; videos retain visible states
     // without constructing an unused transcript. Both replay exactly the same event sequence.
     observe(&mut terminal, 0, &[])?;

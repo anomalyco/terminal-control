@@ -4,6 +4,7 @@ Control, inspect, test, and capture real terminal applications for agents and TU
 
 [![crates.io](https://img.shields.io/crates/v/terminal-control.svg)](https://crates.io/crates/terminal-control)
 [![CI](https://github.com/anomalyco/terminal-control/actions/workflows/ci.yml/badge.svg)](https://github.com/anomalyco/terminal-control/actions/workflows/ci.yml)
+<a href="https://opencode.ai"><picture><source media="(prefers-color-scheme: dark)" srcset="https://opencode.ai/brand/badges/opencode-built-with-g-dark-20.svg"><img alt="Built with OpenCode" src="https://opencode.ai/brand/badges/opencode-built-with-g-light-20.svg" height="20" /></picture></a>
 
 ![OpenCode answering a playful terminal request](https://raw.githubusercontent.com/anomalyco/terminal-control/main/docs/screenshots/opencode-haikus.png)
 
